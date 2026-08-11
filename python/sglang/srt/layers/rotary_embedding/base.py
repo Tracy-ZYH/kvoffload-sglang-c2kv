@@ -39,7 +39,14 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+
+        _has_fused_rope_qk_mqa = True
+    except ImportError:
+        fused_rope_qk_mqa = None
+        _has_fused_rope_qk_mqa = False
 
 if _is_hip:
     from sglang.srt.layers.attention.utils import (
@@ -257,7 +264,7 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if query.shape[0] * query.shape[1] < 65535:
+            if _has_fused_rope_qk_mqa and query.shape[0] * query.shape[1] < 65535:
                 return fused_rope_qk_mqa(
                     query,
                     key,
@@ -266,7 +273,13 @@ class RotaryEmbedding(MultiPlatformOp):
                     self.is_neox_style,
                 )
             else:
-                return self.forward_native(positions, query, key, offsets)
+                # Correctness-first fallback for older sgl-kernel-npu wheels.
+                return self.forward_native(
+                    positions,
+                    query,
+                    key,
+                    offsets,
+                )
         if self.is_neox_style:
             rotary_mode = "half"
         else:

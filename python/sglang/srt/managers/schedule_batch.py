@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -2480,6 +2482,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             c2kv_corr = [
                 getattr(r, "c2kv_position_correction", 0) for r in self.reqs
             ]
+
+        if os.environ.get("C2KV_DEBUG_POSITIONS") == "1":
+            print(
+                "[C2KV WORKER CORR DEBUG]",
+                {
+                    "forward_mode": str(self.forward_mode),
+                    "c2kv_corr": c2kv_corr,
+                    "req_corr": [
+                        getattr(r, "c2kv_position_correction", 0)
+                        for r in self.reqs
+                    ],
+                    "seq_lens": (
+                        self.seq_lens.detach().cpu().tolist()
+                        if isinstance(self.seq_lens, torch.Tensor)
+                        else self.seq_lens
+                    ),
+                    "extend_prefix_lens": extend_prefix_lens,
+                    "extend_seq_lens": extend_seq_lens,
+                },
+                flush=True,
+            )
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,

@@ -138,8 +138,55 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
+            import traceback
+
+            free_page_indices_cpu = torch.unique(
+                free_index.detach().cpu() // self.page_size
+            )
+
+            # Page 0 is the reserved padded/dummy page and must never
+            # be returned to the allocator free list.
+            free_page_indices_cpu = free_page_indices_cpu[free_page_indices_cpu > 0]
+
+            if free_page_indices_cpu.numel() == 0:
+                return
+
+            free_pages_cpu = self.free_pages.detach().cpu()
+            release_pages_cpu = self.release_pages.detach().cpu()
+
+            already_free = torch.isin(
+                free_page_indices_cpu,
+                free_pages_cpu,
+            )
+
+            already_release = torch.isin(
+                free_page_indices_cpu,
+                release_pages_cpu,
+            )
+
+            duplicate_mask = already_free | already_release
+
+            if duplicate_mask.any():
+                duplicate_pages = free_page_indices_cpu[duplicate_mask]
+
+                print(
+                    "[NPU DOUBLE FREE DETECTED] "
+                    f"pages={duplicate_pages.tolist()}, "
+                    f"free_pages={len(self.free_pages)}, "
+                    f"release_pages={len(self.release_pages)}",
+                    flush=True,
+                )
+
+                traceback.print_stack(limit=25)
+
+                # Avoid adding duplicate pages back into the allocator while debugging.
+                free_page_indices_cpu = free_page_indices_cpu[~duplicate_mask]
+
+            free_page_indices = free_page_indices_cpu.to(device)
+
+            if free_page_indices.numel() == 0:
+                return
+
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:

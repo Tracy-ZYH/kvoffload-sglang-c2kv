@@ -29,6 +29,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -595,6 +597,44 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 per_token_corr = torch.repeat_interleave(corr, ext_lens)
                 ret.positions = ret.positions + per_token_corr
+
+
+        # ---------------------------------------------------------
+        # C2KV runtime position debug
+        # ---------------------------------------------------------
+        if (
+            os.environ.get("C2KV_DEBUG_POSITIONS") == "1"
+            and batch.c2kv_position_corrections is not None
+        ):
+            def _c2kv_debug_list(x):
+                if x is None:
+                    return None
+                if isinstance(x, torch.Tensor):
+                    return x.detach().cpu().tolist()
+                return x
+
+            print(
+                "[C2KV POSITION DEBUG]",
+                {
+                    "forward_mode": str(ret.forward_mode),
+                    "correction": _c2kv_debug_list(
+                        batch.c2kv_position_corrections
+                    ),
+                    "seq_lens": _c2kv_debug_list(
+                        batch.seq_lens
+                    ),
+                    "extend_prefix_lens": _c2kv_debug_list(
+                        batch.extend_prefix_lens
+                    ),
+                    "extend_seq_lens": _c2kv_debug_list(
+                        batch.extend_seq_lens
+                    ),
+                    "positions": _c2kv_debug_list(
+                        ret.positions
+                    ),
+                },
+                flush=True,
+            )
 
         # Precompute SWA cache location once for all SWA layers
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:

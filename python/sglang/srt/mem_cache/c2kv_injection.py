@@ -5,6 +5,7 @@ Reads a stored gist entry, applies RoPE at the correct absolute positions,
 and writes K/V tensors into the engine's KV pool.
 """
 
+import os
 from typing import List
 
 import torch
@@ -23,54 +24,227 @@ def inject_c2kv_gist(
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool = True,
 ) -> None:
-    """
-    Apply RoPE at absolute positions and write gist K/V into the KV pool.
 
-    Args:
-        entry:           C2KVEntry containing C2KV pool slot indices.
-        c2kv_pool:       Preallocated C2KV K/V and position storage.
-        position_cursor: Absolute position offset for this gist block.
-        loc:             (gist_len,) int64 slot indices in the KV pool.
-        token_to_kv_pool: Engine KV pool with set_kv_buffer().
-        attn_layers:     List of attention layer objects (one per decoder layer).
-        cos_sin_cache:   (max_pos, rotary_dim) float RoPE lookup table.
-        is_neox_style:   True for Neox-style rotation (Qwen3 and most modern models).
-    """
     gist_len = entry.gist_len
+
     if loc.numel() != gist_len:
         raise ValueError(
-            f"C2KV loc length mismatch: loc.numel()={loc.numel()} != {gist_len=}"
+            f"C2KV loc length mismatch: "
+            f"loc.numel()={loc.numel()} != {gist_len=}"
         )
+
     if c2kv_pool.num_layers != len(attn_layers):
         raise ValueError(
             "C2KV layer count mismatch: "
             f"{c2kv_pool.num_layers=} != {len(attn_layers)=}"
         )
 
+    # ---------------------------------------------------------
+    # Position information
+    # ---------------------------------------------------------
+
     gist_pos = c2kv_pool.get_position_ids(entry)
 
-    # Absolute positions for each gist token
-    abs_pos = (position_cursor + gist_pos).clamp(0, cos_sin_cache.shape[0] - 1)
+    abs_pos = (
+        position_cursor + gist_pos
+    ).clamp(
+        0,
+        cos_sin_cache.shape[0] - 1,
+    )
 
     rotary_dim = cos_sin_cache.shape[1]
     half_dim = rotary_dim // 2
-    cos = cos_sin_cache[abs_pos, :half_dim]   # (gist_len, half_dim)
-    sin = cos_sin_cache[abs_pos, half_dim:]   # (gist_len, half_dim)
+
+    cos = cos_sin_cache[
+        abs_pos,
+        :half_dim,
+    ]
+
+    sin = cos_sin_cache[
+        abs_pos,
+        half_dim:,
+    ]
+
     head_dim = half_dim * 2
 
-    for layer_idx in range(c2kv_pool.num_layers):
-        k_pre, v_pre = c2kv_pool.get_layer_kv(entry, layer_idx)
+    # ---------------------------------------------------------
+    # Debug dump
+    # ---------------------------------------------------------
+
+    dump_path = os.environ.get(
+        "C2KV_DEBUG_INJECT_DUMP"
+    )
+
+    debug_obj = None
+
+    if dump_path:
+        debug_obj = {
+            "position_cursor": int(position_cursor),
+            "gist_len": int(gist_len),
+            "original_seq_len": int(entry.original_seq_len),
+            "gist_pos": gist_pos.detach().cpu(),
+            "abs_pos": abs_pos.detach().cpu(),
+            "loc": loc.detach().cpu(),
+            "layers": {},
+        }
+
+    # ---------------------------------------------------------
+    # Inject each layer
+    # ---------------------------------------------------------
+
+    for layer_idx in range(
+        c2kv_pool.num_layers
+    ):
+
+        # IMPORTANT:
+        # This is already after C2KVPool.store/get.
+        k_pre, v_pre = c2kv_pool.get_layer_kv(
+            entry,
+            layer_idx,
+        )
+
         if k_pre.shape[2] != head_dim:
             raise ValueError(
-                f"C2KV head_dim mismatch at layer {layer_idx}: "
+                f"C2KV head_dim mismatch "
+                f"at layer {layer_idx}: "
                 f"{k_pre.shape[2]} != {head_dim}"
             )
 
-        k_rotated = apply_rotary_emb(k_pre, cos, sin, is_neox_style)
+        # Apply absolute-position RoPE.
+        k_rotated = apply_rotary_emb(
+            k_pre,
+            cos,
+            sin,
+            is_neox_style,
+        )
 
+        layer = attn_layers[layer_idx]
+
+        # Write into SGLang main KV cache.
         token_to_kv_pool.set_kv_buffer(
-            layer=attn_layers[layer_idx],
+            layer=layer,
             loc=loc,
             cache_k=k_rotated,
             cache_v=v_pre,
+        )
+
+        # -----------------------------------------------------
+        # Read the actual main KV cache back.
+        # -----------------------------------------------------
+
+        if dump_path:
+
+            if (
+                hasattr(torch, "npu")
+                and torch.npu.is_available()
+            ):
+                torch.npu.synchronize()
+
+            layer_id = layer.layer_id
+
+            k_buffer = (
+                token_to_kv_pool.get_key_buffer(
+                    layer_id
+                )
+            )
+
+            v_buffer = (
+                token_to_kv_pool.get_value_buffer(
+                    layer_id
+                )
+            )
+
+            # Handles normal Ascend layout:
+            #
+            # [page, page_size, Hkv, D]
+            #
+            # and FIA-like layouts by flattening all
+            # physical token dimensions.
+            k_flat = k_buffer.reshape(
+                -1,
+                k_buffer.shape[-2],
+                k_buffer.shape[-1],
+            )
+
+            v_flat = v_buffer.reshape(
+                -1,
+                v_buffer.shape[-2],
+                v_buffer.shape[-1],
+            )
+
+            loc_long = loc.long()
+
+            k_readback = (
+                k_flat[loc_long]
+                .contiguous()
+                .clone()
+            )
+
+            v_readback = (
+                v_flat[loc_long]
+                .contiguous()
+                .clone()
+            )
+
+            debug_obj["layers"][layer_idx] = {
+                # after C2KVPool.store/get
+                "k_pre": (
+                    k_pre.detach()
+                    .cpu()
+                    .clone()
+                ),
+                "v_pre": (
+                    v_pre.detach()
+                    .cpu()
+                    .clone()
+                ),
+
+                # immediately before main KV cache write
+                "k_rotated": (
+                    k_rotated.detach()
+                    .cpu()
+                    .clone()
+                ),
+
+                # actual main KV cache contents
+                "k_readback": (
+                    k_readback.detach()
+                    .cpu()
+                ),
+                "v_readback": (
+                    v_readback.detach()
+                    .cpu()
+                ),
+            }
+
+    # Diagnostic: make all injected KV writes globally visible
+    # before the scheduler can launch the next prefill round.
+    #
+    # If enabling this fixes C2KV attention, the bug is a
+    # scheduler/forward-stream ordering issue rather than KV values.
+    if (
+        os.environ.get("C2KV_DEBUG_FORCE_SYNC") == "1"
+        and hasattr(torch, "npu")
+        and torch.npu.is_available()
+    ):
+        torch.npu.synchronize()
+        print(
+            "[C2KV FORCE SYNC]",
+            {
+                "gist_len": int(gist_len),
+                "position_cursor": int(position_cursor),
+            },
+            flush=True,
+        )
+
+    if dump_path:
+        torch.save(
+            debug_obj,
+            dump_path,
+        )
+
+        print(
+            "[C2KV DEBUG INJECT] "
+            f"saved injection dump to {dump_path}",
+            flush=True,
         )

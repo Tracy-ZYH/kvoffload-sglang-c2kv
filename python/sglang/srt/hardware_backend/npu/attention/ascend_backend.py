@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -316,6 +317,133 @@ class AscendAttnBackend(AttentionBackend):
             ][:, :: self.page_size]
             // self.page_size
         )
+
+        # ---------------------------------------------------------
+        # C2KV page-table / attention-visibility debug
+        # ---------------------------------------------------------
+        if os.environ.get("C2KV_DEBUG_BLOCK_TABLES") == "1":
+            page_size = int(self.page_size)
+
+            for batch_idx, req_idx in enumerate(
+                forward_batch.req_pool_indices
+                .detach()
+                .cpu()
+                .tolist()
+            ):
+                seq_len = int(
+                    forward_batch.seq_lens[
+                        batch_idx
+                    ].item()
+                )
+
+                slots = (
+                    forward_batch
+                    .req_to_token_pool
+                    .req_to_token[
+                        req_idx,
+                        :seq_len,
+                    ]
+                    .long()
+                )
+
+                block_tables = (
+                    self.forward_metadata
+                    .block_tables[
+                        batch_idx
+                    ]
+                    .long()
+                )
+
+                logical = torch.arange(
+                    seq_len,
+                    device=slots.device,
+                    dtype=torch.long,
+                )
+
+                expected_slots = (
+                    block_tables[
+                        logical // page_size
+                    ]
+                    * page_size
+                    + (
+                        logical
+                        % page_size
+                    )
+                )
+
+                mismatch = torch.nonzero(
+                    slots != expected_slots,
+                    as_tuple=False,
+                ).reshape(-1)
+
+                limit = min(
+                    seq_len,
+                    80,
+                )
+
+                print(
+                    "[C2KV BLOCK DEBUG]",
+                    {
+                        "mode": str(
+                            forward_batch
+                            .forward_mode
+                        ),
+                        "req_idx": req_idx,
+                        "page_size": page_size,
+                        "seq_len": seq_len,
+                        "correction": getattr(
+                            forward_batch,
+                            "c2kv_position_corrections",
+                            None,
+                        ),
+                        "slots": (
+                            slots[:limit]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                        "slot_pages": (
+                            (
+                                slots[:limit]
+                                // page_size
+                            )
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                        "slot_offsets": (
+                            (
+                                slots[:limit]
+                                % page_size
+                            )
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                        "block_tables": (
+                            block_tables
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                        "expected_slots": (
+                            expected_slots[
+                                :limit
+                            ]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                        "mismatch_indices": (
+                            mismatch
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ),
+                    },
+                    flush=True,
+                )
+
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
@@ -976,12 +1104,66 @@ class AscendAttnBackend(AttentionBackend):
                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
                 # Model skywork-reward-gemma2-2-27B also suffers from precision anomalies, thus the torch native backend becomes beneficial approach.
+                qlens_page_aligned = True
+                c2kv_corr = getattr(
+                    forward_batch, "c2kv_position_corrections", None
+                )
+                if k_cache.dim() == 4:
+                    page_size = int(k_cache.shape[1])
+                    extend_lens = [
+                        int(x)
+                        for x in self.forward_metadata.extend_seq_lens_cpu_int
+                    ]
+                    context_lens = [
+                        int(x) for x in self.forward_metadata.seq_lens_cpu_int
+                    ]
+                    prefix_lens = [
+                        context_len - extend_len
+                        for context_len, extend_len in zip(
+                            context_lens, extend_lens
+                        )
+                    ]
+                    bad_prefixes = [
+                        (prefix_len, extend_len)
+                        for prefix_len, extend_len in zip(
+                            prefix_lens, extend_lens
+                        )
+                        if (
+                            extend_len > 1
+                            and prefix_len > 0
+                            and prefix_len % page_size != 0
+                        )
+                    ]
+                    if bad_prefixes:
+                        qlens_page_aligned = False
+                        if getattr(layer, "layer_id", 0) == 0:
+                            for prefix_len, extend_len in bad_prefixes:
+                                logger.warning(
+                                    "[C2KV HYBRID BRIDGE NATIVE] "
+                                    "prefix_len=%s, q_len=%s, "
+                                    "reason=non_page_aligned_prefix",
+                                    prefix_len,
+                                    extend_len,
+                                )
+                            logger.warning(
+                                "[C2KV HYBRID BRIDGE GUARD] "
+                                "non-page-aligned cached prefix before qlens; "
+                                "page_size=%s, bad_prefixes=%s, "
+                                "extend_lens=%s, context_lens=%s, "
+                                "fallback=native",
+                                page_size,
+                                bad_prefixes,
+                                extend_lens,
+                                context_lens,
+                            )
+
                 if (
                     layer.qk_head_dim <= 128
                     and causal
                     and forward_batch.encoder_lens is None
                     and layer.logit_cap == 0
                     and not getattr(self, "use_native_sdpa", False)
+                    and qlens_page_aligned
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -990,6 +1172,84 @@ class AscendAttnBackend(AttentionBackend):
                             dtype=query.dtype,
                             device=query.device,
                         )
+                        if (
+                            __import__("os").environ.get(
+                                "C2KV_DEBUG_ASCEND_ATTN"
+                            ) == "1"
+                            and getattr(layer, "layer_id", 0) == 0
+                        ):
+                            _bt = self.forward_metadata.block_tables
+                            print(
+                                "[C2KV ASCEND ATTN DEBUG]",
+                                {
+                                    "query_shape": tuple(query.shape),
+                                    "k_cache_shape": tuple(k_cache.shape),
+                                    "v_cache_shape": tuple(v_cache.shape),
+                                    "seq_len": list(
+                                        self.forward_metadata
+                                        .extend_seq_lens_cpu_int
+                                    ),
+                                    "context_lens": list(
+                                        self.forward_metadata
+                                        .seq_lens_cpu_int
+                                    ),
+                                    "block_tables_shape": tuple(
+                                        _bt.shape
+                                    ),
+                                    "block_tables_0": (
+                                        _bt[0]
+                                        .detach()
+                                        .cpu()
+                                        .tolist()
+                                        if _bt.numel()
+                                        else []
+                                    ),
+                                    "mask_shape": (
+                                        tuple(self.mask.shape)
+                                        if self.mask is not None
+                                        else None
+                                    ),
+                                    "scale": float(layer.scaling),
+                                    "num_heads": int(
+                                        layer.tp_q_head_num
+                                    ),
+                                    "num_kv_heads": int(
+                                        layer.tp_k_head_num
+                                    ),
+                                },
+                                flush=True,
+                            )
+                        if (
+                            c2kv_corr is not None
+                            and getattr(layer, "layer_id", 0) == 0
+                        ):
+                            logger.warning(
+                                "[C2KV QLENS CALL] "
+                                "page_size=%s, prefix_lens=%s, "
+                                "extend_lens=%s, context_lens=%s",
+                                (
+                                    int(k_cache.shape[1])
+                                    if k_cache.dim() == 4
+                                    else None
+                                ),
+                                [
+                                    int(context_len) - int(extend_len)
+                                    for context_len, extend_len in zip(
+                                        self.forward_metadata.seq_lens_cpu_int,
+                                        self.forward_metadata.extend_seq_lens_cpu_int,
+                                    )
+                                ],
+                                [
+                                    int(x)
+                                    for x in self.forward_metadata
+                                    .extend_seq_lens_cpu_int
+                                ],
+                                [
+                                    int(x)
+                                    for x in self.forward_metadata.seq_lens_cpu_int
+                                ],
+                            )
+
                         torch_npu._npu_flash_attention_qlens(
                             query=query,
                             key_cache=k_cache,

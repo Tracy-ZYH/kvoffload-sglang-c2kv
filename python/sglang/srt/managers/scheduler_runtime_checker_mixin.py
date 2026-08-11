@@ -184,6 +184,28 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
+        allocator = self.token_to_kv_pool_allocator
+
+        if available_size > self.max_total_num_tokens:
+            try:
+                free_pages = allocator.free_pages.detach().cpu()
+                release_pages = allocator.release_pages.detach().cpu()
+
+                free_set = set(free_pages.tolist())
+                release_set = set(release_pages.tolist())
+
+                logger.warning(
+                    "[NPU KV DEBUG] "
+                    f"allocator.size={allocator.size}, "
+                    f"page_size={allocator.page_size}, "
+                    f"len(free_pages)={len(free_pages)}, "
+                    f"len(release_pages)={len(release_pages)}, "
+                    f"intersection={sorted(free_set & release_set)[:20]}, "
+                    f"free_unique={len(free_set)}, "
+                    f"release_unique={len(release_set)}"
+                )
+            except Exception:
+                logger.exception("[NPU KV DEBUG] failed")
         memory_leak = (available_size + evictable_size) != (
             self.max_total_num_tokens - protected_size - session_held
         )

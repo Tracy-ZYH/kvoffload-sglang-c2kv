@@ -272,8 +272,15 @@ class SchedulerOutputProcessorMixin:
                                 batch.seq_lens_cpu[i].item()
                             )
                             if gist_delta > 0:
-                                batch.seq_lens[i] += gist_delta
                                 batch.seq_lens_cpu[i] += gist_delta
+                                if batch.seq_lens is None:
+                                    batch.seq_lens = batch.seq_lens_cpu.to(
+                                        batch.device
+                                    )
+                                else:
+                                    batch.seq_lens[i] += gist_delta
+                                if batch.seq_lens_sum is not None:
+                                    batch.seq_lens_sum += gist_delta
 
                         self._log_c2kv_token_usage(
                             "all_rounds_finished",

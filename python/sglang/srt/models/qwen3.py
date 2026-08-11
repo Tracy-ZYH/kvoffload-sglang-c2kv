@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+import os
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -62,9 +63,46 @@ if _use_aiter:
         pass
 
 if _is_npu:
+    import torch_npu
+
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+
+
+def _repeat_kv_for_npu_fusion(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads for Ascend FusionAttention GQA."""
+    if n_rep == 1:
+        return hidden_states
+
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch,
+        num_key_value_heads,
+        n_rep,
+        seq_len,
+        head_dim,
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+def _npu_fusion_attention_output(
+    output: Any, expected_shape: torch.Size
+) -> torch.Tensor:
+    if isinstance(output, torch.Tensor):
+        return output
+    if not isinstance(output, tuple) or not output:
+        raise RuntimeError(f"Unexpected npu_fusion_attention output type: {type(output)!r}")
+
+    candidates = [
+        item for item in output if isinstance(item, torch.Tensor) and item.dim() == 4
+    ]
+    if not candidates:
+        raise RuntimeError("npu_fusion_attention returned no 4-D attention output tensor.")
+    for tensor in candidates:
+        if tensor.shape == expected_shape:
+            return tensor
+    return candidates[0]
 
 
 class Qwen3Attention(nn.Module):
@@ -358,8 +396,229 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
-        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        # ---------------------------------------------------------
+        # C2KV_LAYER0_DIFF_DUMP
+        #
+        # Dump exactly one real C2KV EXTEND at layer 0:
+        #   hidden -> RoPE Q/K/V -> paged attention output
+        #   + the exact logical KV sequence read from paged cache.
+        # ---------------------------------------------------------
+        _c2kv_diff_path = os.environ.get("C2KV_DEBUG_LAYER0_DUMP")
+        _c2kv_force_dump = (
+            os.environ.get("C2KV_DEBUG_LAYER0_DUMP_FORCE") == "1"
+        )
+        _c2kv_min_qlen = int(
+            os.environ.get("C2KV_DEBUG_LAYER0_MIN_QLEN", "100")
+        )
+
+        # ForwardBatch already contains corrected positions, but it does
+        # not necessarily retain c2kv_position_corrections itself.
+        #
+        # For an EXTEND request:
+        #   normal first position = extend_prefix_len
+        #   C2KV first position   = extend_prefix_len + correction
+        #
+        # Therefore infer correction directly from the actual positions.
+        _c2kv_prefix_len = None
+        _c2kv_corr = None
+
+        if (
+            forward_batch.extend_prefix_lens_cpu is not None
+            and positions is not None
+            and positions.numel() > 0
+        ):
+            _c2kv_prefix_len = int(
+                forward_batch.extend_prefix_lens_cpu[0]
+            )
+            _c2kv_corr_value = (
+                int(positions.reshape(-1)[0].item())
+                - _c2kv_prefix_len
+            )
+
+            if _c2kv_corr_value != 0:
+                _c2kv_corr = [_c2kv_corr_value]
+
+        if _c2kv_force_dump and _c2kv_corr is None:
+            _c2kv_corr = [0]
+
+        _c2kv_do_dump = bool(
+            _c2kv_diff_path
+            and self.attn.layer_id == 0
+            and _c2kv_corr is not None
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and positions is not None
+            and positions.numel() >= _c2kv_min_qlen
+            and not os.path.exists(_c2kv_diff_path)
+        )
+
+        if _c2kv_do_dump:
+            _c2kv_debug = {
+                "positions": positions.detach().cpu().clone(),
+                "hidden": hidden_states.detach().cpu().clone(),
+                "q": q.detach().cpu().clone(),
+                "k_new": (
+                    k.detach().cpu().clone()
+                    if k is not None
+                    else None
+                ),
+                "v_new": (
+                    v.detach().cpu().clone()
+                    if v is not None
+                    else None
+                ),
+                "correction": list(_c2kv_corr),
+                "num_heads": int(self.num_heads),
+                "num_kv_heads": int(self.num_kv_heads),
+                "head_dim": int(self.head_dim),
+                "scaling": float(self.scaling),
+            }
+
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+        )
+
+        if _c2kv_do_dump:
+            # self.attn() has now written current query K/V into cache.
+            _req_idx = int(
+                forward_batch.req_pool_indices[0].item()
+            )
+            _seq_len = int(
+                forward_batch.seq_lens[0].item()
+            )
+
+            _slots = (
+                forward_batch.req_to_token_pool.req_to_token[
+                    _req_idx,
+                    :_seq_len,
+                ]
+                .long()
+            )
+
+            _k_cache, _v_cache = (
+                forward_batch.token_to_kv_pool.get_kv_buffer(
+                    self.attn.layer_id
+                )
+            )
+
+            _c2kv_debug.update(
+                {
+                    "req_idx": _req_idx,
+                    "seq_len": _seq_len,
+                    "slots": _slots.detach().cpu().clone(),
+                    "cache_raw_shape": tuple(
+                        _k_cache.shape
+                    ),
+                    "cache_page_size": (
+                        int(_k_cache.shape[1])
+                        if _k_cache.dim() == 4
+                        else None
+                    ),
+                    "attn_mask": (
+                        forward_batch.attn_backend.mask
+                        .detach()
+                        .cpu()
+                        .clone()
+                        if getattr(
+                            forward_batch.attn_backend,
+                            "mask",
+                            None,
+                        ) is not None
+                        else None
+                    ),
+                    "k_cache_seq": (
+                        (
+                            _k_cache[
+                                torch.div(
+                                    _slots,
+                                    int(_k_cache.shape[1]),
+                                    rounding_mode="floor",
+                                ),
+                                torch.remainder(
+                                    _slots,
+                                    int(_k_cache.shape[1]),
+                                ),
+                            ]
+                            if _k_cache.dim() == 4
+                            else _k_cache[_slots]
+                        )
+                        .detach()
+                        .cpu()
+                        .clone()
+                    ),
+                    "v_cache_seq": (
+                        (
+                            _v_cache[
+                                torch.div(
+                                    _slots,
+                                    int(_v_cache.shape[1]),
+                                    rounding_mode="floor",
+                                ),
+                                torch.remainder(
+                                    _slots,
+                                    int(_v_cache.shape[1]),
+                                ),
+                            ]
+                            if _v_cache.dim() == 4
+                            else _v_cache[_slots]
+                        )
+                        .detach()
+                        .cpu()
+                        .clone()
+                    ),
+                    "attn_output": (
+                        attn_output.detach().cpu().clone()
+                    ),
+                    "extend_prefix_lens": (
+                        list(forward_batch.extend_prefix_lens_cpu)
+                        if forward_batch.extend_prefix_lens_cpu is not None
+                        else None
+                    ),
+                    "extend_seq_lens": (
+                        list(forward_batch.extend_seq_lens_cpu)
+                        if forward_batch.extend_seq_lens_cpu is not None
+                        else None
+                    ),
+                }
+            )
+
         output, _ = self.o_proj(attn_output)
+
+        if _c2kv_do_dump:
+            _c2kv_debug["o_proj_output"] = (
+                output.detach().cpu().clone()
+            )
+
+            _dir = os.path.dirname(_c2kv_diff_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+
+            torch.save(
+                _c2kv_debug,
+                _c2kv_diff_path,
+            )
+
+            print(
+                "[C2KV LAYER0 DIFF DUMP]",
+                {
+                    "path": _c2kv_diff_path,
+                    "seq_len": _seq_len,
+                    "q_len": int(positions.numel()),
+                    "positions": [
+                        int(positions[0].item()),
+                        int(positions[-1].item()),
+                    ],
+                    "correction": list(_c2kv_corr),
+                    "k_cache_shape": tuple(
+                        _c2kv_debug["k_cache_seq"].shape
+                    ),
+                },
+                flush=True,
+            )
+
         return output
 
     def forward_with_gist(
@@ -416,9 +675,44 @@ class Qwen3Attention(nn.Module):
         k = k.view(1, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(1, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        attn_output = self.flex_attention(
-            q, k, v, block_mask=attention_mask, scale=self.scaling, enable_gqa=True,
-        )
+        if _is_npu:
+            if self.num_heads % self.num_kv_heads != 0:
+                raise RuntimeError(
+                    f"Invalid GQA heads: num_heads={self.num_heads}, "
+                    f"num_kv_heads={self.num_kv_heads}"
+                )
+
+            num_kv_groups = self.num_heads // self.num_kv_heads
+            q_attn = q.contiguous()
+            k_attn = _repeat_kv_for_npu_fusion(k, num_kv_groups).contiguous()
+            v_attn = _repeat_kv_for_npu_fusion(v, num_kv_groups).contiguous()
+
+            # Ascend attention mask is a block mask: True/1 means masked.
+            # C2KV attention_mask uses True as "can attend", so invert it.
+            npu_mask = None if attention_mask is None else (~attention_mask).contiguous()
+
+            attn_output = torch_npu.npu_fusion_attention(
+                q_attn,
+                k_attn,
+                v_attn,
+                q_attn.shape[1],
+                input_layout="BNSD",
+                atten_mask=npu_mask,
+                scale=self.scaling,
+                keep_prob=1.0,
+                sparse_mode=0,
+            )
+            attn_output = _npu_fusion_attention_output(attn_output, q_attn.shape)
+
+        else:
+            attn_output = self.flex_attention(
+                q,
+                k,
+                v,
+                block_mask=attention_mask,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
 
         # Reshape back: (1, num_heads, total_len, head_dim) -> (total_len, hidden)
         attn_output = (
@@ -880,6 +1174,28 @@ class Qwen3ForCausalLM(nn.Module):
             gist_key_values.append(layer_kv)
 
         gist_position_ids = position_ids[:, -gist_len:].contiguous()
+
+        # Debug: dump the pre-RoPE C2KV states produced by SGLang.
+        dump_path = os.environ.get("C2KV_DEBUG_GIST_DUMP")
+        if dump_path:
+            dump_obj = {
+                "input_ids": input_ids.detach().cpu(),
+                "gist_mask": gist_mask.detach().cpu(),
+                "gist_position_ids": gist_position_ids.detach().cpu(),
+                "kv": [
+                    (
+                        k.detach().cpu(),
+                        v.detach().cpu(),
+                    )
+                    for k, v in gist_key_values
+                ],
+            }
+            torch.save(dump_obj, dump_path)
+            logger.warning(
+                "[C2KV DEBUG] saved SGLang pre-RoPE gist KV to %s",
+                dump_path,
+            )
+
         return gist_key_values, gist_mask, gist_position_ids
 
     @torch.no_grad()

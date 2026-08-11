@@ -2189,6 +2189,16 @@ class Scheduler(
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         error_msg = None
         gist_key_values = gist_mask = gist_position_ids = None
+
+        def _release_npu_extract_temps():
+            if not _is_npu:
+                return
+            try:
+                torch.npu.synchronize()
+                torch.npu.empty_cache()
+            except Exception:
+                logger.warning("C2KV NPU extract cleanup failed", exc_info=True)
+
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
@@ -2217,6 +2227,9 @@ class Scheduler(
                 error_msg = "C2KV extract failed on a peer TP rank"
 
         if error_msg is not None:
+            input_ids = attention_mask = None
+            gist_key_values = gist_mask = gist_position_ids = None
+            _release_npu_extract_temps()
             return C2KVExtractReqOutput(error=error_msg, success=False)
 
         original_seq_len = len(recv_req.input_ids)
@@ -2241,6 +2254,9 @@ class Scheduler(
                 f"local pool capacity: {self.c2kv_pool.max_total_tokens})."
             )
             logger.warning(error_msg)
+            input_ids = attention_mask = None
+            gist_key_values = gist_mask = gist_position_ids = None
+            _release_npu_extract_temps()
             return C2KVExtractReqOutput(error=error_msg, success=False)
         has_space = self.c2kv_pool.can_allocate(gist_len, existing_key=key_hash)
         if self.tp_size > 1 and torch.distributed.is_initialized():
@@ -2257,6 +2273,9 @@ class Scheduler(
                 "gist tokens."
             )
             logger.warning(error_msg)
+            input_ids = attention_mask = None
+            gist_key_values = gist_mask = gist_position_ids = None
+            _release_npu_extract_temps()
             return C2KVExtractReqOutput(error=error_msg, success=False)
 
         try:
@@ -2269,6 +2288,9 @@ class Scheduler(
             )
         except ValueError as e:
             logger.warning("C2KV extract result does not fit in the pool: %s", e)
+            input_ids = attention_mask = None
+            gist_key_values = gist_mask = gist_position_ids = None
+            _release_npu_extract_temps()
             return C2KVExtractReqOutput(error=str(e), success=False)
         self._log_c2kv_token_usage(
             "extract_store",
@@ -2276,6 +2298,9 @@ class Scheduler(
             original_seq_len=original_seq_len,
             gist_len=entry.gist_len,
         )
+        input_ids = attention_mask = None
+        gist_key_values = gist_mask = gist_position_ids = None
+        _release_npu_extract_temps()
         return C2KVExtractReqOutput(
             key_hash=key_hash,
             gist_len=entry.gist_len,
@@ -2323,15 +2348,54 @@ class Scheduler(
         virtual_ids: list = []
         pending_seg_indices: list = []
         cursor = 0
+        page_size = int(getattr(self, "page_size", 1))
+
+        def append_c2kv_round(tokens: list, post_inject_seg_indices: list):
+            if not tokens:
+                return
+
+            prefix_len = len(virtual_ids)
+            post_inject = list(post_inject_seg_indices)
+
+            if (
+                _is_npu
+                and page_size > 1
+                and prefix_len > 0
+                and prefix_len % page_size != 0
+            ):
+                bridge_len = page_size - (prefix_len % page_size)
+                aligned_prefix = prefix_len + min(bridge_len, len(tokens))
+
+                if len(tokens) > bridge_len:
+                    bridge_tokens = tokens[:bridge_len]
+                    main_tokens = tokens[bridge_len:]
+                    rounds.append(C2KVPrefillRound(bridge_tokens, []))
+                    rounds.append(C2KVPrefillRound(main_tokens, post_inject))
+                    aligned_prefix = prefix_len + bridge_len
+                    remaining_extend = len(main_tokens)
+                else:
+                    rounds.append(C2KVPrefillRound(tokens, post_inject))
+                    remaining_extend = 0
+
+                logger.warning(
+                    "[C2KV HYBRID BRIDGE] "
+                    "prefix_len=%s, bridge_len=%s, aligned_prefix=%s, "
+                    "remaining_extend=%s",
+                    prefix_len,
+                    bridge_len,
+                    aligned_prefix,
+                    remaining_extend,
+                )
+            else:
+                rounds.append(C2KVPrefillRound(tokens, post_inject))
+
+            virtual_ids.extend(tokens)
 
         for seg_idx, (seg, entry) in enumerate(zip(segments, entries)):
             normal_tokens = original_input_ids[cursor : seg.token_start]
             if normal_tokens:
-                rounds.append(
-                    C2KVPrefillRound(normal_tokens, list(pending_seg_indices))
-                )
+                append_c2kv_round(normal_tokens, pending_seg_indices)
                 pending_seg_indices = []
-                virtual_ids.extend(normal_tokens)
 
             virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
 
@@ -2344,8 +2408,7 @@ class Scheduler(
 
         remaining = original_input_ids[cursor:]
         if remaining:
-            rounds.append(C2KVPrefillRound(remaining, list(pending_seg_indices)))
-            virtual_ids.extend(remaining)
+            append_c2kv_round(remaining, pending_seg_indices)
         elif pending_seg_indices and rounds:
             rounds[-1].post_inject_seg_indices.extend(pending_seg_indices)
 
@@ -2429,10 +2492,58 @@ class Scheduler(
 
         trimmed_kv_len = max(req.kv_allocated_len - kv_start, 0)
         if trimmed_kv_len > 0:
-            stale_kv_indices = model_runner.req_to_token_pool.req_to_token[
-                req.req_pool_idx, kv_start : req.kv_allocated_len
-            ]
-            model_runner.token_to_kv_pool_allocator.free(stale_kv_indices)
+            allocator = (
+                model_runner.token_to_kv_pool_allocator
+            )
+
+            free_start = kv_start
+
+            # -----------------------------------------------------
+            # C2KV NPU page-safe stale trim
+            #
+            # NPU allocator.free() is page-granular. If kv_start is
+            # inside a partial page containing committed prefix KV,
+            # freeing stale token slots from kv_start would free the
+            # entire physical page and invalidate that prefix.
+            #
+            # Keep the current partial page alive and only release
+            # stale pages beginning at the next logical page
+            # boundary.
+            # -----------------------------------------------------
+            if _is_npu:
+                page_size = int(allocator.page_size)
+
+                page_offset = (
+                    kv_start % page_size
+                )
+
+                if (
+                    kv_start > 0
+                    and page_offset != 0
+                ):
+                    free_start = min(
+                        req.kv_allocated_len,
+                        kv_start
+                        + (
+                            page_size
+                            - page_offset
+                        ),
+                    )
+
+            if free_start < req.kv_allocated_len:
+                stale_kv_indices = (
+                    model_runner
+                    .req_to_token_pool
+                    .req_to_token[
+                        req.req_pool_idx,
+                        free_start : req.kv_allocated_len,
+                    ]
+                )
+
+                allocator.free(
+                    stale_kv_indices
+                )
+
             req.kv_committed_len = kv_start
             req.kv_allocated_len = kv_start
 
@@ -2447,12 +2558,155 @@ class Scheduler(
             trimmed_kv_len=trimmed_kv_len,
         )
 
-        loc = model_runner.token_to_kv_pool_allocator.alloc(gist_len)
+        # ---------------------------------------------------------
+        # C2KV NPU page-aware alloc_extend
+        #
+        # C2KV gist tokens are logically appended after the committed
+        # KV prefix. On NPU paged KV cache, they must first continue
+        # filling the prefix's current partial physical page. A new
+        # physical page may only be allocated after crossing the
+        # logical page boundary.
+        # ---------------------------------------------------------
+        allocator = model_runner.token_to_kv_pool_allocator
+        page_size = int(getattr(allocator, "page_size", 1))
+
+        # Keep these for existing debug/token-usage logging below.
+        loc_offset = kv_start % page_size if _is_npu else 0
+        alloc_size = gist_len
+
+        def _alloc_c2kv_loc():
+            # Save allocator state. With alloc_extend(), returned loc
+            # can partly belong to the prefix's already-owned physical
+            # page, so allocator.free(loc) would be unsafe on NPU.
+            alloc_state = allocator.backup_state()
+
+            if _is_npu and page_size > 1:
+                if kv_start > 0:
+                    last_loc = (
+                        model_runner.req_to_token_pool.req_to_token[
+                            req.req_pool_idx,
+                            kv_start - 1,
+                        ]
+                        .reshape(1)
+                        .to(dtype=torch.int32)
+                    )
+
+                    device = last_loc.device
+
+                    prefix_lens = torch.tensor(
+                        [kv_start],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+
+                    seq_lens = torch.tensor(
+                        [kv_start + gist_len],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+
+                    prefix_lens_cpu = torch.tensor(
+                        [kv_start],
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+
+                    seq_lens_cpu = torch.tensor(
+                        [kv_start + gist_len],
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+
+                    new_loc = allocator.alloc_extend(
+                        prefix_lens=prefix_lens,
+                        prefix_lens_cpu=prefix_lens_cpu,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens_cpu,
+                        last_loc=last_loc,
+                        extend_num_tokens=gist_len,
+                    )
+
+                    # For logging only: number of new physical slots
+                    # represented by newly allocated pages.
+                    alloc_size_local = (
+                        (
+                            (kv_start + gist_len + page_size - 1)
+                            // page_size
+                        )
+                        - (
+                            (kv_start + page_size - 1)
+                            // page_size
+                        )
+                    ) * page_size
+
+                else:
+                    # No existing prefix page. Allocate page-aligned
+                    # storage from a fresh physical page.
+                    alloc_size_local = (
+                        (gist_len + page_size - 1)
+                        // page_size
+                    ) * page_size
+
+                    allocated_loc = allocator.alloc(
+                        alloc_size_local
+                    )
+
+                    new_loc = (
+                        allocated_loc[:gist_len]
+                        if allocated_loc is not None
+                        else None
+                    )
+
+            else:
+                alloc_size_local = gist_len
+
+                new_loc = allocator.alloc(
+                    gist_len
+                )
+
+            if new_loc is None:
+                allocator.restore_state(
+                    alloc_state
+                )
+                return None, None, alloc_size_local
+
+            return (
+                new_loc,
+                alloc_state,
+                alloc_size_local,
+            )
+
+        (
+            loc,
+            c2kv_alloc_state,
+            alloc_size,
+        ) = _alloc_c2kv_loc()
+
         if loc is None:
-            evict_from_tree_cache(self.tree_cache, gist_len)
-            loc = model_runner.token_to_kv_pool_allocator.alloc(gist_len)
+            # Evict enough capacity for at least the gist. On NPU
+            # eviction/allocation is page-granular.
+            evict_need = (
+                max(gist_len, page_size)
+                if _is_npu and page_size > 1
+                else gist_len
+            )
+
+            evict_from_tree_cache(
+                self.tree_cache,
+                evict_need,
+            )
+
+            (
+                loc,
+                c2kv_alloc_state,
+                alloc_size,
+            ) = _alloc_c2kv_loc()
+
         if loc is None:
-            logger.warning(f"C2KV: cannot allocate {gist_len} KV slots (OOM)")
+            logger.warning(
+                f"C2KV: cannot allocate "
+                f"{gist_len} KV slots (OOM)"
+            )
             self._log_c2kv_token_usage(
                 "inject_alloc_failed",
                 req=req,
@@ -2462,12 +2716,20 @@ class Scheduler(
             )
             return False
 
+        def _rollback_c2kv_alloc():
+            if c2kv_alloc_state is not None:
+                allocator.restore_state(
+                    c2kv_alloc_state
+                )
+
         self._log_c2kv_token_usage(
             "inject_after_alloc",
             req=req,
             seg_idx=seg_idx,
             key_hash=seg.key_hash[:16],
             gist_len=gist_len,
+            alloc_size=alloc_size,
+            loc_offset=loc_offset,
             loc_len=loc.numel(),
         )
 
@@ -2477,7 +2739,7 @@ class Scheduler(
                 f"C2KV: gist injection would exceed max_context_len "
                 f"({kv_start}+{gist_len}={kv_start + gist_len} > {max_ctx})"
             )
-            model_runner.token_to_kv_pool_allocator.free(loc)
+            _rollback_c2kv_alloc()
             self._log_c2kv_token_usage(
                 "inject_context_overflow",
                 req=req,
@@ -2495,7 +2757,7 @@ class Scheduler(
             ] = loc
         except Exception as e:
             logger.warning(f"C2KV: req_to_token_pool write failed: {e}")
-            model_runner.token_to_kv_pool_allocator.free(loc)
+            _rollback_c2kv_alloc()
             self._log_c2kv_token_usage(
                 "inject_req_to_token_write_failed",
                 req=req,
@@ -2534,7 +2796,7 @@ class Scheduler(
             )
         except Exception as e:
             logger.error(f"C2KV injection failed: {e}", exc_info=True)
-            model_runner.token_to_kv_pool_allocator.free(loc)
+            _rollback_c2kv_alloc()
             self._log_c2kv_token_usage(
                 "inject_failed",
                 req=req,

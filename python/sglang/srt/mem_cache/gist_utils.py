@@ -10,11 +10,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
-from torch.nn.attention.flex_attention import FlexKernelOptions, create_block_mask
+from torch.nn.attention.flex_attention import create_block_mask
 
-C2KV_KERNEL_OPTIONS = FlexKernelOptions(
-    FORCE_USE_FLEX_ATTENTION=True,
-)
+# PyTorch 2.8 accepts kernel_options as a plain dict.
+C2KV_KERNEL_OPTIONS = {
+    "FORCE_USE_FLEX_ATTENTION": True,
+}
 
 
 def resolve_c2kv_compression_ratio(
@@ -116,9 +117,46 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
 
             return input_to_input | gist_to_input | gist_to_gist
 
-        block_mask = create_block_mask(
-            mask_mod, B=1, H=None, Q_LEN=total_len, KV_LEN=total_len, device=device
-        )
+        if device.type == "npu":
+            # Correctness-first NPU fallback:
+            # build a dense boolean attention mask directly and avoid
+            # FlexAttention BlockMask / stable argsort on Ascend.
+            idx = torch.arange(total_len, device=device, dtype=torch.long)
+            q_idx = idx[:, None]
+            kv_idx = idx[None, :]
+
+            is_q_input = q_idx < seq_len
+            is_kv_input = kv_idx < seq_len
+
+            # input -> input: causal
+            input_to_input = is_q_input & is_kv_input & (q_idx >= kv_idx)
+
+            # gist -> input: own chunk + sink tokens
+            gist_j = q_idx - seq_len
+            chunk_begin = gist_j * ratio - gist_overlap
+            chunk_end = (gist_j + 1) * ratio
+
+            gist_to_input = (~is_q_input) & is_kv_input & (
+                ((kv_idx >= chunk_begin) & (kv_idx < chunk_end)) | (kv_idx < ratio)
+            )
+
+            # gist -> gist: causal
+            gist_to_gist = (~is_q_input) & (~is_kv_input) & (q_idx >= kv_idx)
+
+            # Shape: (1, 1, total_len, total_len)
+            block_mask = (input_to_input | gist_to_input | gist_to_gist).unsqueeze(
+                0
+            ).unsqueeze(0)
+
+        else:
+            block_mask = create_block_mask(
+                mask_mod,
+                B=1,
+                H=None,
+                Q_LEN=total_len,
+                KV_LEN=total_len,
+                device=device,
+            )
 
         # --- gist_mask (1, gist_len) ---
         gist_mask = torch.ones((1, gist_len), dtype=torch.bool, device=device)
