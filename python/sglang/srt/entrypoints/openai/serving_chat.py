@@ -259,14 +259,57 @@ class OpenAIServingChat(OpenAIServingBase):
         tokenizer = self.tokenizer_manager.tokenizer
         annotated_set = set(annotated)
 
+        # Insertion points must be computed against the SAME rendered prompt that
+        # _process_messages/_apply_jinja_template will later produce. In particular,
+        # `tools` and `chat_template_kwargs` change the rendered prefix (Qwen-style
+        # templates inject the tool schemas into the system block), so omitting them
+        # here shifts every insertion point by the length of the tools block and the
+        # gist KV gets injected at the wrong absolute offset. Mirror the derivation
+        # used in _process_messages (tool_choice filtering + template kwargs +
+        # flat-function fallback).
+        tools = None
+        if request.tools and request.tool_choice != "none":
+            if not isinstance(request.tool_choice, str):
+                tools = [
+                    item.model_dump()
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
+            else:
+                tools = [item.model_dump() for item in request.tools]
+
+        extra_template_kwargs = {}
+        if getattr(request, "reasoning_effort", None) is not None:
+            extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+        if request.chat_template_kwargs:
+            extra_template_kwargs.update(request.chat_template_kwargs)
+
         def chat_template_input_ids(messages):
             if not messages:
                 return []
-            tokenized = tokenizer.apply_chat_template(
-                [m.model_dump() for m in messages],
-                tokenize=True,
-                add_generation_prompt=False,
-            )
+            try:
+                tokenized = tokenizer.apply_chat_template(
+                    [m.model_dump() for m in messages],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    tools=tools,
+                    **extra_template_kwargs,
+                )
+            except Exception:
+                # Mirror _apply_jinja_template's fallback for templates that
+                # expect tools without the OpenAI wrapper (e.g. Mistral).
+                flat_tools = (
+                    [t["function"] if "function" in t else t for t in tools]
+                    if tools
+                    else None
+                )
+                tokenized = tokenizer.apply_chat_template(
+                    [m.model_dump() for m in messages],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    tools=flat_tools,
+                    **extra_template_kwargs,
+                )
             if hasattr(tokenized, "input_ids"):
                 tokenized = tokenized.input_ids
             elif isinstance(tokenized, dict):
