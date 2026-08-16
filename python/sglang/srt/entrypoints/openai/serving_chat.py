@@ -239,6 +239,113 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _chat_template_tools(
+        self, request: "ChatCompletionRequest"
+    ) -> Optional[List[Dict]]:
+        if not request.tools or request.tool_choice == "none":
+            return None
+        if not isinstance(request.tool_choice, str):
+            return [
+                item.model_dump()
+                for item in request.tools
+                if item.function.name == request.tool_choice.function.name
+            ]
+        return [item.model_dump() for item in request.tools]
+
+    def _chat_template_extra_kwargs(
+        self, request: "ChatCompletionRequest"
+    ) -> Dict[str, Any]:
+        extra_template_kwargs = {}
+        if request.reasoning_effort is not None:
+            extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+        if request.chat_template_kwargs:
+            extra_template_kwargs.update(request.chat_template_kwargs)
+        return extra_template_kwargs
+
+    def _openai_messages_for_chat_template(self, messages: List[ChatMessage]):
+        template_content_format = self.template_manager.jinja_template_content_format
+        openai_compatible_messages = []
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        for message in messages:
+            msg_dict = message.model_dump()
+            if msg_dict.get("content") is None:
+                msg_dict["content"] = ""
+            processed_msg = process_content_for_template_format(
+                msg_dict,
+                template_content_format,
+                image_data,
+                video_data,
+                audio_data,
+                modalities,
+            )
+            if (
+                processed_msg["role"] == "assistant"
+                and "tool_calls" in processed_msg
+                and isinstance(processed_msg["tool_calls"], list)
+            ):
+                for item in processed_msg["tool_calls"]:
+                    if "arguments" in item["function"] and isinstance(
+                        item["function"]["arguments"], str
+                    ):
+                        item["function"]["arguments"] = orjson.loads(
+                            item["function"]["arguments"]
+                        )
+            openai_compatible_messages.append(processed_msg)
+
+        return openai_compatible_messages
+
+    def _c2kv_chat_template_input_ids(
+        self,
+        request: "ChatCompletionRequest",
+        messages: List[ChatMessage],
+        tools: Optional[List[Dict]],
+    ):
+        if not messages:
+            return []
+
+        tokenizer = self.tokenizer_manager.tokenizer
+        extra_template_kwargs = self._chat_template_extra_kwargs(request)
+        openai_compatible_messages = self._openai_messages_for_chat_template(messages)
+
+        try:
+            tokenized = tokenizer.apply_chat_template(
+                openai_compatible_messages,
+                tokenize=True,
+                add_generation_prompt=False,
+                tools=tools,
+                return_dict=False,
+                **extra_template_kwargs,
+            )
+        except Exception:
+            # Match _apply_jinja_template's function-only fallback for templates
+            # that do not accept OpenAI's {"type": "function", ...} wrapper.
+            flat_tools = (
+                [t["function"] if "function" in t else t for t in tools]
+                if tools
+                else None
+            )
+            try:
+                tokenized = tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    tools=flat_tools,
+                    return_dict=False,
+                    **extra_template_kwargs,
+                )
+            except jinja2.TemplateError as template_error:
+                raise ValueError(str(template_error)) from template_error
+
+        if hasattr(tokenized, "input_ids"):
+            tokenized = tokenized.input_ids
+        elif isinstance(tokenized, dict):
+            tokenized = tokenized["input_ids"]
+        return list(tokenized)
+
     def _compute_c2kv_segments(self, request: "ChatCompletionRequest"):
         """
         Detect messages annotated with c2kv_key_hash, compute their insertion
@@ -256,22 +363,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if not annotated:
             return None
 
-        tokenizer = self.tokenizer_manager.tokenizer
         annotated_set = set(annotated)
-
-        def chat_template_input_ids(messages):
-            if not messages:
-                return []
-            tokenized = tokenizer.apply_chat_template(
-                [m.model_dump() for m in messages],
-                tokenize=True,
-                add_generation_prompt=False,
-            )
-            if hasattr(tokenized, "input_ids"):
-                tokenized = tokenized.input_ids
-            elif isinstance(tokenized, dict):
-                tokenized = tokenized["input_ids"]
-            return list(tokenized)
+        tools = self._chat_template_tools(request)
 
         segments = []
         for i in annotated:
@@ -281,7 +374,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 for j, m in enumerate(request.messages[:i])
                 if j not in annotated_set
             ]
-            insertion_point = len(chat_template_input_ids(compressed_prefix))
+            insertion_point = len(
+                self._c2kv_chat_template_input_ids(request, compressed_prefix, tools)
+            )
 
             segments.append(
                 C2KVSegmentInfo(
@@ -403,17 +498,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
-        tools = None
-        if request.tools and request.tool_choice != "none":
+        tools = self._chat_template_tools(request)
+        if tools is not None:
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
-                tools = [
-                    item.model_dump()
-                    for item in request.tools
-                    if item.function.name == request.tool_choice.function.name
-                ]
-            else:
-                tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
