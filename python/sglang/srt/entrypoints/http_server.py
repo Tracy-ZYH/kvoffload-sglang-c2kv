@@ -117,10 +117,12 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    CreateRecoveryCheckpointReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetRecoveryCheckpointReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -130,7 +132,9 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReqInput,
+    ReleaseRecoveryCheckpointReqInput,
     ReleaseMemoryOccupationReqInput,
+    RestoreRecoveryCheckpointReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
@@ -843,6 +847,57 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
+
+
+@app.post("/recovery_checkpoint/create")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def create_recovery_checkpoint(obj: CreateRecoveryCheckpointReqInput):
+    """Register an already-prefilled Full-KV prefix as a host recovery checkpoint."""
+    ret = await _global_state.tokenizer_manager.create_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/recovery_checkpoint/restore")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def restore_recovery_checkpoint(obj: RestoreRecoveryCheckpointReqInput):
+    """Load a host recovery checkpoint back to device KV cache."""
+    ret = await _global_state.tokenizer_manager.restore_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/recovery_checkpoint/release")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def release_recovery_checkpoint(obj: ReleaseRecoveryCheckpointReqInput):
+    """Release host/device pins for a recovery checkpoint."""
+    ret = await _global_state.tokenizer_manager.release_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/recovery_checkpoint/status", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def recovery_checkpoint_status(
+    obj: Optional[GetRecoveryCheckpointReqInput] = None,
+    checkpoint_id: Optional[str] = Query(None),
+):
+    """Return recovery checkpoint status without exposing TreeNode or tensors."""
+    if obj is None:
+        obj = GetRecoveryCheckpointReqInput(checkpoint_id=checkpoint_id)
+    elif obj.checkpoint_id is None and checkpoint_id is not None:
+        obj.checkpoint_id = checkpoint_id
+    ret = await _global_state.tokenizer_manager.get_recovery_checkpoint(obj)
+    return ORJSONResponse(
+        content=dataclasses.asdict(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

@@ -727,6 +727,154 @@ class HiRadixCache(RadixCache):
         """
         return RadixKey(token_ids=list(token_ids))
 
+    def find_exact_prefix_node(
+        self, token_ids: List[int], extra_key: Optional[str] = None
+    ) -> Optional[TreeNode]:
+        """Return the radix node for an exact, page-aligned token prefix.
+
+        Recovery checkpoints intentionally do not perform prefill.  They can
+        only attach to a prefix that normal request processing has already
+        inserted into the HiRadix tree.
+        """
+        if self.disable or len(token_ids) == 0:
+            return None
+        if self.page_size != 1 and len(token_ids) % self.page_size != 0:
+            return None
+
+        key = RadixKey(token_ids=list(token_ids), extra_key=extra_key)
+        key, _ = self.maybe_bigram_convert(key)
+        if self.page_size != 1 and len(key) % self.page_size != 0:
+            return None
+
+        _, last_node = self._match_prefix_helper(self.root_node, key)
+        matched_len = sum(len(node.key) for node in self.get_node_path(last_node))
+        if matched_len != len(key):
+            return None
+        return last_node
+
+    def get_node_path(self, last_node: TreeNode) -> List[TreeNode]:
+        path = []
+        node = last_node
+        while node is not None and node != self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        return path
+
+    def ensure_prefix_host_backup(
+        self, last_node: TreeNode, sync: bool = True
+    ) -> dict:
+        """Back up every node in the prefix path from root to last_node."""
+        backup_tokens = 0
+        for node in self.get_node_path(last_node):
+            if node.backuped:
+                continue
+            if node.evicted:
+                return {
+                    "success": False,
+                    "backup_tokens": backup_tokens,
+                    "message": f"Node {node.id} has no device KV to back up.",
+                }
+            written = self.write_backup(node)
+            if not written:
+                return {
+                    "success": False,
+                    "backup_tokens": backup_tokens,
+                    "message": f"Failed to back up node {node.id}.",
+                }
+            backup_tokens += int(written)
+            if sync:
+                self.writing_check()
+
+        if sync:
+            self.writing_check()
+        return {"success": True, "backup_tokens": backup_tokens, "message": ""}
+
+    def protect_host_prefix(self, last_node: TreeNode) -> int:
+        protected_tokens = 0
+        for node in self.get_node_path(last_node):
+            if node.backuped:
+                node.protect_host()
+                protected_tokens += len(node.host_value)
+        return protected_tokens
+
+    def release_host_prefix(self, last_node: TreeNode) -> int:
+        released_tokens = 0
+        for node in reversed(self.get_node_path(last_node)):
+            if node.backuped and node.host_ref_counter > 0:
+                released_tokens += len(node.host_value)
+                node.release_host()
+        return released_tokens
+
+    def load_prefix_to_device(
+        self,
+        last_node: TreeNode,
+        sync: bool = True,
+        mem_quota: Optional[int] = None,
+    ) -> dict:
+        already_device_tokens = sum(
+            len(node.value)
+            for node in self.get_node_path(last_node)
+            if not node.evicted and node.value is not None
+        )
+        host_missing = [
+            node.id
+            for node in self.get_node_path(last_node)
+            if node.evicted and not node.backuped
+        ]
+        if host_missing:
+            return {
+                "success": False,
+                "already_device_tokens": already_device_tokens,
+                "loaded_from_host_tokens": 0,
+                "message": f"Missing host backup for nodes {host_missing}.",
+            }
+        if all(not node.evicted for node in self.get_node_path(last_node)):
+            return {
+                "success": True,
+                "already_device_tokens": already_device_tokens,
+                "loaded_from_host_tokens": 0,
+                "message": "",
+            }
+
+        old_threshold = self.load_back_threshold
+        try:
+            # Checkpoint restore must be allowed to load even very short suffixes.
+            self.load_back_threshold = 0
+            loaded = self.load_back(last_node, mem_quota)
+            if sync:
+                self.loading_check()
+        finally:
+            self.load_back_threshold = old_threshold
+
+        loaded_tokens = int(len(loaded)) if loaded is not None else 0
+        return {
+            "success": True,
+            "already_device_tokens": already_device_tokens,
+            "loaded_from_host_tokens": loaded_tokens,
+            "message": "",
+        }
+
+    def demote_prefix_to_host(
+        self, last_node: TreeNode, only_unlocked: bool = True
+    ) -> dict:
+        requested = 0
+        actual = 0
+        locked = 0
+        for node in reversed(self.get_node_path(last_node)):
+            if node.evicted or not node.backuped or node.value is None:
+                continue
+            requested += len(node.value)
+            if only_unlocked and node.lock_ref > 0:
+                locked += len(node.value)
+                continue
+            actual += self._evict_backuped(node)
+        return {
+            "requested_host_only_tokens": requested,
+            "actual_host_only_tokens": actual,
+            "shared_or_locked_device_tokens": locked,
+        }
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)

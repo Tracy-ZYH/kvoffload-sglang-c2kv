@@ -94,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ContinueGenerationReqInput,
+    CreateRecoveryCheckpointReqInput,
+    CreateRecoveryCheckpointReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -109,6 +111,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadsReqInput,
+    GetRecoveryCheckpointReqInput,
+    GetRecoveryCheckpointReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -121,7 +125,11 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    ReleaseRecoveryCheckpointReqInput,
+    ReleaseRecoveryCheckpointReqOutput,
     ReleaseMemoryOccupationReqInput,
+    RestoreRecoveryCheckpointReqInput,
+    RestoreRecoveryCheckpointReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -824,6 +832,16 @@ class Scheduler(
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+        self.recovery_checkpoint_manager = None
+        if hasattr(self.tree_cache, "find_exact_prefix_node"):
+            from sglang.srt.mem_cache.recovery_checkpoint import (
+                RecoveryCheckpointManager,
+            )
+
+            self.recovery_checkpoint_manager = RecoveryCheckpointManager(
+                self.tree_cache
+            )
+
         self.c2kv_pool = None
         if server_args.enable_c2kv:
             from sglang.srt.mem_cache.c2kv_pool import (
@@ -1292,6 +1310,22 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (
+                    CreateRecoveryCheckpointReqInput,
+                    self.create_recovery_checkpoint,
+                ),
+                (
+                    RestoreRecoveryCheckpointReqInput,
+                    self.restore_recovery_checkpoint,
+                ),
+                (
+                    ReleaseRecoveryCheckpointReqInput,
+                    self.release_recovery_checkpoint,
+                ),
+                (
+                    GetRecoveryCheckpointReqInput,
+                    self.get_recovery_checkpoint,
+                ),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -3827,6 +3861,137 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _recovery_checkpoint_unavailable(self, output_cls, recv_req, reason: str):
+        return output_cls(
+            success=False,
+            checkpoint_id=getattr(recv_req, "checkpoint_id", "") or "",
+            fallback_reason=reason,
+            status={},
+        )
+
+    def create_recovery_checkpoint(
+        self, recv_req: CreateRecoveryCheckpointReqInput
+    ) -> CreateRecoveryCheckpointReqOutput:
+        if self.recovery_checkpoint_manager is None:
+            return self._recovery_checkpoint_unavailable(
+                CreateRecoveryCheckpointReqOutput,
+                recv_req,
+                "HIERARCHICAL_CACHE_NOT_ENABLED",
+            )
+        try:
+            status = self.recovery_checkpoint_manager.create(
+                checkpoint_id=recv_req.checkpoint_id,
+                input_ids=recv_req.input_ids,
+                extra_key=recv_req.extra_key,
+                session_id=recv_req.session_id,
+                segment_id=recv_req.segment_id,
+                global_step=recv_req.global_step,
+                parent_checkpoint_id=recv_req.parent_checkpoint_id,
+                tier=recv_req.tier,
+                evict_device_after=recv_req.evict_device_after,
+                sync=recv_req.sync,
+            )
+            return CreateRecoveryCheckpointReqOutput(
+                success=bool(status.get("success")),
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=status.get("fallback_reason", ""),
+                status=status,
+            )
+        except Exception as e:
+            logger.exception("Create recovery checkpoint failed.")
+            return CreateRecoveryCheckpointReqOutput(
+                success=False,
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=str(e),
+                status={},
+            )
+
+    def restore_recovery_checkpoint(
+        self, recv_req: RestoreRecoveryCheckpointReqInput
+    ) -> RestoreRecoveryCheckpointReqOutput:
+        if self.recovery_checkpoint_manager is None:
+            return self._recovery_checkpoint_unavailable(
+                RestoreRecoveryCheckpointReqOutput,
+                recv_req,
+                "HIERARCHICAL_CACHE_NOT_ENABLED",
+            )
+        try:
+            status = self.recovery_checkpoint_manager.restore(
+                checkpoint_id=recv_req.checkpoint_id,
+                sync=recv_req.sync,
+                pin_device=recv_req.pin_device,
+                mem_quota=recv_req.mem_quota,
+            )
+            return RestoreRecoveryCheckpointReqOutput(
+                success=bool(status.get("success")),
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=status.get("fallback_reason", ""),
+                status=status,
+            )
+        except Exception as e:
+            logger.exception("Restore recovery checkpoint failed.")
+            return RestoreRecoveryCheckpointReqOutput(
+                success=False,
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=str(e),
+                status={},
+            )
+
+    def release_recovery_checkpoint(
+        self, recv_req: ReleaseRecoveryCheckpointReqInput
+    ) -> ReleaseRecoveryCheckpointReqOutput:
+        if self.recovery_checkpoint_manager is None:
+            return self._recovery_checkpoint_unavailable(
+                ReleaseRecoveryCheckpointReqOutput,
+                recv_req,
+                "HIERARCHICAL_CACHE_NOT_ENABLED",
+            )
+        try:
+            status = self.recovery_checkpoint_manager.release(recv_req.checkpoint_id)
+            return ReleaseRecoveryCheckpointReqOutput(
+                success=bool(status.get("success")),
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=status.get("fallback_reason", ""),
+                status=status,
+            )
+        except Exception as e:
+            logger.exception("Release recovery checkpoint failed.")
+            return ReleaseRecoveryCheckpointReqOutput(
+                success=False,
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=str(e),
+                status={},
+            )
+
+    def get_recovery_checkpoint(
+        self, recv_req: GetRecoveryCheckpointReqInput
+    ) -> GetRecoveryCheckpointReqOutput:
+        if self.recovery_checkpoint_manager is None:
+            return GetRecoveryCheckpointReqOutput(
+                success=False,
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason="HIERARCHICAL_CACHE_NOT_ENABLED",
+                status={},
+            )
+        try:
+            status = self.recovery_checkpoint_manager.get_status(
+                recv_req.checkpoint_id
+            )
+            return GetRecoveryCheckpointReqOutput(
+                success=bool(status.get("success")),
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=status.get("fallback_reason", ""),
+                status=status,
+            )
+        except Exception as e:
+            logger.exception("Get recovery checkpoint failed.")
+            return GetRecoveryCheckpointReqOutput(
+                success=False,
+                checkpoint_id=recv_req.checkpoint_id,
+                fallback_reason=str(e),
+                status={},
+            )
+
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -3973,6 +4138,8 @@ class Scheduler(
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
+            if self.recovery_checkpoint_manager is not None:
+                self.recovery_checkpoint_manager.clear()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()

@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CreateRecoveryCheckpointReqInput,
+    CreateRecoveryCheckpointReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -49,6 +51,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    GetRecoveryCheckpointReqInput,
+    GetRecoveryCheckpointReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -64,8 +68,12 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReleaseRecoveryCheckpointReqInput,
+    ReleaseRecoveryCheckpointReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RestoreRecoveryCheckpointReqInput,
+    RestoreRecoveryCheckpointReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -243,6 +251,18 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.create_recovery_checkpoint_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.restore_recovery_checkpoint_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.release_recovery_checkpoint_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_recovery_checkpoint_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -318,6 +338,22 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    CreateRecoveryCheckpointReqOutput,
+                    self.create_recovery_checkpoint_communicator.handle_recv,
+                ),
+                (
+                    RestoreRecoveryCheckpointReqOutput,
+                    self.restore_recovery_checkpoint_communicator.handle_recv,
+                ),
+                (
+                    ReleaseRecoveryCheckpointReqOutput,
+                    self.release_recovery_checkpoint_communicator.handle_recv,
+                ),
+                (
+                    GetRecoveryCheckpointReqOutput,
+                    self.get_recovery_checkpoint_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -386,6 +422,59 @@ class TokenizerCommunicatorMixin:
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
         ]
+
+    @staticmethod
+    def _merge_recovery_checkpoint_results(results, output_cls, checkpoint_id=None):
+        all_success = all(result.success for result in results)
+        fallback = " | ".join(
+            result.fallback_reason for result in results if result.fallback_reason
+        )
+        return output_cls(
+            success=all_success,
+            checkpoint_id=checkpoint_id,
+            fallback_reason=fallback,
+            status={"ranks": [result.status for result in results]},
+        )
+
+    async def create_recovery_checkpoint(
+        self: TokenizerManager,
+        obj: CreateRecoveryCheckpointReqInput,
+    ) -> CreateRecoveryCheckpointReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.create_recovery_checkpoint_communicator(obj)
+        return self._merge_recovery_checkpoint_results(
+            results, CreateRecoveryCheckpointReqOutput, obj.checkpoint_id
+        )
+
+    async def restore_recovery_checkpoint(
+        self: TokenizerManager,
+        obj: RestoreRecoveryCheckpointReqInput,
+    ) -> RestoreRecoveryCheckpointReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.restore_recovery_checkpoint_communicator(obj)
+        return self._merge_recovery_checkpoint_results(
+            results, RestoreRecoveryCheckpointReqOutput, obj.checkpoint_id
+        )
+
+    async def release_recovery_checkpoint(
+        self: TokenizerManager,
+        obj: ReleaseRecoveryCheckpointReqInput,
+    ) -> ReleaseRecoveryCheckpointReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.release_recovery_checkpoint_communicator(obj)
+        return self._merge_recovery_checkpoint_results(
+            results, ReleaseRecoveryCheckpointReqOutput, obj.checkpoint_id
+        )
+
+    async def get_recovery_checkpoint(
+        self: TokenizerManager,
+        obj: GetRecoveryCheckpointReqInput,
+    ) -> GetRecoveryCheckpointReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.get_recovery_checkpoint_communicator(obj)
+        return self._merge_recovery_checkpoint_results(
+            results, GetRecoveryCheckpointReqOutput, obj.checkpoint_id
+        )
 
     async def attach_hicache_storage(
         self: TokenizerManager,

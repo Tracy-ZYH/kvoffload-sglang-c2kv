@@ -1192,6 +1192,70 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class CreateRecoveryCheckpointReqInput(BaseReq):
+    checkpoint_id: str = ""
+    input_ids: List[int] = field(default_factory=list)
+    extra_key: Optional[str] = None
+    session_id: Optional[str] = None
+    segment_id: Optional[int] = None
+    global_step: Optional[int] = None
+    parent_checkpoint_id: Optional[str] = None
+    tier: str = "host"
+    evict_device_after: bool = True
+    sync: bool = True
+
+
+@dataclass
+class CreateRecoveryCheckpointReqOutput(BaseReq):
+    success: bool
+    checkpoint_id: str = ""
+    fallback_reason: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RestoreRecoveryCheckpointReqInput(BaseReq):
+    checkpoint_id: str = ""
+    sync: bool = True
+    pin_device: bool = True
+    mem_quota: Optional[int] = None
+
+
+@dataclass
+class RestoreRecoveryCheckpointReqOutput(BaseReq):
+    success: bool
+    checkpoint_id: str = ""
+    fallback_reason: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReleaseRecoveryCheckpointReqInput(BaseReq):
+    checkpoint_id: str = ""
+
+
+@dataclass
+class ReleaseRecoveryCheckpointReqOutput(BaseReq):
+    success: bool
+    checkpoint_id: str = ""
+    fallback_reason: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GetRecoveryCheckpointReqInput(BaseReq):
+    checkpoint_id: Optional[str] = None
+
+
+@dataclass
+class GetRecoveryCheckpointReqOutput(BaseReq):
+    success: bool
+    checkpoint_id: Optional[str] = None
+    fallback_reason: str = ""
+    status: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
