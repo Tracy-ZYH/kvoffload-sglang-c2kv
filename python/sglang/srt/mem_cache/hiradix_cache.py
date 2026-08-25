@@ -812,14 +812,15 @@ class HiRadixCache(RadixCache):
         sync: bool = True,
         mem_quota: Optional[int] = None,
     ) -> dict:
+        path = self.get_node_path(last_node)
         already_device_tokens = sum(
             len(node.value)
-            for node in self.get_node_path(last_node)
+            for node in path
             if not node.evicted and node.value is not None
         )
         host_missing = [
             node.id
-            for node in self.get_node_path(last_node)
+            for node in path
             if node.evicted and not node.backuped
         ]
         if host_missing:
@@ -829,7 +830,7 @@ class HiRadixCache(RadixCache):
                 "loaded_from_host_tokens": 0,
                 "message": f"Missing host backup for nodes {host_missing}.",
             }
-        if all(not node.evicted for node in self.get_node_path(last_node)):
+        if all(not node.evicted and node.value is not None for node in path):
             return {
                 "success": True,
                 "already_device_tokens": already_device_tokens,
@@ -847,7 +848,27 @@ class HiRadixCache(RadixCache):
         finally:
             self.load_back_threshold = old_threshold
 
-        loaded_tokens = int(len(loaded)) if loaded is not None else 0
+        if loaded is None:
+            return {
+                "success": False,
+                "already_device_tokens": already_device_tokens,
+                "loaded_from_host_tokens": 0,
+                "message": "LOAD_BACK_FAILED",
+            }
+
+        missing_nodes = [
+            node.id for node in path if node.evicted or node.value is None
+        ]
+        if missing_nodes:
+            return {
+                "success": False,
+                "already_device_tokens": already_device_tokens,
+                "loaded_from_host_tokens": int(len(loaded)),
+                "missing_nodes": missing_nodes,
+                "message": "RESTORE_INCOMPLETE",
+            }
+
+        loaded_tokens = int(len(loaded))
         return {
             "success": True,
             "already_device_tokens": already_device_tokens,

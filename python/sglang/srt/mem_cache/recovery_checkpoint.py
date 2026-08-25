@@ -140,19 +140,40 @@ class RecoveryCheckpointManager:
                 "fallback_reason": f"UNSUPPORTED_TIER:{tier}",
             }
 
-        last_node = self.tree_cache.find_exact_prefix_node(input_ids, extra_key)
+        requested_tokens = len(input_ids)
+        page_size = max(1, int(getattr(self.tree_cache, "page_size", 1) or 1))
+        checkpoint_tokens = (requested_tokens // page_size) * page_size
+        checkpoint_input_ids = input_ids[:checkpoint_tokens]
+
+        if checkpoint_tokens <= 0:
+            return {
+                "success": False,
+                "checkpoint_id": checkpoint_id,
+                "error": "PREFIX_TOO_SHORT",
+                "fallback_reason": "PREFIX_TOO_SHORT",
+                "requested_tokens": requested_tokens,
+                "checkpoint_tokens": checkpoint_tokens,
+                "page_size": page_size,
+            }
+
+        last_node = self.tree_cache.find_exact_prefix_node(
+            checkpoint_input_ids, extra_key
+        )
         if last_node is None:
             return {
                 "success": False,
                 "checkpoint_id": checkpoint_id,
                 "fallback_reason": "PREFIX_NOT_FOUND",
+                "requested_tokens": requested_tokens,
+                "checkpoint_tokens": checkpoint_tokens,
+                "page_size": page_size,
             }
 
         started = time.perf_counter()
         checkpoint = RecoveryCheckpoint(
             checkpoint_id=checkpoint_id,
-            token_count=len(input_ids),
-            token_hash=self.token_hash(input_ids),
+            token_count=checkpoint_tokens,
+            token_hash=self.token_hash(checkpoint_input_ids),
             extra_key=extra_key,
             last_node_id=last_node.id,
             node_path_ids=[node.id for node in self.tree_cache.get_node_path(last_node)],
@@ -180,6 +201,9 @@ class RecoveryCheckpointManager:
                 "success": False,
                 "checkpoint_id": checkpoint_id,
                 "fallback_reason": checkpoint.fallback_reason,
+                "requested_tokens": requested_tokens,
+                "checkpoint_tokens": checkpoint_tokens,
+                "page_size": page_size,
                 **self._status_dict(checkpoint),
             }
 
@@ -204,6 +228,9 @@ class RecoveryCheckpointManager:
         return {
             "success": True,
             "checkpoint_id": checkpoint_id,
+            "requested_tokens": requested_tokens,
+            "checkpoint_tokens": checkpoint_tokens,
+            "page_size": page_size,
             **self._status_dict(checkpoint),
         }
 
@@ -239,6 +266,12 @@ class RecoveryCheckpointManager:
         restored = self.tree_cache.load_prefix_to_device(
             last_node, sync=sync, mem_quota=mem_quota
         )
+        if restored is None:
+            restored = {
+                "success": False,
+                "loaded_from_host_tokens": 0,
+                "message": "LOAD_BACK_FAILED",
+            }
         checkpoint.restore_latency_ms = (time.perf_counter() - started) * 1000
         checkpoint.restore_tokens += int(restored.get("loaded_from_host_tokens") or 0)
         self.metrics["recovery_checkpoint_restore_tokens"] += int(
