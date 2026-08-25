@@ -248,3 +248,70 @@ def inject_c2kv_gist(
             f"saved injection dump to {dump_path}",
             flush=True,
         )
+
+
+def inject_c2kv_stored_kv(
+    entry: C2KVEntry,
+    c2kv_pool: C2KVPool,
+    *,
+    loc: torch.Tensor,
+    token_to_kv_pool,
+    attn_layers: List,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool = True,
+) -> None:
+    """Inject a generic stored KV entry into the active paged KV cache.
+
+    Repair entries may already contain K with the original absolute RoPE phase
+    (`entry.already_rotated=True`). In that case K is copied verbatim. For
+    neutral/sham entries stored pre-RoPE, apply RoPE exactly once at the stored
+    absolute position ids.
+    """
+
+    token_len = entry.token_len
+    if loc.numel() != token_len:
+        raise ValueError(
+            f"C2KV repair loc length mismatch: loc.numel()={loc.numel()} != {token_len=}"
+        )
+    if c2kv_pool.num_layers != len(attn_layers):
+        raise ValueError(
+            "C2KV repair layer count mismatch: "
+            f"{c2kv_pool.num_layers=} != {len(attn_layers)=}"
+        )
+
+    abs_pos = c2kv_pool.get_position_ids(entry).clamp(
+        0,
+        cos_sin_cache.shape[0] - 1,
+    )
+    rotary_dim = cos_sin_cache.shape[1]
+    half_dim = rotary_dim // 2
+    cos = cos_sin_cache[abs_pos, :half_dim]
+    sin = cos_sin_cache[abs_pos, half_dim:]
+    head_dim = half_dim * 2
+
+    for layer_idx in range(c2kv_pool.num_layers):
+        k_stored, v_stored = c2kv_pool.get_layer_kv(entry, layer_idx)
+        if k_stored.shape[2] != head_dim:
+            raise ValueError(
+                f"C2KV repair head_dim mismatch at layer {layer_idx}: "
+                f"{k_stored.shape[2]} != {head_dim}"
+            )
+        cache_k = (
+            k_stored
+            if entry.already_rotated
+            else apply_rotary_emb(k_stored, cos, sin, is_neox_style)
+        )
+        layer = attn_layers[layer_idx]
+        token_to_kv_pool.set_kv_buffer(
+            layer=layer,
+            loc=loc,
+            cache_k=cache_k,
+            cache_v=v_stored,
+        )
+
+    if (
+        os.environ.get("C2KV_DEBUG_FORCE_SYNC") == "1"
+        and hasattr(torch, "npu")
+        and torch.npu.is_available()
+    ):
+        torch.npu.synchronize()

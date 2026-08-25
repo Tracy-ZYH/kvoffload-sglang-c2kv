@@ -383,6 +383,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     key_hash=msg.c2kv_key_hash,
                     token_start=insertion_point,
                     token_end=insertion_point,
+                    repair_key_hashes=(
+                        list(getattr(msg, "c2kv_repair_key_hashes", None) or [])
+                    ),
                 )
             )
 

@@ -81,6 +81,8 @@ from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     C2KVExtractRequest,
     C2KVExtractResponse,
+    C2KVRepairExtractRequest,
+    C2KVRepairExtractResponse,
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
@@ -1510,6 +1512,68 @@ async def v1_c2kv_extract(
         return C2KVExtractResponse(
             key_hash="", gist_len=0, original_seq_len=0,
             success=False, error=str(e),
+        )
+
+
+@app.post("/v1/c2kv/repair_extract")
+async def v1_c2kv_repair_extract(
+    request: C2KVRepairExtractRequest, raw_request: Request
+) -> C2KVRepairExtractResponse:
+    """Extract and store raw/neutral repair KV for a span."""
+    try:
+        tokenizer_manager = _global_state.tokenizer_manager
+        tokenizer = tokenizer_manager.tokenizer
+        chat_template_kwargs = request.chat_template_kwargs or {}
+
+        if request.input_ids is not None:
+            input_ids = list(request.input_ids)
+        elif request.role:
+            text_str = tokenizer.apply_chat_template(
+                [{"role": request.role, "content": request.text}],
+                tokenize=False,
+                add_generation_prompt=False,
+                **chat_template_kwargs,
+            )
+            if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
+                text_str = text_str[len(tokenizer.bos_token):]
+            input_ids = tokenizer.encode(text_str, add_special_tokens=False)
+        else:
+            input_ids = tokenizer.encode(request.text)
+        if not isinstance(input_ids, list):
+            input_ids = list(input_ids)
+        if not input_ids:
+            return C2KVRepairExtractResponse(
+                key_hash="",
+                success=False,
+                error="The repair input contributes no tokens.",
+            )
+
+        span_end = len(input_ids) if request.span_end is None else request.span_end
+        result = await tokenizer_manager.c2kv_repair_extract(
+            input_ids=input_ids,
+            input_text=request.text,
+            span_start=request.span_start,
+            span_end=span_end,
+            position_offset=request.position_offset,
+            repair_mode=request.repair_mode,
+            source_doc_index=request.source_doc_index,
+        )
+        return C2KVRepairExtractResponse(
+            key_hash=result.key_hash,
+            token_len=result.token_len,
+            position_start=result.position_start,
+            position_end=result.position_end,
+            original_seq_len=result.original_seq_len,
+            repair_mode=result.repair_mode,
+            success=result.success,
+            error=result.error or None,
+        )
+    except Exception as e:
+        return C2KVRepairExtractResponse(
+            key_hash="",
+            token_len=0,
+            success=False,
+            error=str(e),
         )
 
 

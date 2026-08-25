@@ -66,6 +66,14 @@ class C2KVEntry:
     token_indices: torch.Tensor
     gist_len: int
     original_seq_len: int
+    entry_type: str = "gist"
+    already_rotated: bool = False
+    repair_mode: Optional[str] = None
+    source_doc_index: Optional[int] = None
+
+    @property
+    def token_len(self) -> int:
+        return self.gist_len
 
 
 class C2KVPool:
@@ -311,6 +319,116 @@ class C2KVPool:
         )
         self._cache[key_hash] = entry
         self._current_tokens += gist_len
+        return entry
+
+    def store_repair(
+        self,
+        key_hash: str,
+        key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        position_ids: torch.Tensor,
+        *,
+        original_seq_len: int,
+        already_rotated: bool,
+        repair_mode: str,
+        source_doc_index: Optional[int] = None,
+    ) -> C2KVEntry:
+        """Store raw/neutral repair KV using the same paged-token pool.
+
+        `position_ids` are the original absolute positions of these repair KV
+        tokens. If `already_rotated` is true, injection writes K directly into
+        the active KV cache. Otherwise the injection path applies RoPE once at
+        these absolute positions.
+        """
+        if position_ids.ndim != 2 or position_ids.shape[0] != 1:
+            raise ValueError(
+                f"repair position_ids must have shape (1, token_len), got {position_ids.shape}."
+            )
+        token_len = position_ids.shape[1]
+        if token_len == 0:
+            raise ValueError("repair entry must contain at least one token.")
+        if token_len > self.max_entry_tokens or token_len > self.max_total_tokens:
+            raise ValueError(
+                f"repair entry has {token_len} tokens and exceeds pool limits "
+                f"({self.max_entry_tokens=}, {self.max_total_tokens=})."
+            )
+        if position_ids.dtype != torch.int64:
+            raise ValueError(
+                f"repair position_ids must use torch.int64, got {position_ids.dtype}."
+            )
+        if position_ids.device != self.position_buffer.device:
+            raise ValueError(
+                f"repair position_ids device mismatch: {position_ids.device} != "
+                f"{self.position_buffer.device}."
+            )
+        if len(key_values) != self.num_layers:
+            raise ValueError(
+                f"repair layer count mismatch: {len(key_values)} != {self.num_layers}."
+            )
+
+        expected_k_shape = (token_len, self.num_kv_heads * self.head_dim)
+        expected_v_shape = (token_len, self.num_kv_heads * self.value_head_dim)
+        for layer_idx, (key, value) in enumerate(key_values):
+            if tuple(key.shape) != expected_k_shape:
+                raise ValueError(
+                    f"repair K shape mismatch at layer {layer_idx}: "
+                    f"{tuple(key.shape)} != {expected_k_shape}."
+                )
+            if tuple(value.shape) != expected_v_shape:
+                raise ValueError(
+                    f"repair V shape mismatch at layer {layer_idx}: "
+                    f"{tuple(value.shape)} != {expected_v_shape}."
+                )
+            if key.dtype != self.dtype or value.dtype != self.dtype:
+                raise ValueError(
+                    f"repair K/V dtype mismatch at layer {layer_idx}: "
+                    f"{key.dtype}/{value.dtype} != {self.dtype}."
+                )
+            if (
+                key.device != self.position_buffer.device
+                or value.device != self.position_buffer.device
+            ):
+                raise ValueError(
+                    f"repair K/V device mismatch at layer {layer_idx}: "
+                    f"{key.device}/{value.device} != {self.position_buffer.device}."
+                )
+
+        existing = self._cache.get(key_hash)
+        indices, old_tail = self._allocate_for_store(token_len, existing)
+        try:
+            for layer_idx, (key, value) in enumerate(key_values):
+                layer_id = self.start_layer + layer_idx
+                self.kv_cache.get_key_buffer(layer_id)[indices] = key.view(
+                    token_len, self.num_kv_heads, self.head_dim
+                )
+                self.kv_cache.get_value_buffer(layer_id)[indices] = value.view(
+                    token_len, self.num_kv_heads, self.value_head_dim
+                )
+            self.position_buffer[indices] = position_ids[0]
+        except Exception:
+            if existing is None:
+                self.allocator.free(indices)
+            elif token_len > existing.gist_len:
+                self.allocator.free(indices[existing.gist_len :])
+            raise
+
+        if existing is not None:
+            self._cache.pop(key_hash)
+            self._current_tokens -= existing.gist_len
+        if old_tail is not None and old_tail.numel():
+            self.allocator.free(old_tail)
+
+        entry = C2KVEntry(
+            key_hash=key_hash,
+            token_indices=indices,
+            gist_len=token_len,
+            original_seq_len=original_seq_len,
+            entry_type="repair",
+            already_rotated=already_rotated,
+            repair_mode=repair_mode,
+            source_doc_index=source_doc_index,
+        )
+        self._cache[key_hash] = entry
+        self._current_tokens += token_len
         return entry
 
     def get(self, key_hash: str) -> Optional[C2KVEntry]:

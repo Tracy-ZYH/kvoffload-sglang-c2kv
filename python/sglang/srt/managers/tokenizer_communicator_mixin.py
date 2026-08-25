@@ -26,7 +26,9 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     C2KVExtractReqOutput,
+    C2KVRepairExtractReqOutput,
     TokenizedExtractReqInput,
+    TokenizedRepairExtractReqInput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -251,6 +253,9 @@ class TokenizerCommunicatorMixin:
         self.c2kv_extract_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.c2kv_repair_extract_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.create_recovery_checkpoint_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -338,6 +343,10 @@ class TokenizerCommunicatorMixin:
                     self.c2kv_extract_communicator.handle_recv,
                 ),
                 (
+                    C2KVRepairExtractReqOutput,
+                    self.c2kv_repair_extract_communicator.handle_recv,
+                ),
+                (
                     CreateRecoveryCheckpointReqOutput,
                     self.create_recovery_checkpoint_communicator.handle_recv,
                 ),
@@ -414,6 +423,34 @@ class TokenizerCommunicatorMixin:
             compression_ratio=compression_ratio,
         )
         return (await self.c2kv_extract_communicator(req))[0]
+
+    async def c2kv_repair_extract(
+        self: TokenizerManager,
+        input_ids: list,
+        input_text: str,
+        span_start: int,
+        span_end: int,
+        position_offset: int = 0,
+        repair_mode: str = "d_corr",
+        source_doc_index: Optional[int] = None,
+        rid: Optional[str] = None,
+    ) -> C2KVRepairExtractReqOutput:
+        """Run C2KV repair KV extraction via the scheduler."""
+        import uuid
+
+        self.auto_create_handle_loop()
+        req = TokenizedRepairExtractReqInput(
+            rid=rid or uuid.uuid4().hex,
+            input_ids=input_ids,
+            input_text=input_text,
+            span_start=span_start,
+            span_end=span_end,
+            position_offset=position_offset,
+            repair_mode=repair_mode,
+            source_doc_index=source_doc_index,
+            already_rotated=True,
+        )
+        return (await self.c2kv_repair_extract_communicator(req))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

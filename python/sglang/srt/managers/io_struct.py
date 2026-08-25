@@ -2007,10 +2007,17 @@ class DumperControlReqOutput(BaseReq):
 class C2KVSegmentInfo:
     """Describes one C2KV-compressed segment within a generation request."""
 
-    def __init__(self, key_hash: str = "", token_start: int = 0, token_end: int = 0):
+    def __init__(
+        self,
+        key_hash: str = "",
+        token_start: int = 0,
+        token_end: int = 0,
+        repair_key_hashes: Optional[List[str]] = None,
+    ):
         self.key_hash = key_hash
         self.token_start = token_start
         self.token_end = token_end
+        self.repair_key_hashes = repair_key_hashes or []
 
 
 @dataclass
@@ -2029,6 +2036,34 @@ class C2KVExtractReqOutput(BaseReq):
     key_hash: str = ""
     gist_len: int = 0
     original_seq_len: int = 0
+    error: str = ""
+    success: bool = True
+
+
+@dataclass
+class TokenizedRepairExtractReqInput(BaseReq):
+    """Internal request type for C2KV repair raw/sham KV extraction."""
+
+    input_ids: List[int] = field(default_factory=list)
+    input_text: str = ""
+    span_start: int = 0
+    span_end: int = 0
+    position_offset: int = 0
+    repair_mode: str = "d_corr"
+    source_doc_index: Optional[int] = None
+    already_rotated: bool = True
+
+
+@dataclass
+class C2KVRepairExtractReqOutput(BaseReq):
+    """Output returned from C2KV repair extraction."""
+
+    key_hash: str = ""
+    token_len: int = 0
+    position_start: int = 0
+    position_end: int = 0
+    original_seq_len: int = 0
+    repair_mode: str = ""
     error: str = ""
     success: bool = True
 

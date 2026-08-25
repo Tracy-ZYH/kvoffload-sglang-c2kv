@@ -14,6 +14,8 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -142,6 +144,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedExtractReqInput,
     TokenizedGenerateReqInput,
+    TokenizedRepairExtractReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -1304,6 +1307,10 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (TokenizedExtractReqInput, self.handle_extract_request),
+                (
+                    TokenizedRepairExtractReqInput,
+                    self.handle_repair_extract_request,
+                ),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
@@ -2341,6 +2348,170 @@ class Scheduler(
             original_seq_len=original_seq_len,
         )
 
+    def handle_repair_extract_request(
+        self, recv_req: "TokenizedRepairExtractReqInput"
+    ):
+        from sglang.srt.managers.io_struct import C2KVRepairExtractReqOutput
+
+        if self.c2kv_pool is None:
+            return C2KVRepairExtractReqOutput(
+                error="C2KV not enabled.", success=False
+            )
+        if not recv_req.input_ids:
+            return C2KVRepairExtractReqOutput(
+                error="input_ids is empty.", success=False
+            )
+        input_len = len(recv_req.input_ids)
+        if not (0 <= recv_req.span_start <= recv_req.span_end <= input_len):
+            return C2KVRepairExtractReqOutput(
+                error=(
+                    "Invalid repair span: "
+                    f"{recv_req.span_start=}, {recv_req.span_end=}, {input_len=}"
+                ),
+                success=False,
+            )
+        token_len = recv_req.span_end - recv_req.span_start
+        if token_len <= 0:
+            return C2KVRepairExtractReqOutput(
+                error="repair span is empty.", success=False
+            )
+        if token_len > min(
+            self.c2kv_pool.max_entry_tokens,
+            self.c2kv_pool.max_total_tokens,
+        ):
+            return C2KVRepairExtractReqOutput(
+                error=(
+                    f"repair entry would have {token_len} tokens, exceeding pool limits "
+                    f"({self.c2kv_pool.max_entry_tokens=}, "
+                    f"{self.c2kv_pool.max_total_tokens=})."
+                ),
+                success=False,
+            )
+
+        payload = {
+            "input_ids": recv_req.input_ids,
+            "span_start": recv_req.span_start,
+            "span_end": recv_req.span_end,
+            "position_offset": recv_req.position_offset,
+            "repair_mode": recv_req.repair_mode,
+            "source_doc_index": recv_req.source_doc_index,
+        }
+        key_hash = hashlib.sha256(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        existing = self.c2kv_pool.get(key_hash)
+        if existing is not None:
+            pos = self.c2kv_pool.get_position_ids(existing)
+            return C2KVRepairExtractReqOutput(
+                key_hash=key_hash,
+                token_len=existing.token_len,
+                position_start=int(pos[0].item()),
+                position_end=int(pos[-1].item()) + 1,
+                original_seq_len=existing.original_seq_len,
+                repair_mode=existing.repair_mode or recv_req.repair_mode,
+            )
+
+        has_space = self.c2kv_pool.can_allocate(token_len, existing_key=key_hash)
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            all_ranks_have_space = torch.tensor([int(has_space)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                all_ranks_have_space,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            has_space = bool(all_ranks_have_space.item())
+        if not has_space:
+            return C2KVRepairExtractReqOutput(
+                error=f"C2KV pool cannot allocate {token_len} repair tokens.",
+                success=False,
+            )
+
+        if self.enable_overlap and self.forward_stream is not None:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
+        input_ids = torch.tensor(
+            [recv_req.input_ids],
+            dtype=torch.long,
+            device="cuda",
+        )
+        error_msg = None
+        key_values = position_ids = None
+        try:
+            key_values, position_ids = (
+                self.tp_worker.model_runner.forward_c2kv_repair_extract(
+                    input_ids,
+                    span_start=recv_req.span_start,
+                    span_end=recv_req.span_end,
+                    position_offset=recv_req.position_offset,
+                )
+            )
+        except Exception as e:
+            logger.error("C2KV repair extract failed: %s", e, exc_info=True)
+            error_msg = str(e)
+
+        if self.tp_size > 1 and torch.distributed.is_initialized():
+            local_ok = torch.tensor([0 if error_msg else 1], dtype=torch.long)
+            torch.distributed.all_reduce(
+                local_ok,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            if local_ok.item() == 0 and error_msg is None:
+                error_msg = "C2KV repair extract failed on a peer TP rank"
+
+        if error_msg is not None:
+            input_ids = None
+            key_values = position_ids = None
+            if _is_npu:
+                try:
+                    torch.npu.synchronize()
+                    torch.npu.empty_cache()
+                except Exception:
+                    logger.warning("C2KV NPU repair cleanup failed", exc_info=True)
+            return C2KVRepairExtractReqOutput(error=error_msg, success=False)
+
+        try:
+            entry = self.c2kv_pool.store_repair(
+                key_hash=key_hash,
+                key_values=key_values,
+                position_ids=position_ids,
+                original_seq_len=input_len,
+                already_rotated=recv_req.already_rotated,
+                repair_mode=recv_req.repair_mode,
+                source_doc_index=recv_req.source_doc_index,
+            )
+        except ValueError as e:
+            input_ids = None
+            key_values = position_ids = None
+            return C2KVRepairExtractReqOutput(error=str(e), success=False)
+
+        pos = self.c2kv_pool.get_position_ids(entry)
+        self._log_c2kv_token_usage(
+            "repair_extract_store",
+            key_hash=key_hash[:16],
+            repair_mode=recv_req.repair_mode,
+            token_len=entry.token_len,
+            position_start=int(pos[0].item()),
+            position_end=int(pos[-1].item()) + 1,
+        )
+        input_ids = None
+        key_values = position_ids = None
+        if _is_npu:
+            try:
+                torch.npu.synchronize()
+                torch.npu.empty_cache()
+            except Exception:
+                logger.warning("C2KV NPU repair cleanup failed", exc_info=True)
+        return C2KVRepairExtractReqOutput(
+            key_hash=key_hash,
+            token_len=entry.token_len,
+            position_start=int(pos[0].item()),
+            position_end=int(pos[-1].item()) + 1,
+            original_seq_len=entry.original_seq_len,
+            repair_mode=entry.repair_mode or "",
+        )
+
     def _build_c2kv_prefill_rounds(self, req: "Req") -> Optional[str]:
         if not req.c2kv_segments:
             return None
@@ -2371,12 +2542,25 @@ class Scheduler(
             prev_end = seg.token_end
 
         entries = []
+        repair_entries = []
         for seg in segments:
             entry = self.c2kv_pool.get(seg.key_hash)
             if entry is None:
                 logger.warning("C2KV cache miss: %s", seg.key_hash)
                 return f"C2KV cache miss: {seg.key_hash}"
+            if entry.entry_type != "gist":
+                return f"C2KV segment key is not a gist entry: {seg.key_hash}"
             entries.append(entry)
+            cur_repair_entries = []
+            for repair_key in getattr(seg, "repair_key_hashes", []) or []:
+                repair_entry = self.c2kv_pool.get(repair_key)
+                if repair_entry is None:
+                    logger.warning("C2KV repair cache miss: %s", repair_key)
+                    return f"C2KV repair cache miss: {repair_key}"
+                if repair_entry.entry_type != "repair":
+                    return f"C2KV repair key is not a repair entry: {repair_key}"
+                cur_repair_entries.append(repair_entry)
+            repair_entries.append(cur_repair_entries)
 
         rounds: list = []
         virtual_ids: list = []
@@ -2432,6 +2616,10 @@ class Scheduler(
                 pending_seg_indices = []
 
             virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
+            for repair_entry in repair_entries[seg_idx]:
+                virtual_ids.extend(
+                    c2kv_gist_token_ids(repair_entry.key_hash, repair_entry.token_len)
+                )
 
             if rounds:
                 rounds[-1].post_inject_seg_indices.append(seg_idx)
@@ -2462,7 +2650,11 @@ class Scheduler(
             self.max_req_len - virtual_len - 1,
         )
 
-        pinned_keys = list(dict.fromkeys(seg.key_hash for seg in segments))
+        pinned_keys = []
+        for seg in segments:
+            pinned_keys.append(seg.key_hash)
+            pinned_keys.extend(getattr(seg, "repair_key_hashes", []) or [])
+        pinned_keys = list(dict.fromkeys(pinned_keys))
         if not self.c2kv_pool.pin_many(pinned_keys):
             return "C2KV cache miss while pinning segments."
 
@@ -2478,7 +2670,15 @@ class Scheduler(
             original_len=original_len,
             virtual_len=virtual_len,
             segment_spans=[
-                (segment.key_hash[:16], segment.token_start, segment.token_end)
+                (
+                    segment.key_hash[:16],
+                    segment.token_start,
+                    segment.token_end,
+                    [
+                        key_hash[:16]
+                        for key_hash in (getattr(segment, "repair_key_hashes", []) or [])
+                    ],
+                )
                 for segment in segments
             ],
             round_lens=[len(round_info.tokens) for round_info in rounds],
@@ -2843,6 +3043,16 @@ class Scheduler(
         req.kv_committed_len = kv_start + gist_len
         req.kv_allocated_len = kv_start + gist_len
         req.c2kv_position_correction += entry.original_seq_len - gist_len
+
+        for repair_key in getattr(seg, "repair_key_hashes", []) or []:
+            repair_entry = self.c2kv_pool.get(repair_key)
+            if repair_entry is None:
+                logger.warning("C2KV repair miss: %s", repair_key[:16])
+                return False
+            if not self._inject_c2kv_repair_entry(req, repair_entry):
+                logger.warning("C2KV repair injection failed: %s", repair_key[:16])
+                return False
+
         self._log_c2kv_token_usage(
             "inject_success",
             req=req,
@@ -2850,6 +3060,153 @@ class Scheduler(
             key_hash=seg.key_hash[:16],
             gist_len=gist_len,
             position_cursor=position_cursor,
+        )
+        return True
+
+    def _inject_c2kv_repair_entry(self, req: "Req", entry) -> bool:
+        """Inject an already stored repair KV entry after the current prefix."""
+        if self.c2kv_pool is None:
+            return False
+
+        model_runner = self.tp_worker.model_runner
+        repair_len = entry.token_len
+        kv_start = req.kv_committed_len
+        allocator = model_runner.token_to_kv_pool_allocator
+        page_size = int(getattr(allocator, "page_size", 1))
+
+        def _alloc_repair_loc():
+            alloc_state = allocator.backup_state()
+            if _is_npu and page_size > 1:
+                if kv_start > 0:
+                    last_loc = (
+                        model_runner.req_to_token_pool.req_to_token[
+                            req.req_pool_idx,
+                            kv_start - 1,
+                        ]
+                        .reshape(1)
+                        .to(dtype=torch.int32)
+                    )
+                    device = last_loc.device
+                    prefix_lens = torch.tensor(
+                        [kv_start],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    seq_lens = torch.tensor(
+                        [kv_start + repair_len],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    prefix_lens_cpu = torch.tensor(
+                        [kv_start],
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                    seq_lens_cpu = torch.tensor(
+                        [kv_start + repair_len],
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                    new_loc = allocator.alloc_extend(
+                        prefix_lens=prefix_lens,
+                        prefix_lens_cpu=prefix_lens_cpu,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens_cpu,
+                        last_loc=last_loc,
+                        extend_num_tokens=repair_len,
+                    )
+                else:
+                    alloc_size = ((repair_len + page_size - 1) // page_size) * page_size
+                    allocated_loc = allocator.alloc(alloc_size)
+                    new_loc = (
+                        allocated_loc[:repair_len]
+                        if allocated_loc is not None
+                        else None
+                    )
+            else:
+                new_loc = allocator.alloc(repair_len)
+            if new_loc is None:
+                allocator.restore_state(alloc_state)
+                return None, None
+            return new_loc, alloc_state
+
+        loc, alloc_state = _alloc_repair_loc()
+        if loc is None:
+            evict_from_tree_cache(
+                self.tree_cache,
+                max(repair_len, page_size) if _is_npu and page_size > 1 else repair_len,
+            )
+            loc, alloc_state = _alloc_repair_loc()
+        if loc is None:
+            self._log_c2kv_token_usage(
+                "repair_inject_alloc_failed",
+                req=req,
+                key_hash=entry.key_hash[:16],
+                repair_len=repair_len,
+            )
+            return False
+
+        def _rollback():
+            if alloc_state is not None:
+                allocator.restore_state(alloc_state)
+
+        max_ctx = model_runner.req_to_token_pool.req_to_token.shape[1]
+        if kv_start + repair_len > max_ctx:
+            _rollback()
+            self._log_c2kv_token_usage(
+                "repair_inject_context_overflow",
+                req=req,
+                key_hash=entry.key_hash[:16],
+                repair_len=repair_len,
+                kv_start=kv_start,
+                max_context_len=max_ctx,
+            )
+            return False
+
+        try:
+            model_runner.req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                kv_start : kv_start + repair_len,
+            ] = loc
+        except Exception as e:
+            logger.warning("C2KV repair req_to_token_pool write failed: %s", e)
+            _rollback()
+            return False
+
+        try:
+            from sglang.srt.mem_cache.c2kv_injection import inject_c2kv_stored_kv
+
+            cos_sin_cache = (
+                model_runner.model.model.layers[0].self_attn.rotary_emb.cos_sin_cache
+            )
+            attn_layers = [
+                layer.self_attn.attn for layer in model_runner.model.model.layers
+            ]
+            inject_c2kv_stored_kv(
+                entry=entry,
+                c2kv_pool=self.c2kv_pool,
+                loc=loc,
+                token_to_kv_pool=model_runner.token_to_kv_pool_allocator.get_kvcache(),
+                attn_layers=attn_layers,
+                cos_sin_cache=cos_sin_cache,
+                is_neox_style=True,
+            )
+        except Exception as e:
+            logger.error("C2KV repair injection failed: %s", e, exc_info=True)
+            _rollback()
+            return False
+
+        req.kv_committed_len = kv_start + repair_len
+        req.kv_allocated_len = kv_start + repair_len
+        req.c2kv_position_correction -= repair_len
+        self._log_c2kv_token_usage(
+            "repair_inject_success",
+            req=req,
+            key_hash=entry.key_hash[:16],
+            repair_mode=entry.repair_mode,
+            repair_len=repair_len,
+            position_start=int(self.c2kv_pool.get_position_ids(entry)[0].item()),
+            position_end=int(self.c2kv_pool.get_position_ids(entry)[-1].item()) + 1,
         )
         return True
 

@@ -2745,6 +2745,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             input_ids, attention_mask, ratio=compression_ratio
         )
 
+    def forward_c2kv_repair_extract(
+        self,
+        input_ids: torch.Tensor,
+        span_start: int,
+        span_end: int,
+        position_offset: int = 0,
+    ):
+        """Capture ordinary full-prefill KV for a repair span."""
+        if not hasattr(self.model, "generate_raw_repair_kv"):
+            raise ValueError(
+                f"{type(self.model).__name__} does not support C2KV repair KV extraction."
+            )
+        return self.model.generate_raw_repair_kv(
+            input_ids,
+            span_start=span_start,
+            span_end=span_end,
+            position_offset=position_offset,
+        )
+
     def get_c2kv_compression_ratio(self, requested_ratio: int) -> int:
         from sglang.srt.mem_cache.gist_utils import resolve_c2kv_compression_ratio
 

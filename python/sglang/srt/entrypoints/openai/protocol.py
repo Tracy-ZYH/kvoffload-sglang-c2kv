@@ -497,6 +497,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     c2kv_key_hash: Optional[str] = None
+    c2kv_repair_key_hashes: Optional[List[str]] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -515,6 +516,7 @@ class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
     c2kv_key_hash: Optional[str] = None
+    c2kv_repair_key_hashes: Optional[List[str]] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -1520,5 +1522,32 @@ class C2KVExtractResponse(BaseModel):
     key_hash: str
     gist_len: int
     original_seq_len: int
+    success: bool = True
+    error: Optional[str] = None
+
+
+class C2KVRepairExtractRequest(BaseModel):
+    """Request to extract and store raw/neutral repair KV."""
+
+    text: str = ""
+    input_ids: Optional[List[int]] = None
+    role: Optional[str] = None
+    chat_template_kwargs: Optional[Dict] = None
+    span_start: int = 0
+    span_end: Optional[int] = None
+    position_offset: int = 0
+    repair_mode: str = "d_corr"
+    source_doc_index: Optional[int] = None
+
+
+class C2KVRepairExtractResponse(BaseModel):
+    """Response from C2KV repair KV extraction."""
+
+    key_hash: str
+    token_len: int = 0
+    position_start: int = 0
+    position_end: int = 0
+    original_seq_len: int = 0
+    repair_mode: str = ""
     success: bool = True
     error: Optional[str] = None

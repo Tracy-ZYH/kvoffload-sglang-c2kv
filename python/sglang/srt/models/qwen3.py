@@ -1199,6 +1199,133 @@ class Qwen3ForCausalLM(nn.Module):
         return gist_key_values, gist_mask, gist_position_ids
 
     @torch.no_grad()
+    def generate_raw_repair_kv(
+        self,
+        input_ids: torch.Tensor,
+        span_start: int,
+        span_end: int,
+        *,
+        position_offset: int = 0,
+    ):
+        """Run a correctness-first full prefill and capture raw RoPE'd KV.
+
+        This is used by the C2KV repair endpoints. It intentionally captures
+        ordinary self-attention K/V, not gist/PIC K/V. The returned K already
+        carries the requested absolute RoPE phase and must be injected with
+        `already_rotated=True`.
+        """
+
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                f"generate_raw_repair_kv expects input_ids shape (1, L), got {input_ids.shape}."
+            )
+        seq_len = int(input_ids.shape[1])
+        if not (0 <= span_start <= span_end <= seq_len):
+            raise ValueError(
+                f"Invalid repair span: {span_start=}, {span_end=}, {seq_len=}."
+            )
+        if span_start == span_end:
+            raise ValueError("repair span must be non-empty.")
+
+        device = input_ids.device
+        positions = torch.arange(
+            position_offset,
+            position_offset + seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+        hidden_states = self.model.embed_tokens(input_ids).squeeze(0)
+        raw_key_values = []
+
+        for layer in self.model.layers:
+            residual = hidden_states
+            attn_input = layer.input_layernorm(hidden_states)
+            q, k, v = layer.self_attn.forward_prepare_native(
+                positions=positions,
+                hidden_states=attn_input,
+            )
+            raw_key_values.append(
+                (
+                    k[span_start:span_end].contiguous().clone(),
+                    v[span_start:span_end].contiguous().clone(),
+                )
+            )
+
+            q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
+            k_attn = k.view(
+                1,
+                seq_len,
+                layer.self_attn.num_kv_heads,
+                layer.self_attn.head_dim,
+            )
+            v_attn = v.view(
+                1,
+                seq_len,
+                layer.self_attn.num_kv_heads,
+                layer.self_attn.head_dim,
+            )
+            q = q.transpose(1, 2).contiguous()
+            k_attn = k_attn.transpose(1, 2).contiguous()
+            v_attn = v_attn.transpose(1, 2).contiguous()
+
+            if _is_npu:
+                groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
+                k_run = _repeat_kv_for_npu_fusion(k_attn, groups).contiguous()
+                v_run = _repeat_kv_for_npu_fusion(v_attn, groups).contiguous()
+                blocked = torch.triu(
+                    torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
+                    diagonal=1,
+                ).view(1, 1, seq_len, seq_len)
+                attn_output = torch_npu.npu_fusion_attention(
+                    q,
+                    k_run,
+                    v_run,
+                    q.shape[1],
+                    input_layout="BNSD",
+                    atten_mask=blocked,
+                    scale=layer.self_attn.scaling,
+                    keep_prob=1.0,
+                    sparse_mode=0,
+                )
+                attn_output = _npu_fusion_attention_output(attn_output, q.shape)
+            else:
+                if layer.self_attn.num_heads != layer.self_attn.num_kv_heads:
+                    groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
+                    k_run = k_attn.repeat_interleave(groups, dim=1)
+                    v_run = v_attn.repeat_interleave(groups, dim=1)
+                else:
+                    k_run = k_attn
+                    v_run = v_attn
+                scores = torch.matmul(
+                    q.float(),
+                    k_run.transpose(-2, -1).float(),
+                ) * layer.self_attn.scaling
+                keep = torch.tril(
+                    torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+                ).view(1, 1, seq_len, seq_len)
+                scores = scores.masked_fill(~keep, float("-inf"))
+                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(
+                    v_run.dtype
+                )
+                attn_output = torch.matmul(probs, v_run)
+
+            attn_output = (
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(seq_len, layer.self_attn.num_heads * layer.self_attn.head_dim)
+            )
+            attn_output, _ = layer.self_attn.o_proj(attn_output)
+            attn_output = tensor_model_parallel_all_reduce(attn_output)
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            mlp_input = layer.post_attention_layernorm(hidden_states)
+            hidden_states = residual + layer.mlp(mlp_input)
+
+        repair_position_ids = positions[span_start:span_end].view(1, -1).contiguous()
+        return raw_key_values, repair_position_ids
+
+    @torch.no_grad()
     def generate_pic(self, input_ids, attention_mask, ratio=1, **kwargs):
         """Extract full-length residual-QKV PIC states for one document."""
         if not self.full_length_pic:
