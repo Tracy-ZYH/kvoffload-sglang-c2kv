@@ -1199,7 +1199,10 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata={
+                "weight_version": ret[0]["meta_info"]["weight_version"],
+                "sglang_runtime": ret[0]["meta_info"].get("kv_runtime_stats"),
+            },
             sglext=response_sglext,
         )
 

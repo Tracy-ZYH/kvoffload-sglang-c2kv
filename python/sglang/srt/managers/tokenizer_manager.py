@@ -1588,6 +1588,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                if (
+                    hasattr(recv_obj, "kv_runtime_stats")
+                    and recv_obj.kv_runtime_stats
+                    and recv_obj.kv_runtime_stats[i] is not None
+                ):
+                    meta_info["kv_runtime_stats"] = recv_obj.kv_runtime_stats[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]

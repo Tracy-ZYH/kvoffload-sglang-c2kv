@@ -151,6 +151,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            kv_runtime_stats=_extract_field_by_index(
+                output, "kv_runtime_stats", i
+            ),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),

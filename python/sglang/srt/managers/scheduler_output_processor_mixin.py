@@ -82,6 +82,31 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
+    def _get_kv_runtime_stats(self: Scheduler) -> Optional[dict]:
+        """Return a real KV allocator residency snapshot for accounting."""
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if allocator is None:
+            return None
+        try:
+            size = int(getattr(allocator, "size", 0) or 0)
+            available = int(allocator.available_size())
+            resident = max(0, size - available)
+            peak = max(
+                int(getattr(self, "_c2kv_runtime_peak_kv_tokens", 0) or 0),
+                resident,
+            )
+            self._c2kv_runtime_peak_kv_tokens = peak
+            return {
+                "kv_pool_size": size,
+                "kv_available_tokens": available,
+                "kv_resident_tokens": resident,
+                "kv_peak_resident_tokens": peak,
+                "kv_page_size": int(getattr(allocator, "page_size", 1) or 1),
+            }
+        except Exception:
+            return None
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -1073,6 +1098,7 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
+        kv_runtime_stats = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
@@ -1176,6 +1202,7 @@ class SchedulerOutputProcessorMixin:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
+                kv_runtime_stats.append(self._get_kv_runtime_stats())
 
                 retraction_counts.append(req.retraction_count)
 
@@ -1304,6 +1331,7 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
+                    kv_runtime_stats=kv_runtime_stats,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
