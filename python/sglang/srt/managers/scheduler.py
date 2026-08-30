@@ -2544,12 +2544,15 @@ class Scheduler(
         entries = []
         repair_entries = []
         for seg in segments:
-            entry = self.c2kv_pool.get(seg.key_hash)
-            if entry is None:
-                logger.warning("C2KV cache miss: %s", seg.key_hash)
-                return f"C2KV cache miss: {seg.key_hash}"
-            if entry.entry_type != "gist":
-                return f"C2KV segment key is not a gist entry: {seg.key_hash}"
+            if seg.key_hash:
+                entry = self.c2kv_pool.get(seg.key_hash)
+                if entry is None:
+                    logger.warning("C2KV cache miss: %s", seg.key_hash)
+                    return f"C2KV cache miss: {seg.key_hash}"
+                if entry.entry_type != "gist":
+                    return f"C2KV segment key is not a gist entry: {seg.key_hash}"
+            else:
+                entry = None
             entries.append(entry)
             cur_repair_entries = []
             for repair_key in getattr(seg, "repair_key_hashes", []) or []:
@@ -2615,7 +2618,8 @@ class Scheduler(
                 append_c2kv_round(normal_tokens, pending_seg_indices)
                 pending_seg_indices = []
 
-            virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
+            if entry is not None:
+                virtual_ids.extend(c2kv_gist_token_ids(seg.key_hash, entry.gist_len))
             for repair_entry in repair_entries[seg_idx]:
                 virtual_ids.extend(
                     c2kv_gist_token_ids(repair_entry.key_hash, repair_entry.token_len)
@@ -2652,7 +2656,8 @@ class Scheduler(
 
         pinned_keys = []
         for seg in segments:
-            pinned_keys.append(seg.key_hash)
+            if seg.key_hash:
+                pinned_keys.append(seg.key_hash)
             pinned_keys.extend(getattr(seg, "repair_key_hashes", []) or [])
         pinned_keys = list(dict.fromkeys(pinned_keys))
         if not self.c2kv_pool.pin_many(pinned_keys):
@@ -2671,7 +2676,7 @@ class Scheduler(
             virtual_len=virtual_len,
             segment_spans=[
                 (
-                    segment.key_hash[:16],
+                    segment.key_hash[:16] if segment.key_hash else "<repair-only>",
                     segment.token_start,
                     segment.token_end,
                     [
@@ -2697,6 +2702,30 @@ class Scheduler(
         seg = req.c2kv_segments[seg_idx]
         if self.c2kv_pool is None:
             return False
+
+        if not seg.key_hash:
+            repair_keys = list(getattr(seg, "repair_key_hashes", []) or [])
+            if not repair_keys:
+                logger.warning("C2KV repair-only segment has no repair keys")
+                return False
+            for repair_key in repair_keys:
+                repair_entry = self.c2kv_pool.get(repair_key)
+                if repair_entry is None:
+                    logger.warning("C2KV repair-only miss: %s", repair_key[:16])
+                    return False
+                if not self._inject_c2kv_repair_entry(req, repair_entry):
+                    logger.warning(
+                        "C2KV repair-only injection failed: %s",
+                        repair_key[:16],
+                    )
+                    return False
+            self._log_c2kv_token_usage(
+                "repair_only_inject_success",
+                req=req,
+                seg_idx=seg_idx,
+                repair_keys=[key_hash[:16] for key_hash in repair_keys],
+            )
+            return True
 
         entry = self.c2kv_pool.get(seg.key_hash)
         if entry is None:
@@ -3198,13 +3227,22 @@ class Scheduler(
 
         req.kv_committed_len = kv_start + repair_len
         req.kv_allocated_len = kv_start + repair_len
-        req.c2kv_position_correction -= repair_len
+        repair_advances_logical_position = entry.repair_mode in {
+            "d_corr_recompute",
+            "d_corr_recompute_w2",
+            "d_corr_replace_w2",
+            "raw_all_replace",
+            "raw_all_replace_direct",
+        }
+        if not repair_advances_logical_position:
+            req.c2kv_position_correction -= repair_len
         self._log_c2kv_token_usage(
             "repair_inject_success",
             req=req,
             key_hash=entry.key_hash[:16],
             repair_mode=entry.repair_mode,
             repair_len=repair_len,
+            repair_advances_logical_position=repair_advances_logical_position,
             position_start=int(self.c2kv_pool.get_position_ids(entry)[0].item()),
             position_end=int(self.c2kv_pool.get_position_ids(entry)[-1].item()) + 1,
         )
@@ -4500,6 +4538,8 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            if self.c2kv_pool is not None:
+                self.c2kv_pool.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
 

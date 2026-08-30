@@ -484,3 +484,9 @@ class C2KVPool:
 
     def num_entries(self) -> int:
         return len(self._cache)
+
+    def clear(self) -> None:
+        self.allocator.clear()
+        self._cache.clear()
+        self._pin_counts.clear()
+        self._current_tokens = 0

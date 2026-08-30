@@ -346,12 +346,52 @@ class OpenAIServingChat(OpenAIServingBase):
             tokenized = tokenized["input_ids"]
         return list(tokenized)
 
+    def _c2kv_first_message_start_offset(
+        self,
+        request: "ChatCompletionRequest",
+        msg: ChatMessage,
+        tools: Optional[List[Dict]],
+    ) -> int:
+        """Return where the first real chat message starts after tool prologue.
+
+        Qwen-style templates render `tools=` before the first user/assistant
+        message.  A C2KV/repair segment at the beginning of the message list
+        must therefore be injected after that prologue, not at token offset 0.
+        """
+
+        with_tools = self._c2kv_chat_template_input_ids(request, [msg], tools)
+        without_tools = self._c2kv_chat_template_input_ids(request, [msg], None)
+
+        bos_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
+        while without_tools and bos_id is not None and without_tools[0] == bos_id:
+            without_tools = without_tools[1:]
+
+        if not without_tools:
+            return 0
+
+        limit = len(with_tools) - len(without_tools) + 1
+        for start in range(max(0, limit)):
+            if with_tools[start : start + len(without_tools)] == without_tools:
+                return start
+
+        if len(with_tools) >= len(without_tools) and with_tools[-len(without_tools) :] == without_tools:
+            return len(with_tools) - len(without_tools)
+
+        logger.warning(
+            "C2KV could not locate first message inside chat template with tools; "
+            "falling back to offset 0. with_tools_len=%s, without_tools_len=%s",
+            len(with_tools),
+            len(without_tools),
+        )
+        return 0
+
     def _compute_c2kv_segments(self, request: "ChatCompletionRequest"):
         """
-        Detect messages annotated with c2kv_key_hash, compute their insertion
-        points in the compressed prompt after annotated messages are removed,
-        remove them from the request so _process_messages skips them, and return
-        a list of C2KVSegmentInfo descriptors. Returns None if no annotations found.
+        Detect messages annotated with c2kv_key_hash or repair-only KV keys,
+        compute their insertion points in the compressed prompt after annotated
+        messages are removed, remove them from the request so _process_messages
+        skips them, and return a list of C2KVSegmentInfo descriptors. Returns
+        None if no annotations found.
         """
         from sglang.srt.managers.io_struct import C2KVSegmentInfo
 
@@ -359,6 +399,8 @@ class OpenAIServingChat(OpenAIServingBase):
             i
             for i, m in enumerate(request.messages)
             if getattr(m, "c2kv_key_hash", None)
+            or getattr(m, "c2kv_repair_key_hashes", None)
+            or getattr(m, "c2kv_repair_only_key_hashes", None)
         ]
         if not annotated:
             return None
@@ -374,17 +416,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 for j, m in enumerate(request.messages[:i])
                 if j not in annotated_set
             ]
-            insertion_point = len(
-                self._c2kv_chat_template_input_ids(request, compressed_prefix, tools)
-            )
+            if compressed_prefix:
+                insertion_point = len(
+                    self._c2kv_chat_template_input_ids(request, compressed_prefix, tools)
+                )
+            else:
+                insertion_point = self._c2kv_first_message_start_offset(
+                    request, msg, tools
+                )
 
             segments.append(
                 C2KVSegmentInfo(
-                    key_hash=msg.c2kv_key_hash,
+                    key_hash=getattr(msg, "c2kv_key_hash", "") or "",
                     token_start=insertion_point,
                     token_end=insertion_point,
                     repair_key_hashes=(
                         list(getattr(msg, "c2kv_repair_key_hashes", None) or [])
+                        + list(
+                            getattr(msg, "c2kv_repair_only_key_hashes", None) or []
+                        )
                     ),
                 )
             )

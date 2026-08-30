@@ -2,6 +2,7 @@
 import logging
 import os
 from functools import partial
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -68,22 +69,6 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
-
-
-def _repeat_kv_for_npu_fusion(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads for Ascend FusionAttention GQA."""
-    if n_rep == 1:
-        return hidden_states
-
-    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch,
-        num_key_value_heads,
-        n_rep,
-        seq_len,
-        head_dim,
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
 
 
 def _npu_fusion_attention_output(
@@ -682,10 +667,11 @@ class Qwen3Attention(nn.Module):
                     f"num_kv_heads={self.num_kv_heads}"
                 )
 
-            num_kv_groups = self.num_heads // self.num_kv_heads
             q_attn = q.contiguous()
-            k_attn = _repeat_kv_for_npu_fusion(k, num_kv_groups).contiguous()
-            v_attn = _repeat_kv_for_npu_fusion(v, num_kv_groups).contiguous()
+            # Keep KV heads unexpanded. Ascend FusionAttention supports GQA
+            # directly when Q heads are an integer multiple of KV heads.
+            k_attn = k.contiguous()
+            v_attn = v.contiguous()
 
             # Ascend attention mask is a block mask: True/1 means masked.
             # C2KV attention_mask uses True as "can attend", so invert it.
@@ -1236,14 +1222,28 @@ class Qwen3ForCausalLM(nn.Module):
         )
         hidden_states = self.model.embed_tokens(input_ids).squeeze(0)
         raw_key_values = []
+        npu_forward_batch_stub = None
+        if _is_npu:
+            npu_forward_batch_stub = SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(
+                    start_layer=self.model.layers[0].self_attn.attn.layer_id
+                )
+            )
 
         for layer in self.model.layers:
             residual = hidden_states
             attn_input = layer.input_layernorm(hidden_states)
-            q, k, v = layer.self_attn.forward_prepare_native(
-                positions=positions,
-                hidden_states=attn_input,
-            )
+            if _is_npu:
+                q, k, v = layer.self_attn.forward_prepare_npu(
+                    positions=positions,
+                    hidden_states=attn_input,
+                    forward_batch=npu_forward_batch_stub,
+                )
+            else:
+                q, k, v = layer.self_attn.forward_prepare_native(
+                    positions=positions,
+                    hidden_states=attn_input,
+                )
             raw_key_values.append(
                 (
                     k[span_start:span_end].contiguous().clone(),
@@ -1269,24 +1269,44 @@ class Qwen3ForCausalLM(nn.Module):
             v_attn = v_attn.transpose(1, 2).contiguous()
 
             if _is_npu:
-                groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
-                k_run = _repeat_kv_for_npu_fusion(k_attn, groups).contiguous()
-                v_run = _repeat_kv_for_npu_fusion(v_attn, groups).contiguous()
+                # Match the serving attention path: do not materialize repeated
+                # KV heads for GQA. Repair KV must be captured from the same
+                # Full-context computation that the normal Ascend backend uses.
+                k_run = k_attn.contiguous()
+                v_run = v_attn.contiguous()
                 blocked = torch.triu(
                     torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
                     diagonal=1,
                 ).view(1, 1, seq_len, seq_len)
-                attn_output = torch_npu.npu_fusion_attention(
-                    q,
-                    k_run,
-                    v_run,
-                    q.shape[1],
-                    input_layout="BNSD",
-                    atten_mask=blocked,
-                    scale=layer.self_attn.scaling,
-                    keep_prob=1.0,
-                    sparse_mode=0,
-                )
+                if os.environ.get(
+                    "C2KV_REPAIR_EXTRACT_ATTN_IMPL",
+                    "prompt_flash",
+                ) == "prompt_flash" and hasattr(
+                    torch_npu, "npu_prompt_flash_attention"
+                ):
+                    attn_output = torch_npu.npu_prompt_flash_attention(
+                        q,
+                        k_run,
+                        v_run,
+                        num_heads=q.shape[1],
+                        num_key_value_heads=k_run.shape[1],
+                        input_layout="BNSD",
+                        atten_mask=blocked,
+                        scale_value=layer.self_attn.scaling,
+                        sparse_mode=0,
+                    )
+                else:
+                    attn_output = torch_npu.npu_fusion_attention(
+                        q,
+                        k_run,
+                        v_run,
+                        q.shape[1],
+                        input_layout="BNSD",
+                        atten_mask=blocked,
+                        scale=layer.self_attn.scaling,
+                        keep_prob=1.0,
+                        sparse_mode=0,
+                    )
                 attn_output = _npu_fusion_attention_output(attn_output, q.shape)
             else:
                 if layer.self_attn.num_heads != layer.self_attn.num_kv_heads:

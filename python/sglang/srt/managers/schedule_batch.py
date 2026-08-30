@@ -2033,7 +2033,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens.extend(
             [
                 (r.kv_committed_len + delta)
-                if getattr(r, "c2kv_position_correction", 0) > 0
+                if getattr(r, "c2kv_virtual_input_ids", None) is not None
                 else (len(r.origin_input_ids) + len(r.output_ids) + delta)
                 for r in running_batch.reqs
             ]
