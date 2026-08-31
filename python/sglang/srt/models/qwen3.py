@@ -1233,17 +1233,16 @@ class Qwen3ForCausalLM(nn.Module):
         for layer in self.model.layers:
             residual = hidden_states
             attn_input = layer.input_layernorm(hidden_states)
-            if _is_npu:
-                q, k, v = layer.self_attn.forward_prepare_npu(
-                    positions=positions,
-                    hidden_states=attn_input,
-                    forward_batch=npu_forward_batch_stub,
-                )
-            else:
-                q, k, v = layer.self_attn.forward_prepare_native(
-                    positions=positions,
-                    hidden_states=attn_input,
-                )
+            # Normal SGLang prefill/extend on Ascend takes the native
+            # QK-norm/RoPE preparation path before entering the Ascend
+            # attention backend.  Repair KV must be captured from that same
+            # Full-prefill path; using the decode-oriented NPU fused prepare
+            # changes the raw K/V slightly and breaks raw-all replacement
+            # equivalence on sensitive BFCL trajectories.
+            q, k, v = layer.self_attn.forward_prepare_native(
+                positions=positions,
+                hidden_states=attn_input,
+            )
             raw_key_values.append(
                 (
                     k[span_start:span_end].contiguous().clone(),

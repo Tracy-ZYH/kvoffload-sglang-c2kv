@@ -498,6 +498,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     c2kv_key_hash: Optional[str] = None
     c2kv_repair_key_hashes: Optional[List[str]] = None
+    c2kv_repair_only_key_hashes: Optional[List[str]] = None
+    c2kv_repair_token_start: Optional[int] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -517,6 +519,8 @@ class ChatCompletionMessageUserParam(BaseModel):
     content: Union[str, List[ChatCompletionMessageContentPart]]
     c2kv_key_hash: Optional[str] = None
     c2kv_repair_key_hashes: Optional[List[str]] = None
+    c2kv_repair_only_key_hashes: Optional[List[str]] = None
+    c2kv_repair_token_start: Optional[int] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -1538,6 +1542,7 @@ class C2KVRepairExtractRequest(BaseModel):
     position_offset: int = 0
     repair_mode: str = "d_corr"
     source_doc_index: Optional[int] = None
+    extract_source: str = "model_prefill"
 
 
 class C2KVRepairExtractResponse(BaseModel):
@@ -1549,5 +1554,8 @@ class C2KVRepairExtractResponse(BaseModel):
     position_end: int = 0
     original_seq_len: int = 0
     repair_mode: str = ""
+    extract_source: str = ""
+    cache_hit_tokens: int = 0
+    serving_kv_buffer_shape: Optional[List[int]] = None
     success: bool = True
     error: Optional[str] = None

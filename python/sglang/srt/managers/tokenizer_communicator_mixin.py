@@ -433,6 +433,7 @@ class TokenizerCommunicatorMixin:
         position_offset: int = 0,
         repair_mode: str = "d_corr",
         source_doc_index: Optional[int] = None,
+        extract_source: str = "model_prefill",
         rid: Optional[str] = None,
     ) -> C2KVRepairExtractReqOutput:
         """Run C2KV repair KV extraction via the scheduler."""
@@ -449,6 +450,7 @@ class TokenizerCommunicatorMixin:
             repair_mode=repair_mode,
             source_doc_index=source_doc_index,
             already_rotated=True,
+            extract_source=extract_source,
         )
         return (await self.c2kv_repair_extract_communicator(req))[0]
 

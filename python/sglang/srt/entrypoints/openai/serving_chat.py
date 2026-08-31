@@ -411,19 +411,29 @@ class OpenAIServingChat(OpenAIServingBase):
         segments = []
         for i in annotated:
             msg = request.messages[i]
-            compressed_prefix = [
-                m
-                for j, m in enumerate(request.messages[:i])
-                if j not in annotated_set
-            ]
-            if compressed_prefix:
-                insertion_point = len(
-                    self._c2kv_chat_template_input_ids(request, compressed_prefix, tools)
-                )
+            explicit_repair_start = getattr(msg, "c2kv_repair_token_start", None)
+            if explicit_repair_start is not None:
+                insertion_point = int(explicit_repair_start)
+                if insertion_point < 0:
+                    raise ValueError(
+                        f"c2kv_repair_token_start must be non-negative, got {insertion_point}"
+                    )
             else:
-                insertion_point = self._c2kv_first_message_start_offset(
-                    request, msg, tools
-                )
+                compressed_prefix = [
+                    m
+                    for j, m in enumerate(request.messages[:i])
+                    if j not in annotated_set
+                ]
+                if compressed_prefix:
+                    insertion_point = len(
+                        self._c2kv_chat_template_input_ids(
+                            request, compressed_prefix, tools
+                        )
+                    )
+                else:
+                    insertion_point = self._c2kv_first_message_start_offset(
+                        request, msg, tools
+                    )
 
             segments.append(
                 C2KVSegmentInfo(

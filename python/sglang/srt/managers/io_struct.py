@@ -24,7 +24,7 @@ from abc import ABC
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -2054,6 +2054,7 @@ class TokenizedRepairExtractReqInput(BaseReq):
     repair_mode: str = "d_corr"
     source_doc_index: Optional[int] = None
     already_rotated: bool = True
+    extract_source: str = "model_prefill"
 
 
 @dataclass
@@ -2066,6 +2067,9 @@ class C2KVRepairExtractReqOutput(BaseReq):
     position_end: int = 0
     original_seq_len: int = 0
     repair_mode: str = ""
+    extract_source: str = ""
+    cache_hit_tokens: int = 0
+    serving_kv_buffer_shape: Optional[Tuple[int, ...]] = None
     error: str = ""
     success: bool = True
 

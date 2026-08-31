@@ -1557,6 +1557,7 @@ async def v1_c2kv_repair_extract(
             position_offset=request.position_offset,
             repair_mode=request.repair_mode,
             source_doc_index=request.source_doc_index,
+            extract_source=request.extract_source,
         )
         return C2KVRepairExtractResponse(
             key_hash=result.key_hash,
@@ -1565,6 +1566,13 @@ async def v1_c2kv_repair_extract(
             position_end=result.position_end,
             original_seq_len=result.original_seq_len,
             repair_mode=result.repair_mode,
+            extract_source=result.extract_source,
+            cache_hit_tokens=result.cache_hit_tokens,
+            serving_kv_buffer_shape=(
+                list(result.serving_kv_buffer_shape)
+                if result.serving_kv_buffer_shape is not None
+                else None
+            ),
             success=result.success,
             error=result.error or None,
         )

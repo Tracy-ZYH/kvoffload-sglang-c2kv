@@ -194,7 +194,8 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -2395,10 +2396,18 @@ class Scheduler(
             "position_offset": recv_req.position_offset,
             "repair_mode": recv_req.repair_mode,
             "source_doc_index": recv_req.source_doc_index,
+            "extract_source": recv_req.extract_source,
         }
         key_hash = hashlib.sha256(
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        extract_source = recv_req.extract_source or "model_prefill"
+        if extract_source not in {"model_prefill", "serving_cache"}:
+            return C2KVRepairExtractReqOutput(
+                error=f"Unsupported repair extract_source: {extract_source!r}.",
+                success=False,
+                extract_source=extract_source,
+            )
 
         existing = self.c2kv_pool.get(key_hash)
         if existing is not None:
@@ -2410,6 +2419,8 @@ class Scheduler(
                 position_end=int(pos[-1].item()) + 1,
                 original_seq_len=existing.original_seq_len,
                 repair_mode=existing.repair_mode or recv_req.repair_mode,
+                extract_source=extract_source,
+                cache_hit_tokens=input_len if extract_source == "serving_cache" else 0,
             )
 
         has_space = self.c2kv_pool.can_allocate(token_len, existing_key=key_hash)
@@ -2430,25 +2441,120 @@ class Scheduler(
         if self.enable_overlap and self.forward_stream is not None:
             self.schedule_stream.wait_stream(self.forward_stream)
 
-        input_ids = torch.tensor(
-            [recv_req.input_ids],
-            dtype=torch.long,
-            device="cuda",
-        )
         error_msg = None
         key_values = position_ids = None
-        try:
-            key_values, position_ids = (
-                self.tp_worker.model_runner.forward_c2kv_repair_extract(
-                    input_ids,
-                    span_start=recv_req.span_start,
-                    span_end=recv_req.span_end,
-                    position_offset=recv_req.position_offset,
+        cache_hit_tokens = 0
+
+        if extract_source == "serving_cache":
+            try:
+                if self.tree_cache is None:
+                    raise RuntimeError("Serving cache is disabled.")
+                match_result = self.tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(recv_req.input_ids, extra_key=None)
+                    )
                 )
+                cached_indices = match_result.device_indices
+                cache_hit_tokens = int(cached_indices.numel())
+                if cache_hit_tokens < recv_req.span_end:
+                    raise RuntimeError(
+                        "PREFIX_NOT_FOUND_IN_SERVING_CACHE: "
+                        f"cache_hit_tokens={cache_hit_tokens}, "
+                        f"required_span_end={recv_req.span_end}, "
+                        f"input_len={input_len}, page_size={self.tree_cache.page_size}"
+                    )
+                span_indices = cached_indices[
+                    recv_req.span_start : recv_req.span_end
+                ].to(dtype=torch.long)
+                if int(span_indices.numel()) != token_len:
+                    raise RuntimeError(
+                        "Serving-cache repair span index length mismatch: "
+                        f"{int(span_indices.numel())=} != {token_len=}"
+                    )
+                kv_cache = (
+                    self.tp_worker.model_runner.token_to_kv_pool_allocator.get_kvcache()
+                )
+                first_key_buffer_shape = tuple(
+                    kv_cache.get_key_buffer(self.c2kv_pool.start_layer).shape
+                )
+
+                def _slice_kv_tokens(buffer: torch.Tensor) -> torch.Tensor:
+                    if buffer.ndim >= 3:
+                        # Main serving KV can be either [token, Hkv, D] or
+                        # paged [page, page_size, Hkv, D].  Radix cache indices
+                        # are physical token locations, so flatten all physical
+                        # token dimensions and keep the final [Hkv, D] layout.
+                        flat = buffer.reshape(
+                            -1,
+                            buffer.shape[-2],
+                            buffer.shape[-1],
+                        )
+                        max_index = (
+                            int(span_indices.max().item())
+                            if int(span_indices.numel()) > 0
+                            else -1
+                        )
+                        if max_index >= int(flat.shape[0]):
+                            raise RuntimeError(
+                                "Serving-cache repair span index out of bounds: "
+                                f"{max_index=} >= flat_tokens={int(flat.shape[0])}, "
+                                f"buffer_shape={tuple(buffer.shape)}"
+                            )
+                        return flat[span_indices]
+                    raise RuntimeError(
+                        "Unsupported serving KV cache buffer shape for repair "
+                        f"extract: {tuple(buffer.shape)}"
+                    )
+
+                key_values = []
+                for layer_idx in range(self.c2kv_pool.num_layers):
+                    layer_id = self.c2kv_pool.start_layer + layer_idx
+                    key = (
+                        _slice_kv_tokens(kv_cache.get_key_buffer(layer_id))
+                        .reshape(token_len, -1)
+                        .contiguous()
+                        .clone()
+                    )
+                    value = (
+                        _slice_kv_tokens(kv_cache.get_value_buffer(layer_id))
+                        .reshape(token_len, -1)
+                        .contiguous()
+                        .clone()
+                    )
+                    key_values.append((key, value))
+                position_ids = torch.arange(
+                    recv_req.position_offset + recv_req.span_start,
+                    recv_req.position_offset + recv_req.span_end,
+                    dtype=torch.int64,
+                    device=self.c2kv_pool.position_buffer.device,
+                ).view(1, token_len)
+            except Exception as e:
+                logger.error(
+                    "C2KV serving-cache repair extract failed: %s",
+                    e,
+                    exc_info=True,
+                )
+                error_msg = str(e)
+        else:
+            input_ids = torch.tensor(
+                [recv_req.input_ids],
+                dtype=torch.long,
+                device="cuda",
             )
-        except Exception as e:
-            logger.error("C2KV repair extract failed: %s", e, exc_info=True)
-            error_msg = str(e)
+            try:
+                key_values, position_ids = (
+                    self.tp_worker.model_runner.forward_c2kv_repair_extract(
+                        input_ids,
+                        span_start=recv_req.span_start,
+                        span_end=recv_req.span_end,
+                        position_offset=recv_req.position_offset,
+                    )
+                )
+            except Exception as e:
+                logger.error("C2KV repair extract failed: %s", e, exc_info=True)
+                error_msg = str(e)
+            finally:
+                input_ids = None
 
         if self.tp_size > 1 and torch.distributed.is_initialized():
             local_ok = torch.tensor([0 if error_msg else 1], dtype=torch.long)
@@ -2461,7 +2567,6 @@ class Scheduler(
                 error_msg = "C2KV repair extract failed on a peer TP rank"
 
         if error_msg is not None:
-            input_ids = None
             key_values = position_ids = None
             if _is_npu:
                 try:
@@ -2469,7 +2574,12 @@ class Scheduler(
                     torch.npu.empty_cache()
                 except Exception:
                     logger.warning("C2KV NPU repair cleanup failed", exc_info=True)
-            return C2KVRepairExtractReqOutput(error=error_msg, success=False)
+            return C2KVRepairExtractReqOutput(
+                error=error_msg,
+                success=False,
+                extract_source=extract_source,
+                cache_hit_tokens=cache_hit_tokens,
+            )
 
         try:
             entry = self.c2kv_pool.store_repair(
@@ -2482,9 +2592,13 @@ class Scheduler(
                 source_doc_index=recv_req.source_doc_index,
             )
         except ValueError as e:
-            input_ids = None
             key_values = position_ids = None
-            return C2KVRepairExtractReqOutput(error=str(e), success=False)
+            return C2KVRepairExtractReqOutput(
+                error=str(e),
+                success=False,
+                extract_source=extract_source,
+                cache_hit_tokens=cache_hit_tokens,
+            )
 
         pos = self.c2kv_pool.get_position_ids(entry)
         self._log_c2kv_token_usage(
@@ -2494,8 +2608,15 @@ class Scheduler(
             token_len=entry.token_len,
             position_start=int(pos[0].item()),
             position_end=int(pos[-1].item()) + 1,
+            extract_source=extract_source,
+            cache_hit_tokens=cache_hit_tokens,
+            serving_kv_buffer_shape=(
+                first_key_buffer_shape
+                if extract_source == "serving_cache"
+                and "first_key_buffer_shape" in locals()
+                else None
+            ),
         )
-        input_ids = None
         key_values = position_ids = None
         if _is_npu:
             try:
@@ -2510,6 +2631,14 @@ class Scheduler(
             position_end=int(pos[-1].item()) + 1,
             original_seq_len=entry.original_seq_len,
             repair_mode=entry.repair_mode or "",
+            extract_source=extract_source,
+            cache_hit_tokens=cache_hit_tokens,
+            serving_kv_buffer_shape=(
+                first_key_buffer_shape
+                if extract_source == "serving_cache"
+                and "first_key_buffer_shape" in locals()
+                else None
+            ),
         )
 
     def _build_c2kv_prefill_rounds(self, req: "Req") -> Optional[str]:
@@ -2530,12 +2659,12 @@ class Scheduler(
         prev_end = 0
         for seg in segments:
             if not (0 <= seg.token_start <= seg.token_end <= original_len):
-                raise ValueError(
+                return (
                     "Invalid C2KV segment boundary: "
                     f"{seg.token_start=}, {seg.token_end=}, {original_len=}"
                 )
             if seg.token_start < prev_end:
-                raise ValueError(
+                return (
                     "Overlapping C2KV segments are not supported: "
                     f"{seg.token_start=} < previous token_end {prev_end}"
                 )
@@ -3225,16 +3354,29 @@ class Scheduler(
             _rollback()
             return False
 
+        position_ids = self.c2kv_pool.get_position_ids(entry)
+        position_start = int(position_ids[0].item())
+        position_end = int(position_ids[-1].item()) + 1
+
         req.kv_committed_len = kv_start + repair_len
         req.kv_allocated_len = kv_start + repair_len
         repair_advances_logical_position = entry.repair_mode in {
             "d_corr_recompute",
             "d_corr_recompute_w2",
+            "d_corr_replace_w1",
             "d_corr_replace_w2",
+            "d_corr_replace_w4",
+            "d_corr_replace_all",
             "raw_all_replace",
             "raw_all_replace_direct",
         }
-        if not repair_advances_logical_position:
+        if repair_advances_logical_position:
+            # Raw replacement repair KV is already RoPE-rotated at its original
+            # Full-prompt absolute positions.  The compressed active prompt may
+            # inject the raw span at a shorter physical KV offset, so following
+            # query tokens must continue from the raw span's absolute end.
+            req.c2kv_position_correction = position_end - req.kv_committed_len
+        else:
             req.c2kv_position_correction -= repair_len
         self._log_c2kv_token_usage(
             "repair_inject_success",
@@ -3243,8 +3385,11 @@ class Scheduler(
             repair_mode=entry.repair_mode,
             repair_len=repair_len,
             repair_advances_logical_position=repair_advances_logical_position,
-            position_start=int(self.c2kv_pool.get_position_ids(entry)[0].item()),
-            position_end=int(self.c2kv_pool.get_position_ids(entry)[-1].item()) + 1,
+            position_start=position_start,
+            position_end=position_end,
+            kv_start=kv_start,
+            kv_end=req.kv_committed_len,
+            c2kv_position_correction=req.c2kv_position_correction,
         )
         return True
 
