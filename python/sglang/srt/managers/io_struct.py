@@ -244,6 +244,8 @@ class GenerateReqInput(BaseReq):
 
     # C2KV: per-segment descriptors for gist injection
     c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
+    c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
+    c2kv_use_gist_projection: bool = False
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
@@ -756,6 +758,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # C2KV: per-segment descriptors for gist injection
     c2kv_segments: Optional[List] = None  # List[C2KVSegmentInfo]
+    c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
+    c2kv_use_gist_projection: bool = False
 
 
 @dataclass
@@ -1026,6 +1030,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # Runtime KV allocator snapshot for accounting/debug.
     kv_runtime_stats: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-request C2KV/repair history KV layout report for accounting/debug.
+    kv_memory_reports: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
@@ -1089,6 +1095,10 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Runtime KV allocator snapshot for accounting/debug.
+    kv_runtime_stats: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-request C2KV/repair history KV layout report for accounting/debug.
+    kv_memory_reports: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
@@ -2015,11 +2025,13 @@ class C2KVSegmentInfo:
         token_start: int = 0,
         token_end: int = 0,
         repair_key_hashes: Optional[List[str]] = None,
+        use_gist_projection: bool = False,
     ):
         self.key_hash = key_hash
         self.token_start = token_start
         self.token_end = token_end
         self.repair_key_hashes = repair_key_hashes or []
+        self.use_gist_projection = use_gist_projection
 
 
 @dataclass
@@ -2051,10 +2063,19 @@ class TokenizedRepairExtractReqInput(BaseReq):
     span_start: int = 0
     span_end: int = 0
     position_offset: int = 0
+    repair_position_ids: Optional[List[int]] = None
+    raw_kv_position_mode: str = "rotated"
     repair_mode: str = "d_corr"
     source_doc_index: Optional[int] = None
     already_rotated: bool = True
     extract_source: str = "model_prefill"
+    history_kv_method: Optional[str] = None
+    history_kv_target_tokens: Optional[int] = None
+    history_kv_retention_ratio: Optional[float] = None
+    history_kv_recent_window: int = 64
+    history_kv_kernel_size: int = 5
+    history_kv_pooling: str = "avgpool"
+    history_kv_h2o_recent_fraction: float = 0.5
 
 
 @dataclass
@@ -2070,6 +2091,10 @@ class C2KVRepairExtractReqOutput(BaseReq):
     extract_source: str = ""
     cache_hit_tokens: int = 0
     serving_kv_buffer_shape: Optional[Tuple[int, ...]] = None
+    history_kv_method: Optional[str] = None
+    requested_span_tokens: int = 0
+    selected_token_count: int = 0
+    selected_relative_indices: Optional[List[int]] = None
     error: str = ""
     success: bool = True
 

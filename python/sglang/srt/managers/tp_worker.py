@@ -476,6 +476,7 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                history_kv_selection_scores=out.history_kv_selection_scores,
             )
 
             if is_verify:
@@ -531,6 +532,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                history_kv_selection_scores=out.history_kv_selection_scores,
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
@@ -554,6 +556,7 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            history_kv_selection_scores=out.history_kv_selection_scores,
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

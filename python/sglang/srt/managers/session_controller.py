@@ -113,15 +113,22 @@ class Session:
         last_req = None
         abort = False
         abort_message = ""
+        hint = getattr(req, "c2kv_kv_memory_hint", None)
+        persistent_history_session = bool(
+            isinstance(hint, dict)
+            and isinstance(hint.get("persistent_history_session"), dict)
+            and hint["persistent_history_session"].get("enabled")
+        )
         if self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
             if session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
-            elif session_params.drop_previous_output:
+            elif session_params.drop_previous_output and not persistent_history_session:
                 abort = True
                 abort_message = (
-                    "Streaming sessions do not support drop_previous_output."
+                    "Streaming sessions do not support drop_previous_output "
+                    "outside persistent history-KV mode."
                 )
             elif session_params.offset and session_params.offset != 0:
                 abort = True

@@ -1343,6 +1343,9 @@ async def close_session(obj: CloseSessionReqInput, request: Request):
     """Close the session."""
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
+        serving_chat = getattr(request.app.state, "openai_serving_chat", None)
+        if serving_chat is not None:
+            serving_chat.release_persistent_history_session(obj.session_id)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -1555,9 +1558,18 @@ async def v1_c2kv_repair_extract(
             span_start=request.span_start,
             span_end=span_end,
             position_offset=request.position_offset,
+            repair_position_ids=request.repair_position_ids,
+            raw_kv_position_mode=request.raw_kv_position_mode,
             repair_mode=request.repair_mode,
             source_doc_index=request.source_doc_index,
             extract_source=request.extract_source,
+            history_kv_method=request.history_kv_method,
+            history_kv_target_tokens=request.history_kv_target_tokens,
+            history_kv_retention_ratio=request.history_kv_retention_ratio,
+            history_kv_recent_window=request.history_kv_recent_window,
+            history_kv_kernel_size=request.history_kv_kernel_size,
+            history_kv_pooling=request.history_kv_pooling,
+            history_kv_h2o_recent_fraction=request.history_kv_h2o_recent_fraction,
         )
         return C2KVRepairExtractResponse(
             key_hash=result.key_hash,
@@ -1573,6 +1585,10 @@ async def v1_c2kv_repair_extract(
                 if result.serving_kv_buffer_shape is not None
                 else None
             ),
+            history_kv_method=result.history_kv_method,
+            requested_span_tokens=result.requested_span_tokens,
+            selected_token_count=result.selected_token_count,
+            selected_relative_indices=result.selected_relative_indices,
             success=result.success,
             error=result.error or None,
         )

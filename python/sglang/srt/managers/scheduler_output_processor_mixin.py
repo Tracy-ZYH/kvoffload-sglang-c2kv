@@ -85,27 +85,118 @@ class SchedulerOutputProcessorMixin:
     def _get_kv_runtime_stats(self: Scheduler) -> Optional[dict]:
         """Return a real KV allocator residency snapshot for accounting."""
 
+        snapshot = self._get_physical_kv_snapshot()
+        if snapshot is None:
+            return None
+        return {
+            "kv_pool_size": snapshot["main_kv_pool_size"],
+            "kv_available_tokens": snapshot["main_kv_available_slots"],
+            "kv_resident_tokens": snapshot["physical_main_kv_slots"],
+            "kv_peak_resident_tokens": snapshot["peak_main_paged_kv_slots"],
+            "kv_page_size": snapshot["page_size_tokens"],
+            **snapshot,
+        }
+
+    def _bytes_per_kv_token(self: Scheduler) -> Optional[int]:
+        try:
+            model_runner = self.tp_worker.model_runner
+            dtype = getattr(model_runner, "dtype", None)
+            if dtype is None:
+                dtype = getattr(self.token_to_kv_pool_allocator, "dtype", torch.float16)
+            dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+            num_layers = int(getattr(model_runner, "num_effective_layers"))
+            num_kv_heads = int(
+                self.model_config.get_num_kv_heads(self.attn_tp_group.world_size)
+            )
+            head_dim = int(self.model_config.head_dim)
+            value_head_dim = int(getattr(self.model_config, "v_head_dim", head_dim))
+            return num_layers * num_kv_heads * (head_dim + value_head_dim) * dtype_bytes
+        except Exception:
+            return None
+
+    def _get_physical_kv_snapshot(self: Scheduler) -> Optional[dict]:
+        """Return physical GPU KV residency for main paged KV and C2KV pool."""
+
         allocator = getattr(self, "token_to_kv_pool_allocator", None)
         if allocator is None:
             return None
         try:
             size = int(getattr(allocator, "size", 0) or 0)
             available = int(allocator.available_size())
-            resident = max(0, size - available)
-            peak = max(
-                int(getattr(self, "_c2kv_runtime_peak_kv_tokens", 0) or 0),
-                resident,
+            page_size = int(getattr(allocator, "page_size", 1) or 1)
+            main_slots = max(0, size - available)
+            main_pages = (
+                (main_slots + page_size - 1) // page_size if page_size > 0 else 0
             )
-            self._c2kv_runtime_peak_kv_tokens = peak
+
+            c2kv_pool = getattr(self, "c2kv_pool", None)
+            c2kv_slots = int(c2kv_pool.current_tokens()) if c2kv_pool is not None else 0
+            c2kv_pages = c2kv_slots
+            if c2kv_pool is not None:
+                c2kv_page_size = int(
+                    getattr(getattr(c2kv_pool, "allocator", None), "page_size", 1) or 1
+                )
+                c2kv_pages = (
+                    (c2kv_slots + c2kv_page_size - 1) // c2kv_page_size
+                    if c2kv_page_size > 0
+                    else 0
+                )
+
+            bytes_per_token = self._bytes_per_kv_token() or 0
+            main_bytes = main_slots * bytes_per_token
+            c2kv_bytes = c2kv_slots * bytes_per_token
+            total_bytes = main_bytes + c2kv_bytes
+
+            peak_main = max(
+                int(getattr(self, "_c2kv_runtime_peak_main_kv_slots", 0) or 0),
+                main_slots,
+            )
+            peak_c2kv = max(
+                int(getattr(self, "_c2kv_runtime_peak_c2kv_pool_slots", 0) or 0),
+                c2kv_slots,
+            )
+            peak_total = max(
+                int(getattr(self, "_c2kv_runtime_peak_total_gpu_kv_bytes", 0) or 0),
+                total_bytes,
+            )
+            self._c2kv_runtime_peak_main_kv_slots = peak_main
+            self._c2kv_runtime_peak_c2kv_pool_slots = peak_c2kv
+            self._c2kv_runtime_peak_total_gpu_kv_bytes = peak_total
             return {
-                "kv_pool_size": size,
-                "kv_available_tokens": available,
-                "kv_resident_tokens": resident,
-                "kv_peak_resident_tokens": peak,
-                "kv_page_size": int(getattr(allocator, "page_size", 1) or 1),
+                "main_kv_pool_size": size,
+                "main_kv_available_slots": available,
+                "page_size_tokens": page_size,
+                "bytes_per_kv_token": bytes_per_token,
+                "physical_main_kv_pages": main_pages,
+                "physical_main_kv_slots": main_slots,
+                "physical_main_kv_bytes": main_bytes,
+                "physical_c2kv_pool_pages": c2kv_pages,
+                "physical_c2kv_pool_slots": c2kv_slots,
+                "physical_c2kv_pool_bytes": c2kv_bytes,
+                "total_gpu_kv_bytes": total_bytes,
+                "peak_main_paged_kv_slots": peak_main,
+                "peak_c2kv_pool_slots": peak_c2kv,
+                "peak_total_gpu_kv_bytes": peak_total,
             }
         except Exception:
             return None
+
+    def _get_kv_memory_report(self: Scheduler, req: Req) -> Optional[dict]:
+        report = getattr(req, "kv_memory_report", None)
+        if not isinstance(report, dict):
+            snapshot = getattr(req, "history_kv_eviction_report_snapshot", None)
+            if isinstance(snapshot, dict):
+                logger.warning(
+                    "KV-memory report recovered from eviction snapshot rid=%s",
+                    req.rid,
+                )
+                report = dict(snapshot)
+        if not isinstance(report, dict):
+            return None
+        snapshot = self._get_physical_kv_snapshot()
+        if snapshot is not None:
+            report = {**report, **snapshot}
+        return report
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -253,6 +344,18 @@ class SchedulerOutputProcessorMixin:
                         if abort:
                             continue
 
+                        if getattr(cur_round, "post_history_kv_eviction", False):
+                            score_map = getattr(result, "history_kv_selection_scores", None)
+                            if isinstance(score_map, dict):
+                                req.history_kv_selection_scores = score_map.get(
+                                    int(req.req_pool_idx)
+                                )
+                            if not self._apply_history_kv_eviction(req):
+                                self._release_c2kv_pins(req)
+                                release_kv_cache(req, self.tree_cache, is_insert=False)
+                                self.stream_output([req], req.return_logprob)
+                                continue
+
                         req.c2kv_round_idx += 1
 
                         if req.c2kv_round_idx < len(req.c2kv_rounds):
@@ -292,20 +395,22 @@ class SchedulerOutputProcessorMixin:
 
                         # If gist was injected this round, batch.seq_lens is stale.
                         # Patch it so decode allocates at the correct position.
-                        if cur_round.post_inject_seg_indices:
-                            gist_delta = req.kv_committed_len - int(
-                                batch.seq_lens_cpu[i].item()
-                            )
-                            if gist_delta > 0:
-                                batch.seq_lens_cpu[i] += gist_delta
+                        if (
+                            cur_round.post_inject_seg_indices
+                            or getattr(cur_round, "post_history_kv_eviction", False)
+                        ):
+                            old_seq_len = int(batch.seq_lens_cpu[i].item())
+                            seq_delta = req.kv_committed_len - old_seq_len
+                            if seq_delta != 0:
+                                batch.seq_lens_cpu[i] = req.kv_committed_len
                                 if batch.seq_lens is None:
                                     batch.seq_lens = batch.seq_lens_cpu.to(
                                         batch.device
                                     )
                                 else:
-                                    batch.seq_lens[i] += gist_delta
+                                    batch.seq_lens[i] += seq_delta
                                 if batch.seq_lens_sum is not None:
-                                    batch.seq_lens_sum += gist_delta
+                                    batch.seq_lens_sum += seq_delta
 
                         self._log_c2kv_token_usage(
                             "all_rounds_finished",
@@ -317,6 +422,17 @@ class SchedulerOutputProcessorMixin:
                                 else None
                             ),
                         )
+                        persistent_active_ids = getattr(
+                            req, "c2kv_persistent_active_input_ids", None
+                        )
+                        if persistent_active_ids is not None:
+                            # Future streaming-session appends must see the
+                            # compact physical order rather than the discarded
+                            # logical history. c2kv_position_correction keeps
+                            # RoPE in the original logical coordinate frame.
+                            req.origin_input_ids = list(persistent_active_ids)
+                            req.origin_input_ids_unpadded = list(persistent_active_ids)
+                            req.c2kv_virtual_input_ids = list(persistent_active_ids)
                         self._release_c2kv_pins(req)
 
                     # req output_ids are set here
@@ -1099,6 +1215,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         kv_runtime_stats = []
+        kv_memory_reports = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
@@ -1203,6 +1320,14 @@ class SchedulerOutputProcessorMixin:
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
                 kv_runtime_stats.append(self._get_kv_runtime_stats())
+                kv_memory_report = self._get_kv_memory_report(req)
+                if getattr(req, "history_kv_eviction_result", None) is not None:
+                    logger.info(
+                        "KV-memory output snapshot rid=%s report_present=%s",
+                        req.rid,
+                        kv_memory_report is not None,
+                    )
+                kv_memory_reports.append(kv_memory_report)
 
                 retraction_counts.append(req.retraction_count)
 
@@ -1332,6 +1457,7 @@ class SchedulerOutputProcessorMixin:
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
                     kv_runtime_stats=kv_runtime_stats,
+                    kv_memory_reports=kv_memory_reports,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

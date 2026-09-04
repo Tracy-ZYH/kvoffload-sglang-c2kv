@@ -122,6 +122,120 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        # Canonical full chat-token sequences used to turn an OpenAI chat
+        # request into an exact streaming-session delta. This stores token ids
+        # only; KV ownership stays in SessionAwareCache.
+        self._persistent_history_sessions: Dict[str, List[int]] = {}
+
+    def release_persistent_history_session(self, session_id: str) -> None:
+        self._persistent_history_sessions.pop(session_id, None)
+
+    @staticmethod
+    def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
+        hint = request.c2kv_kv_memory_hint
+        return bool(
+            isinstance(hint, dict)
+            and isinstance(hint.get("persistent_history_session"), dict)
+            and hint["persistent_history_session"].get("enabled")
+        )
+
+    def _prepare_persistent_history_delta(
+        self,
+        request: ChatCompletionRequest,
+        full_prompt_ids: List[int],
+    ) -> tuple[List[int], Optional[str], Optional[List[int]]]:
+        """Return the exact append delta for a streaming history session."""
+        if not self._is_persistent_history_request(request):
+            return full_prompt_ids, None, None
+        if request.stream:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_STREAMING_UNSUPPORTED")
+        params = request.session_params or {}
+        session_id = params.get("id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_ID_REQUIRED")
+        # Store the canonical prompt *before* decode, not raw generated IDs.
+        # Tool parsers may return a structured assistant/tool-call message whose
+        # next-turn chat-template serialization differs from the raw completion.
+        # That completion suffix is deliberately discarded from the physical
+        # session cache and is re-prefilled in its canonical serialized form.
+        previous = self._persistent_history_sessions.get(session_id)
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("history_kv_eviction") if isinstance(hint, dict) else None
+        if previous is None:
+            if isinstance(config, dict):
+                config["persistent_session"] = True
+                config["persistent_continuation"] = False
+            if isinstance(hint, dict):
+                hint["persistent_session_logical_prefix_tokens"] = 0
+                hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
+            params["drop_previous_output"] = True
+            return full_prompt_ids, session_id, full_prompt_ids
+
+        common = min(len(previous), len(full_prompt_ids))
+        if full_prompt_ids[:common] != previous[:common] or len(full_prompt_ids) < len(previous):
+            mismatch = next(
+                (
+                    i
+                    for i, (left, right) in enumerate(zip(previous, full_prompt_ids))
+                    if left != right
+                ),
+                common,
+            )
+            raise ValueError(
+                "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                f"session_id={session_id}, previous_tokens={len(previous)}, "
+                f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
+            )
+
+        delta = full_prompt_ids[len(previous) :]
+        # Session.create_req must not append last_req.output_ids. Those raw
+        # decode tokens are not necessarily the canonical serialization of an
+        # OpenAI tool call; the delta above contains that serialization.
+        params["drop_previous_output"] = True
+        if isinstance(hint, dict):
+            hint["persistent_session_logical_prefix_tokens"] = len(previous)
+            hint["persistent_session_delta_tokens"] = len(delta)
+        if isinstance(config, dict):
+            history_end = int(config.get("history_end") or 0)
+            history_start = int(config.get("history_start") or 0)
+            if not (history_start <= history_end and history_end >= len(previous)):
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_BOUNDARY_MISMATCH: "
+                    f"history_start={history_start}, history_end={history_end}, "
+                    f"previous_tokens={len(previous)}"
+                )
+            config["persistent_session"] = True
+            config["persistent_continuation"] = True
+            config["persistent_protected_prefix_tokens"] = history_start
+            config["persistent_delta_history_tokens"] = history_end - len(previous)
+            config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
+        return delta, session_id, full_prompt_ids
+
+    def _commit_persistent_history_session(
+        self,
+        adapted_request: GenerateReqInput,
+        ret: List[Dict[str, Any]],
+    ) -> None:
+        session_id = getattr(adapted_request, "_persistent_history_session_id", None)
+        canonical_prompt_ids = getattr(
+            adapted_request, "_persistent_history_canonical_prompt_ids", None
+        )
+        if not session_id or not isinstance(canonical_prompt_ids, list) or not ret:
+            return
+        output_ids = ret[0].get("output_ids") or []
+        if not isinstance(output_ids, list):
+            raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
+        # The next request is compared against the pre-decode canonical prompt.
+        # Raw output IDs are never assumed to be equivalent to the API's
+        # structured assistant/tool-call serialization.
+        self._persistent_history_sessions[session_id] = list(canonical_prompt_ids)
+        ret[0].setdefault("meta_info", {})["persistent_history_session"] = {
+            "session_id": session_id,
+            "canonical_prompt_tokens": len(canonical_prompt_ids),
+            "generated_tokens": len(output_ids),
+            "next_prefix_tokens": len(canonical_prompt_ids),
+            "generated_suffix_reprefill_required": True,
+        }
 
     def _handle_last_assistant_message(
         self,
@@ -446,6 +560,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             getattr(msg, "c2kv_repair_only_key_hashes", None) or []
                         )
                     ),
+                    use_gist_projection=(
+                        getattr(msg, "c2kv_use_gist_projection", None) is not False
+                    ),
                 )
             )
 
@@ -456,6 +573,86 @@ class OpenAIServingChat(OpenAIServingBase):
             request.messages.pop(i)
 
         return segments
+
+    @staticmethod
+    def _find_token_subsequence(haystack: List[int], needle: List[int]) -> int:
+        if not needle or len(needle) > len(haystack):
+            return -1
+        limit = len(haystack) - len(needle) + 1
+        for start in range(limit):
+            if haystack[start : start + len(needle)] == needle:
+                return start
+        return -1
+
+    def _resolve_history_kv_eviction_range(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        """Resolve BFCL history offsets in the server's actual token frame.
+
+        The client sends a completed-message count, never client-side token
+        offsets. Tool templates can produce a different prologue or fallback
+        representation on the server, so only the final OpenAI prompt IDs are
+        authoritative for physical KV eviction.
+        """
+
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict):
+            return
+        config = hint.get("history_kv_eviction")
+        if not isinstance(config, dict):
+            return
+        count = config.get("history_message_count")
+        if count is None:
+            return
+        try:
+            count = int(count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid history_message_count: {count!r}") from exc
+        if not (0 < count <= len(request.messages)):
+            raise ValueError(
+                "Invalid physical history message boundary: "
+                f"history_message_count={count}, messages={len(request.messages)}"
+            )
+
+        tools = self._chat_template_tools(request)
+        completed = list(request.messages[:count])
+        with_tools = self._c2kv_chat_template_input_ids(request, completed, tools)
+        without_tools = self._c2kv_chat_template_input_ids(request, completed, None)
+        bos_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
+        while without_tools and bos_id is not None and without_tools[0] == bos_id:
+            without_tools = without_tools[1:]
+        if not without_tools:
+            raise ValueError("Cannot resolve an empty physical history token span")
+
+        prefix_start = 0
+        if prompt_ids[: len(with_tools)] != with_tools:
+            prefix_start = self._find_token_subsequence(prompt_ids, with_tools)
+        if prefix_start < 0:
+            raise ValueError(
+                "Server chat template prefix is not present in the final prompt; "
+                "refusing physical history KV eviction."
+            )
+        history_relative_start = self._find_token_subsequence(with_tools, without_tools)
+        if history_relative_start < 0:
+            raise ValueError(
+                "Cannot isolate completed history from the server tool prologue; "
+                "refusing physical history KV eviction."
+            )
+        history_start = prefix_start + history_relative_start
+        history_end = history_start + len(without_tools)
+        if history_end > len(prompt_ids) or prompt_ids[history_start:history_end] != without_tools:
+            raise ValueError(
+                "Resolved physical history range does not match the server prompt IDs; "
+                "refusing physical history KV eviction."
+            )
+        config["history_start"] = history_start
+        config["history_end"] = history_end
+        config["server_tokenized"] = True
+        # The server owns the final chat template, so this is the only exact
+        # full-history token count used by persistent physical accounting.
+        hint["full_equivalent_history_tokens"] = history_end - history_start
 
     def _convert_to_internal_request(
         self,
@@ -483,6 +680,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        if not is_multimodal and isinstance(processed_messages.prompt_ids, list):
+            self._resolve_history_kv_eviction_range(request, processed_messages.prompt_ids)
+            input_ids, persistent_session_id, canonical_prompt_ids = (
+                self._prepare_persistent_history_delta(
+                    request, list(processed_messages.prompt_ids)
+                )
+            )
+        else:
+            input_ids = processed_messages.prompt_ids
+            persistent_session_id = None
+            canonical_prompt_ids = None
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -498,7 +706,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
             else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+                prompt_kwargs = {"input_ids": input_ids}
 
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
@@ -540,11 +748,30 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            session_params=request.session_params,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             c2kv_segments=c2kv_segments,
+            c2kv_kv_memory_hint=request.c2kv_kv_memory_hint,
+            c2kv_use_gist_projection=bool(
+                c2kv_segments
+                and any(
+                    getattr(seg, "use_gist_projection", True)
+                    for seg in c2kv_segments
+                )
+            ),
         )
+        if persistent_session_id is not None:
+            adapted_request._persistent_history_session_id = persistent_session_id
+            adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
+
+        if request.c2kv_kv_memory_hint:
+            logger.info(
+                "C2KV KV-memory hint accepted rid=%s history_eviction=%s",
+                adapted_request.rid,
+                bool(request.c2kv_kv_memory_hint.get("history_kv_eviction")),
+            )
 
         return adapted_request, request
 
@@ -1145,6 +1372,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
+        self._commit_persistent_history_session(adapted_request, ret)
+
         response = self._build_chat_response(
             request,
             ret,
@@ -1253,6 +1482,14 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        kv_memory_report = ret[0]["meta_info"].get("kv_memory_report")
+        if kv_memory_report is not None:
+            logger.info(
+                "C2KV KV-memory report returned rid=%s status=%s",
+                ret[0]["meta_info"]["id"],
+                kv_memory_report.get("history_kv_runtime_status"),
+            )
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
@@ -1262,6 +1499,10 @@ class OpenAIServingChat(OpenAIServingBase):
             metadata={
                 "weight_version": ret[0]["meta_info"]["weight_version"],
                 "sglang_runtime": ret[0]["meta_info"].get("kv_runtime_stats"),
+                # Keep the per-request layout report produced by the scheduler.
+                # BFCL uses this to distinguish measured physical KV residency
+                # from client-side history-token estimates.
+                "kv_memory_report": kv_memory_report,
             },
             sglext=response_sglext,
         )

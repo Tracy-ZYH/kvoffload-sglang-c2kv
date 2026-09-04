@@ -500,6 +500,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     c2kv_repair_key_hashes: Optional[List[str]] = None
     c2kv_repair_only_key_hashes: Optional[List[str]] = None
     c2kv_repair_token_start: Optional[int] = None
+    c2kv_use_gist_projection: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -521,6 +522,7 @@ class ChatCompletionMessageUserParam(BaseModel):
     c2kv_repair_key_hashes: Optional[List[str]] = None
     c2kv_repair_only_key_hashes: Optional[List[str]] = None
     c2kv_repair_token_start: Optional[int] = None
+    c2kv_use_gist_projection: Optional[bool] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -597,6 +599,7 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
+    c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1540,9 +1543,18 @@ class C2KVRepairExtractRequest(BaseModel):
     span_start: int = 0
     span_end: Optional[int] = None
     position_offset: int = 0
+    repair_position_ids: Optional[List[int]] = None
+    raw_kv_position_mode: str = "rotated"
     repair_mode: str = "d_corr"
     source_doc_index: Optional[int] = None
     extract_source: str = "model_prefill"
+    history_kv_method: Optional[str] = None
+    history_kv_target_tokens: Optional[int] = None
+    history_kv_retention_ratio: Optional[float] = None
+    history_kv_recent_window: int = 64
+    history_kv_kernel_size: int = 5
+    history_kv_pooling: str = "avgpool"
+    history_kv_h2o_recent_fraction: float = 0.5
 
 
 class C2KVRepairExtractResponse(BaseModel):
@@ -1557,5 +1569,9 @@ class C2KVRepairExtractResponse(BaseModel):
     extract_source: str = ""
     cache_hit_tokens: int = 0
     serving_kv_buffer_shape: Optional[List[int]] = None
+    history_kv_method: Optional[str] = None
+    requested_span_tokens: int = 0
+    selected_token_count: int = 0
+    selected_relative_indices: Optional[List[int]] = None
     success: bool = True
     error: Optional[str] = None

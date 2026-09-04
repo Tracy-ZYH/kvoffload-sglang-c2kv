@@ -26,7 +26,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -281,6 +281,7 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    history_kv_selection_scores: Optional[Dict[int, Dict[str, Any]]] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -2751,6 +2752,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         span_start: int,
         span_end: int,
         position_offset: int = 0,
+        repair_position_ids=None,
+        raw_kv_position_mode: str = "rotated",
+        history_kv_method: str = None,
+        history_kv_target_tokens: int = None,
+        history_kv_retention_ratio: float = None,
+        history_kv_recent_window: int = 64,
+        history_kv_kernel_size: int = 5,
+        history_kv_pooling: str = "avgpool",
+        history_kv_h2o_recent_fraction: float = 0.5,
     ):
         """Capture ordinary full-prefill KV for a repair span."""
         if not hasattr(self.model, "generate_raw_repair_kv"):
@@ -2762,6 +2772,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             span_start=span_start,
             span_end=span_end,
             position_offset=position_offset,
+            repair_position_ids=repair_position_ids,
+            raw_kv_position_mode=raw_kv_position_mode,
+            history_kv_method=history_kv_method,
+            history_kv_target_tokens=history_kv_target_tokens,
+            history_kv_retention_ratio=history_kv_retention_ratio,
+            history_kv_recent_window=history_kv_recent_window,
+            history_kv_kernel_size=history_kv_kernel_size,
+            history_kv_pooling=history_kv_pooling,
+            history_kv_h2o_recent_fraction=history_kv_h2o_recent_fraction,
         )
 
     def get_c2kv_compression_ratio(self, requested_ratio: int) -> int:
@@ -2912,7 +2931,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+        return ModelRunnerOutput(
+            logits_output=ret,
+            can_run_graph=can_run_graph,
+            history_kv_selection_scores=getattr(
+                forward_batch, "c2kv_history_kv_selection_scores", None
+            ),
+        )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

@@ -34,7 +34,7 @@ import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -430,6 +430,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For C2KV extraction
     c2kv_position_corrections: Optional[torch.Tensor] = None  # (batch_size,) int64
+    c2kv_use_gist_projection: Optional[torch.Tensor] = None  # (num_tokens,) bool
+    c2kv_gist_projection_start_positions: Optional[torch.Tensor] = None
+    c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None
+    c2kv_history_kv_selection_scores: Optional[Dict[int, Dict[str, Any]]] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -484,6 +488,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
         )
+        ret.c2kv_history_kv_eviction_configs = (
+            batch.c2kv_history_kv_eviction_configs
+        )
+        if ret.c2kv_history_kv_eviction_configs is not None:
+            ret.c2kv_history_kv_selection_scores = {}
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
@@ -597,6 +606,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 per_token_corr = torch.repeat_interleave(corr, ext_lens)
                 ret.positions = ret.positions + per_token_corr
+
+        if batch.c2kv_use_gist_projection is not None:
+            req_flags = torch.tensor(
+                batch.c2kv_use_gist_projection, dtype=torch.bool, device=device
+            )
+            req_starts = torch.tensor(
+                batch.c2kv_gist_projection_start_positions
+                or [0] * len(batch.c2kv_use_gist_projection),
+                dtype=torch.int64,
+                device=device,
+            )
+            if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+                ret.c2kv_use_gist_projection = req_flags & (
+                    ret.positions.reshape(-1).to(dtype=torch.int64) >= req_starts
+                )
+            elif batch.extend_seq_lens is not None:
+                ext_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32, device=device
+                )
+                token_flags = torch.repeat_interleave(req_flags, ext_lens)
+                token_starts = torch.repeat_interleave(req_starts, ext_lens)
+                ret.c2kv_use_gist_projection = token_flags & (
+                    ret.positions.reshape(-1).to(dtype=torch.int64) >= token_starts
+                )
 
 
         # ---------------------------------------------------------

@@ -459,6 +459,21 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    # A persistent session keeps only the canonical prompt KV between turns.
+    # Decode KV is parsed/re-rendered by the OpenAI layer and must be discarded
+    # on session handoff.  Record the real allocator slots because a paged
+    # allocator can reserve a full page that is not represented by the
+    # request's logical length.
+    for i, req in enumerate(batch.reqs):
+        hint = getattr(req, "c2kv_kv_memory_hint", None)
+        persistent = (
+            isinstance(hint, dict)
+            and isinstance(hint.get("persistent_history_session"), dict)
+            and hint["persistent_history_session"].get("enabled")
+        )
+        if persistent:
+            req.persistent_decode_cache_locs.append(out_cache_loc[i])
+
     return out_cache_loc
 
 

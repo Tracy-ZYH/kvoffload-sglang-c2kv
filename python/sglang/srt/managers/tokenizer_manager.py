@@ -983,6 +983,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 c2kv_segments=getattr(obj, "c2kv_segments", None),
+                c2kv_kv_memory_hint=getattr(obj, "c2kv_kv_memory_hint", None),
+                c2kv_use_gist_projection=getattr(
+                    obj, "c2kv_use_gist_projection", False
+                ),
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1594,6 +1598,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     and recv_obj.kv_runtime_stats[i] is not None
                 ):
                     meta_info["kv_runtime_stats"] = recv_obj.kv_runtime_stats[i]
+                if (
+                    hasattr(recv_obj, "kv_memory_reports")
+                    and recv_obj.kv_memory_reports
+                    and recv_obj.kv_memory_reports[i] is not None
+                ):
+                    meta_info["kv_memory_report"] = recv_obj.kv_memory_reports[i]
+                    logger.info("KV-memory report attached to response rid=%s", rid)
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]

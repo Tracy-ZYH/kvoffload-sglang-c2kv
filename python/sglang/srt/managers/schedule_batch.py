@@ -559,11 +559,17 @@ class MultimodalInputs:
 class C2KVPrefillRound:
     """One round of C2KV multi-round prefill."""
 
-    __slots__ = ("tokens", "post_inject_seg_indices")
+    __slots__ = ("tokens", "post_inject_seg_indices", "post_history_kv_eviction")
 
-    def __init__(self, tokens: List[int], post_inject_seg_indices: List[int]):
+    def __init__(
+        self,
+        tokens: List[int],
+        post_inject_seg_indices: List[int],
+        post_history_kv_eviction: bool = False,
+    ):
         self.tokens = tokens
         self.post_inject_seg_indices = post_inject_seg_indices
+        self.post_history_kv_eviction = post_history_kv_eviction
 
 
 class Req(ReqDllmMixin):
@@ -628,6 +634,11 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        # Persistent streaming sessions may reserve a whole paged KV page for
+        # a decode token even when the token is discarded before the next
+        # canonical chat-template turn.  Keep the actual physical ownership
+        # explicit; kv_allocated_len alone cannot describe that reservation.
+        self.persistent_decode_cache_locs = []
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -897,6 +908,15 @@ class Req(ReqDllmMixin):
         self.c2kv_requeued = False              # True while waiting for next round
         self.c2kv_pinned_keys = None        # Unique C2KV keys pinned while rounds inject
         self.c2kv_tree_cache_prefix_len = 0  # Prefix slots owned by radix/tree cache
+        self.c2kv_kv_memory_hint = None
+        self.history_kv_eviction = None
+        self.history_kv_eviction_result = None
+        self.history_kv_eviction_report_snapshot = None
+        self.history_kv_selection_scores = None
+        self.c2kv_persistent_active_input_ids = None
+        self.c2kv_use_gist_projection = False
+        self.c2kv_gist_projection_start_pos = 0
+        self.kv_memory_report = None
 
     @property
     def seqlen(self) -> int:
@@ -1313,6 +1333,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.persistent_decode_cache_locs = []
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1360,6 +1381,20 @@ class Req(ReqDllmMixin):
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
+        if (
+            self.c2kv_rounds is not None
+            and self.return_logprob
+            and self.token_ids_logprob is None
+            and self.logprob_start_len >= len(self.origin_input_ids)
+        ):
+            # OpenAI-style generation logprobs only need sampled output token
+            # logprobs. During C2KV multi-round prefill, the virtual prefix can
+            # be longer than origin_input_ids, so the generic relative
+            # logprob_start_len calculation would incorrectly request input
+            # logprobs for the transient C2KV round tokens and later fail the
+            # origin-input length invariant in the output processor.
+            self.extend_logprob_start_len = self.extend_input_len
+            return
         if self.logprob_start_len == -1:
             logprob_start_len = len(self.fill_ids)
         else:
@@ -2482,6 +2517,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             c2kv_corr = [
                 getattr(r, "c2kv_position_correction", 0) for r in self.reqs
             ]
+        c2kv_use_gist_projection = None
+        if any(getattr(r, "c2kv_use_gist_projection", False) for r in self.reqs):
+            c2kv_use_gist_projection = [
+                bool(getattr(r, "c2kv_use_gist_projection", False))
+                for r in self.reqs
+            ]
+        c2kv_gist_projection_start_positions = None
+        if c2kv_use_gist_projection is not None:
+            c2kv_gist_projection_start_positions = [
+                int(getattr(r, "c2kv_gist_projection_start_pos", 0) or 0)
+                for r in self.reqs
+            ]
+        c2kv_history_kv_eviction_configs = None
+        if any(getattr(r, "history_kv_eviction", None) for r in self.reqs):
+            c2kv_history_kv_eviction_configs = []
+            for r in self.reqs:
+                config = getattr(r, "history_kv_eviction", None)
+                if (
+                    isinstance(config, dict)
+                    and getattr(r, "c2kv_rounds", None) is not None
+                    and r.c2kv_round_idx < len(r.c2kv_rounds)
+                    and getattr(
+                        r.c2kv_rounds[r.c2kv_round_idx],
+                        "post_history_kv_eviction",
+                        False,
+                    )
+                ):
+                    c2kv_history_kv_eviction_configs.append(dict(config))
+                else:
+                    c2kv_history_kv_eviction_configs.append(None)
 
         if os.environ.get("C2KV_DEBUG_POSITIONS") == "1":
             print(
@@ -2562,6 +2627,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             c2kv_position_corrections=c2kv_corr,
+            c2kv_use_gist_projection=c2kv_use_gist_projection,
+            c2kv_gist_projection_start_positions=(
+                c2kv_gist_projection_start_positions
+            ),
+            c2kv_history_kv_eviction_configs=c2kv_history_kv_eviction_configs,
         )
 
     def copy(self):
@@ -2752,3 +2822,6 @@ class ModelWorkerBatch:
 
     # C2KV position corrections per request
     c2kv_position_corrections: Optional[List[int]] = None
+    c2kv_use_gist_projection: Optional[List[bool]] = None
+    c2kv_gist_projection_start_positions: Optional[List[int]] = None
+    c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None

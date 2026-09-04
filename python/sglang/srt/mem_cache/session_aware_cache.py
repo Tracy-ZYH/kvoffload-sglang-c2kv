@@ -51,6 +51,11 @@ class SessionSlot:
     # SWA state
     swa_evicted_seqlen: int = 0
 
+    # C2KV physical-history eviction keeps a compact physical sequence while
+    # rotary positions remain in the original logical frame. Persist the
+    # correction across streaming session requests.
+    c2kv_position_correction: int = 0
+
     # Mamba states
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
@@ -69,6 +74,9 @@ class SessionSlot:
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
         self.swa_evicted_seqlen = req.swa_evicted_seqlen
+        self.c2kv_position_correction = int(
+            getattr(req, "c2kv_position_correction", 0) or 0
+        )
 
         if is_first:
             self.last_node = req.last_node
@@ -90,6 +98,7 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv_allocated_len = self.kv_allocated_len
         req.swa_evicted_seqlen = self.swa_evicted_seqlen
+        req.c2kv_position_correction = self.c2kv_position_correction
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -181,6 +190,66 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["persistent_history_session"] = True
+            report["persistent_session_restore"] = True
+            report["persistent_session_reused_physical_tokens"] = int(
+                req.kv_committed_len
+            )
+            report["persistent_session_position_correction"] = int(
+                req.c2kv_position_correction
+            )
+
+        # A persistent physical-history request arrives with only the exact
+        # chat-template delta.  Now that the session KV length is restored,
+        # split that delta into completed-history and current-query rounds.
+        # This must happen after restore: before that point the physical prefix
+        # length is unknown.
+        config = getattr(req, "history_kv_eviction", None)
+        if (
+            isinstance(config, dict)
+            and config.get("persistent_continuation_pending")
+        ):
+            from sglang.srt.managers.schedule_batch import C2KVPrefillRound
+
+            protected = int(config.get("persistent_protected_prefix_tokens") or 0)
+            delta_history = int(config.get("persistent_delta_history_tokens") or 0)
+            prefix_len = int(req.kv_committed_len)
+            history_end = prefix_len + delta_history
+            origin_len = len(req.origin_input_ids)
+            if not (0 <= protected <= prefix_len <= history_end <= origin_len):
+                req.set_finish_with_abort(
+                    "PERSISTENT_HISTORY_SESSION_RANGE_INVALID: "
+                    f"{protected=}, {prefix_len=}, {delta_history=}, {origin_len=}"
+                )
+            else:
+                rounds = [
+                    C2KVPrefillRound(
+                        list(req.origin_input_ids[:history_end]),
+                        [],
+                        post_history_kv_eviction=True,
+                    )
+                ]
+                if history_end < origin_len:
+                    rounds.append(
+                        C2KVPrefillRound(
+                            list(req.origin_input_ids[history_end:]), []
+                        )
+                    )
+                req.c2kv_rounds = rounds
+                req.c2kv_round_idx = 0
+                req.c2kv_round_start_len = 0
+                req.c2kv_virtual_input_ids = list(req.origin_input_ids)
+                config["history_start"] = protected
+                config["history_end"] = history_end
+                config["persistent_prior_physical_tokens"] = prefix_len
+                if isinstance(report, dict):
+                    report["persistent_session_history_start"] = protected
+                    report["persistent_session_history_end"] = history_end
+                    report["persistent_session_delta_history_tokens"] = delta_history
+                config.pop("persistent_continuation_pending", None)
+
         # logprob_start_len is already forced to -1 for streaming sessions
         # (in Req.init_next_round_input), so the prefix key is not truncated
         # and we can directly reuse the committed KV length.
@@ -200,6 +269,9 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        if self._is_persistent_history_req(req):
+            self._discard_persistent_decode_suffix(req)
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
@@ -208,6 +280,113 @@ class SessionAwareCache(BasePrefixCache):
             self.slots[session_id] = slot
 
         slot.save_from_req(req, is_first=is_first)
+
+    @staticmethod
+    def _is_persistent_history_req(req: Req) -> bool:
+        hint = getattr(req, "c2kv_kv_memory_hint", None)
+        return bool(
+            isinstance(hint, dict)
+            and isinstance(hint.get("persistent_history_session"), dict)
+            and hint["persistent_history_session"].get("enabled")
+        )
+
+    def _discard_persistent_decode_suffix(self, req: Req) -> None:
+        """Remove raw decode KV before stashing a persistent chat session.
+
+        A generated tool call is parsed into structured OpenAI data and gets
+        re-rendered by the chat template on the next request. Its raw decode
+        tokens are therefore not a valid cache prefix. Keep only the prompt
+        KV; the canonical assistant/tool serialization is part of the next
+        request's delta and is prefetched normally.
+        """
+        prompt_len = len(req.origin_input_ids)
+        committed_len = int(req.kv_committed_len)
+        allocated_len = int(req.kv_allocated_len)
+        if prompt_len > committed_len:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_SESSION_PROMPT_LONGER_THAN_KV: "
+                f"{prompt_len=}, {committed_len=}, rid={req.rid}"
+            )
+        if committed_len > allocated_len:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_SESSION_COMMITTED_EXCEEDS_ALLOCATED: "
+                f"{committed_len=}, {allocated_len=}, rid={req.rid}"
+            )
+        discarded = allocated_len - prompt_len
+        reclaimed = 0
+        orphaned_tail = 0
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+
+        # Paged decode allocation is page-granular.  The allocator can own a
+        # page even when the request row/logical length only exposes the
+        # prompt.  Release explicitly recorded decode slots first, filtering
+        # out the prompt's final partial page, which must remain resident.
+        explicit_reclaimed = 0
+        explicit_slots = getattr(req, "persistent_decode_cache_locs", None) or []
+        if explicit_slots:
+            slots = torch.stack(
+                [slot.reshape(()) for slot in explicit_slots]
+            ).to(dtype=torch.int64)
+            min_page = (prompt_len + self.page_size - 1) // self.page_size
+            page_ids = torch.div(slots, self.page_size, rounding_mode="floor")
+            slots = slots[(slots > 0) & (page_ids >= min_page)]
+            if slots.numel() > 0:
+                pages = torch.unique(
+                    torch.div(slots, self.page_size, rounding_mode="floor")
+                )
+                free_slots = pages[:, None] * self.page_size + torch.arange(
+                    self.page_size, device=pages.device, dtype=pages.dtype
+                )
+                free_slots = free_slots.reshape(-1)
+                self.token_to_kv_pool_allocator.free(free_slots)
+                explicit_reclaimed = int(free_slots.numel())
+                # Clear any request-row references into the released pages.
+                for page in pages.tolist():
+                    start = int(page) * self.page_size
+                    end = min(start + self.page_size, req_row.shape[0])
+                    req_row[start:end] = 0
+                orphaned_tail = explicit_reclaimed
+            req.persistent_decode_cache_locs = []
+        if discarded:
+            # PagedAllocator owns complete pages. Free only pages strictly
+            # after the prompt's final page; the remaining partial page is
+            # retained as an internal session tail and is not attention
+            # visible. It is released with the session.
+            free_start = ceil_align(prompt_len, self.page_size)
+            if free_start < allocated_len:
+                free_slots = req_row[free_start:allocated_len]
+                self.token_to_kv_pool_allocator.free(free_slots)
+                reclaimed = allocated_len - free_start
+            req_row[prompt_len:allocated_len] = 0
+            req.kv_committed_len = prompt_len
+            req.kv_allocated_len = prompt_len
+            req.already_computed = prompt_len
+
+        # Some decode/over-allocation paths reserve a complete page but leave
+        # kv_allocated_len at the last committed token. Such a page is not
+        # visible through the session length accounting and would trip the
+        # idle memory checker after ownership transfer. It is safe to inspect
+        # only pages after the prompt's final page: the prompt page itself is
+        # retained because it contains attention-visible KV.
+        scan_start = ceil_align(prompt_len, self.page_size)
+        scan_end = min(scan_start + self.page_size, req_row.shape[0])
+        if scan_start < scan_end:
+            tail_slots = req_row[scan_start:scan_end]
+            live_tail_slots = tail_slots[tail_slots > 0]
+            if live_tail_slots.numel() > 0:
+                self.token_to_kv_pool_allocator.free(live_tail_slots)
+                req_row[scan_start:scan_end] = 0
+                orphaned_tail = self.page_size
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["persistent_session_discarded_decode_kv_tokens"] = discarded
+            report["persistent_session_reclaimed_decode_kv_tokens"] = reclaimed
+            report["persistent_session_page_tail_tokens"] = discarded - reclaimed
+            report["persistent_session_orphaned_tail_page_tokens"] = orphaned_tail
+            report["persistent_session_explicit_decode_reclaimed_tokens"] = (
+                explicit_reclaimed
+            )
+            report["persistent_session_prompt_physical_tokens"] = prompt_len
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):
