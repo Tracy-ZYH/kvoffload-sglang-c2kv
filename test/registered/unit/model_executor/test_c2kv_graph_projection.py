@@ -13,6 +13,27 @@ class TestC2KVGraphProjectionMask(unittest.TestCase):
         buffers.c2kv_use_gist_projection = torch.ones(capacity, dtype=torch.bool)
         return buffers
 
+    def test_constructor_defaults_projection_buffer_off(self):
+        buffers = DecodeInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=2,
+            hidden_size=4,
+            vocab_size=8,
+            dtype=torch.float32,
+            dp_size=1,
+            pp_size=1,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=False,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=0,
+            num_tokens_per_bs=1,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+        )
+
+        self.assertIsNone(buffers.c2kv_use_gist_projection)
+
     def test_mixed_requests_and_padding_are_preserved(self):
         buffers = self.create_buffers(4)
         forward_batch = SimpleNamespace(

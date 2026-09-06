@@ -159,7 +159,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
-        enable_c2kv_query_projection: bool,
+        enable_c2kv_query_projection: bool = False,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
