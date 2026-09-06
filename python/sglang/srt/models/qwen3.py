@@ -255,15 +255,14 @@ class Qwen3Attention(nn.Module):
         if (
             gist_mask is not None
             and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
-            and bool(gist_mask.any().item())
             and hasattr(self, "gist_qkv_proj")
         ):
-            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
             if gist_mask.ndim != 1 or gist_mask.shape[0] != qkv.shape[0]:
                 raise RuntimeError(
                     "c2kv_use_gist_projection mask shape mismatch: "
                     f"{tuple(gist_mask.shape)} != {(qkv.shape[0],)}"
                 )
+            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
             qkv = torch.where(gist_mask.to(qkv.device).view(-1, 1), gist_qkv, qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(

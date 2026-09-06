@@ -127,6 +127,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
+    c2kv_use_gist_projection: Optional[torch.Tensor]
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
@@ -158,6 +159,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        enable_c2kv_query_projection: bool,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
@@ -167,6 +169,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            c2kv_use_gist_projection = (
+                torch.zeros((max_num_token,), dtype=torch.bool)
+                if enable_c2kv_query_projection
+                else None
+            )
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
@@ -238,6 +245,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             positions=positions,
+            c2kv_use_gist_projection=c2kv_use_gist_projection,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
@@ -250,6 +258,37 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
         )
+
+    def update_c2kv_gist_projection_mask(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_num_token: int,
+        graph_num_token: int,
+    ) -> None:
+        """Copy the dynamic C2KV projection mask into graph-owned storage."""
+
+        buffer = self.c2kv_use_gist_projection
+        if buffer is None:
+            return
+        if not 0 <= raw_num_token <= graph_num_token <= buffer.shape[0]:
+            raise ValueError(
+                "Invalid C2KV graph mask sizes: "
+                f"{raw_num_token=}, {graph_num_token=}, capacity={buffer.shape[0]}"
+            )
+
+        # Clear the full captured slice on every replay. This resets masks from a
+        # previous C2KV batch and keeps padded requests on the base projection.
+        buffer[:graph_num_token].zero_()
+        source = getattr(forward_batch, "c2kv_use_gist_projection", None)
+        if source is None:
+            return
+        if source.ndim != 1 or source.shape[0] != raw_num_token:
+            raise RuntimeError(
+                "c2kv_use_gist_projection mask shape mismatch during graph replay: "
+                f"{tuple(source.shape)} != {(raw_num_token,)}"
+            )
+        buffer[:raw_num_token].copy_(source)
 
     def populate_from_forward_batch(
         self,
@@ -272,6 +311,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+
+        self.update_c2kv_gist_projection_mask(
+            forward_batch,
+            raw_num_token=raw_num_token,
+            graph_num_token=bs * num_tokens_per_bs,
+        )
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -632,6 +677,11 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_c2kv_query_projection=(
+                getattr(model_runner.server_args, "enable_c2kv", False)
+                and not getattr(model_runner.model, "full_length_pic", False)
+                and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
+            ),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -951,6 +1001,11 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            c2kv_use_gist_projection=(
+                buffers.c2kv_use_gist_projection[:num_tokens]
+                if buffers.c2kv_use_gist_projection is not None
+                else None
+            ),
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -1152,6 +1207,11 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.update_c2kv_gist_projection_mask(
+                forward_batch,
+                raw_num_token=self.raw_num_token,
+                graph_num_token=self.bs * self.num_tokens_per_bs,
+            )
 
         # Replay
         if self.enable_pdmux:
