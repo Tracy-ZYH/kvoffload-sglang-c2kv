@@ -66,7 +66,12 @@ if _use_aiter:
 if _is_npu:
     import torch_npu
 
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    except ImportError:
+        # The fused kernel is optional; retain native QKV preparation when the
+        # installed kernel package cannot import its Triton extension.
+        split_qkv_rmsnorm_rope = None
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
@@ -255,15 +260,14 @@ class Qwen3Attention(nn.Module):
         if (
             gist_mask is not None
             and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
-            and bool(gist_mask.any().item())
             and hasattr(self, "gist_qkv_proj")
         ):
-            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
             if gist_mask.ndim != 1 or gist_mask.shape[0] != qkv.shape[0]:
                 raise RuntimeError(
                     "c2kv_use_gist_projection mask shape mismatch: "
                     f"{tuple(gist_mask.shape)} != {(qkv.shape[0],)}"
                 )
+            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
             qkv = torch.where(gist_mask.to(qkv.device).view(-1, 1), gist_qkv, qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
@@ -373,6 +377,8 @@ class Qwen3Attention(nn.Module):
             entry["layers"].append(layer_score.detach().cpu())
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        if split_qkv_rmsnorm_rope is None:
+            return self.forward_prepare_native(positions, hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
