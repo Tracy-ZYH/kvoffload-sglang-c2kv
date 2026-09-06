@@ -66,7 +66,12 @@ if _use_aiter:
 if _is_npu:
     import torch_npu
 
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    try:
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    except ImportError:
+        # The fused kernel is optional; retain native QKV preparation when the
+        # installed kernel package cannot import its Triton extension.
+        split_qkv_rmsnorm_rope = None
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
@@ -372,6 +377,8 @@ class Qwen3Attention(nn.Module):
             entry["layers"].append(layer_score.detach().cpu())
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        if split_qkv_rmsnorm_rope is None:
+            return self.forward_prepare_native(positions, hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
