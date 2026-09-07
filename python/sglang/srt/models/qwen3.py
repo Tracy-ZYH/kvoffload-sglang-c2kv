@@ -34,6 +34,16 @@ from sglang.srt.mem_cache.gist_utils import (
     get_prepare_gist_input_func,
     prepare_pic_input,
 )
+from sglang.srt.mem_cache.history_kv_selection import (
+    HEADWISE_HISTORY_KV_METHODS,
+    attention_scores_by_kv_head,
+    gather_paired_kv,
+    require_rotated_headwise_storage,
+    select_h2o_prefill_indices,
+    select_snapkv_indices,
+    select_streamingllm_indices,
+    summarize_headwise_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -41,6 +51,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.mem_cache.cacheblend import CacheBlendConfig
+from sglang.srt.mem_cache.cacheblend import blend as cacheblend_blend
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -67,10 +79,13 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+            split_qkv_rmsnorm_rope,
+        )
     except ImportError:
-        # The fused kernel is optional; retain native QKV preparation when the
-        # installed kernel package cannot import its Triton extension.
+        # older triton-ascend without language.extra.cann: fall back to the
+        # native path (split + qk_norm + rope) for decode as well
+        # (compat 27f21a588, ported onto 22fbf3146)
         split_qkv_rmsnorm_rope = None
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
@@ -182,6 +197,12 @@ class Qwen3Attention(nn.Module):
                 f"got {pic_param!r}."
             )
 
+        # Which of q/k/v ordinary tokens switch to the gist projections when the
+        # per-token C2KV mask selects them (empty = never = base). Derived from
+        # --c2kv-gist-param ALONE: --c2kv-query-proj is only the per-request
+        # DEFAULT of the mask (D1), so a request that explicitly asks for the
+        # gist projection must still find the parts wired up here.
+        self.c2kv_query_proj_parts = frozenset()
         if get_global_server_args().enable_c2kv:
             c2kv_proj_name = "residual_qkv_proj" if pic_enabled else "gist_qkv_proj"
             c2kv_proj = QKVParallelLinear(
@@ -196,6 +217,15 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
+            if not pic_enabled:
+                # PIC/residual_qkv_proj is excluded by construction: there is no
+                # gist_qkv_proj to switch to.
+                _gist_param = str(
+                    getattr(get_global_server_args(), "c2kv_gist_param", "qkv") or ""
+                ).lower()
+                self.c2kv_query_proj_parts = frozenset(
+                    part for part in "qkv" if part in _gist_param
+                )
             if pic_enabled:
                 # Loading a base Qwen3 checkpoint with PIC enabled must initially
                 # preserve its QKV projections exactly.
@@ -250,25 +280,52 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def _c2kv_project_qkv(self, hidden_states, forward_batch):
+        """QKV projection honouring --c2kv-query-proj.
+
+        The paper/reference lowercase-qkv regime leaves ordinary query tokens
+        on the base projections. The post-2026-08-09 local fork can instead use
+        gist_{q,k,v}_proj for the main forward; that extension is selected
+        explicitly with ``--c2kv-query-proj gist``. The system prefix is
+        prefilled separately with base projections.
+        `forward_batch.c2kv_use_gist_projection` is the
+        per-token mask built in ForwardBatch from the request's EFFECTIVE mode
+        (explicit message-level ``c2kv_use_gist_projection`` if the client sent
+        one, otherwise ``ServerArgs.c2kv_query_proj``) gated by the absolute
+        position of the request's first gist segment; those rows take the gist
+        projection for the parts listed in `c2kv_query_proj_parts` (derived from
+        --c2kv-gist-param). Everything else, including repair KV extraction
+        (`generate_raw_repair_kv`, forward_batch=None), stays base.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
-        gist_mask = getattr(
-            getattr(self, "_active_forward_batch", None),
-            "c2kv_use_gist_projection",
-            None,
+        parts = self.c2kv_query_proj_parts
+        if not parts or not hasattr(self, "gist_qkv_proj"):
+            return qkv
+        mask = (
+            getattr(forward_batch, "c2kv_use_gist_projection", None)
+            if forward_batch is not None
+            else None
         )
-        if (
-            gist_mask is not None
-            and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
-            and hasattr(self, "gist_qkv_proj")
-        ):
-            if gist_mask.ndim != 1 or gist_mask.shape[0] != qkv.shape[0]:
-                raise RuntimeError(
-                    "c2kv_use_gist_projection mask shape mismatch: "
-                    f"{tuple(gist_mask.shape)} != {(qkv.shape[0],)}"
-                )
-            gist_qkv, _ = self.gist_qkv_proj(hidden_states)
-            qkv = torch.where(gist_mask.to(qkv.device).view(-1, 1), gist_qkv, qkv)
+        if mask is None:
+            return qkv
+        if mask.ndim != 1 or mask.shape[0] != qkv.shape[0]:
+            raise RuntimeError(
+                "c2kv_use_gist_projection mask shape mismatch: "
+                f"{tuple(mask.shape)} != {(qkv.shape[0],)}"
+            )
+        qkv_gist, _ = self.gist_qkv_proj(hidden_states)
+        sizes = [self.q_size, self.kv_size, self.kv_size]
+        base_parts = qkv.split(sizes, dim=-1)
+        gist_parts = qkv_gist.split(sizes, dim=-1)
+        sel = mask.to(qkv.device).view(-1, 1)
+        merged = [
+            torch.where(sel, gist_t, base_t) if name in parts else base_t
+            for name, base_t, gist_t in zip("qkv", base_parts, gist_parts)
+        ]
+        return torch.cat(merged, dim=-1)
+
+    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -378,8 +435,12 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         if split_qkv_rmsnorm_rope is None:
-            return self.forward_prepare_native(positions, hidden_states)
-        qkv, _ = self.qkv_proj(hidden_states)
+            # compat fallback (27f21a588 port): repair_extract calls this
+            # path directly, bypassing the forward dispatch guard
+            return self.forward_prepare_native(
+                positions, hidden_states, forward_batch=forward_batch
+            )
+        qkv = self._c2kv_project_qkv(hidden_states, forward_batch)
 
         if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -486,16 +547,14 @@ class Qwen3Attention(nn.Module):
             getattr(forward_batch, "c2kv_use_gist_projection", None) is not None
             or
             not _is_npu
+            or split_qkv_rmsnorm_rope is None
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
-            self._active_forward_batch = forward_batch
-            try:
-                q, k, v = self.forward_prepare_native(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                )
-            finally:
-                self._active_forward_batch = None
+            q, k, v = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         else:
             q, k, v = self.forward_prepare_npu(
                 positions=positions,
@@ -1329,15 +1388,44 @@ class Qwen3ForCausalLM(nn.Module):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        cacheblend: Optional[Dict[str, Any]] = None,
     ):
         """Run a correctness-first full prefill and capture raw repair KV.
 
-        This is used by the C2KV repair endpoints. It intentionally captures
-        ordinary self-attention K/V, not gist/PIC K/V. In ``rotated`` mode the
-        returned K already carries native Full-prompt RoPE. In ``pre_rope`` mode
-        the returned K is captured after base QKV + QK norm but before RoPE; the
-        caller supplies the position IDs that will be used when it is injected.
+        Used by the C2KV repair endpoints. It intentionally captures ordinary
+        self-attention K/V with the frozen base projections, not gist/PIC K/V
+        (paper 2607.17715 section 3.3.2, original-token invariance: raw KV must
+        be what the base model computes in this exact context). The forward runs
+        at ``position_offset + i`` so the attention output, and therefore every
+        later layer's K/V, is the full-context one.
+
+        ``raw_kv_position_mode`` selects the STORED form of K, independently of
+        where the entry is later placed:
+
+        * ``rotated``  - K carries native Full-prompt RoPE (already_rotated=True)
+          and can only be re-injected at its original absolute positions.
+        * ``pre_rope`` - K is captured after base QKV + QK norm but before RoPE
+          (already_rotated=False); injection applies RoPE exactly once, either at
+          the recorded positions (in_place / append_keep_ledger) or at a fresh
+          tail position (append_tail, which requires this mode).
+
+        ``repair_position_ids`` records the positions to store with the entry.
+        See c2kv/c2kv_serving_semantics.md.
         """
+
+        if cacheblend:
+            # CacheBlend (chunk-KV reuse + selective recompute) shares this
+            # entry point so every caller/route is the same; the algorithm
+            # lives in mem_cache/cacheblend.py (see its module docstring).
+            return self.generate_cacheblend_kv(
+                input_ids,
+                span_start=span_start,
+                span_end=span_end,
+                position_offset=position_offset,
+                raw_kv_position_mode=raw_kv_position_mode,
+                history_kv_method=history_kv_method,
+                cacheblend=cacheblend,
+            )
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
@@ -1371,13 +1459,33 @@ class Qwen3ForCausalLM(nn.Module):
         )
         hidden_states = self.model.embed_tokens(input_ids).squeeze(0)
         raw_key_values = []
-        history_scores = []
+        history_scores: List[torch.Tensor] = []
         requested_span_tokens = span_end - span_start
         history_method = (history_kv_method or "").strip().lower()
         if history_method == "snapkv":
             history_method = "snapkv_persistent"
         if history_method == "pyramid":
             history_method = "pyramidkv"
+        require_rotated_headwise_storage(history_method, raw_kv_position_mode)
+        if history_method.startswith("snapkv"):
+            snap_recent_window = int(history_kv_recent_window)
+            snap_kernel_size = int(history_kv_kernel_size)
+            snap_pooling = history_kv_pooling.strip().lower()
+            if snap_recent_window <= 0:
+                raise ValueError(
+                    "history_kv_recent_window must be positive for SnapKV, got "
+                    f"{snap_recent_window}"
+                )
+            if snap_kernel_size <= 0:
+                raise ValueError(
+                    "history_kv_kernel_size must be positive for SnapKV, got "
+                    f"{snap_kernel_size}"
+                )
+            if snap_pooling not in {"avgpool", "maxpool"}:
+                raise ValueError(
+                    "history_kv_pooling must be 'avgpool' or 'maxpool' for "
+                    f"SnapKV, got {snap_pooling!r}"
+                )
         npu_forward_batch_stub = None
         if _is_npu:
             npu_forward_batch_stub = SimpleNamespace(
@@ -1389,27 +1497,38 @@ class Qwen3ForCausalLM(nn.Module):
         for layer in self.model.layers:
             residual = hidden_states
             attn_input = layer.input_layernorm(hidden_states)
-            qkv, _ = layer.self_attn.qkv_proj(attn_input)
-            q, k_pre, v = qkv.split(
-                [layer.self_attn.q_size, layer.self_attn.kv_size, layer.self_attn.kv_size],
-                dim=-1,
-            )
-            q, k_pre = apply_qk_norm(
+            # Normal SGLang prefill/extend on Ascend takes the native
+            # QK-norm/RoPE preparation path before entering the Ascend
+            # attention backend.  Repair KV must be captured from that same
+            # Full-prefill path; using the decode-oriented NPU fused prepare
+            # changes the raw K/V slightly and breaks raw-all replacement
+            # equivalence on sensitive BFCL trajectories.
+            # Same ops as forward_prepare_native (qkv_proj -> qk_norm -> rope),
+            # split so the span's K can be captured pre-RoPE. Base projections
+            # only (self.qkv_proj, never gist_qkv_proj): paper 3.3.2
+            # original-token invariance.
+            attn = layer.self_attn
+            qkv, _ = attn.qkv_proj(attn_input)
+            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            q, k = apply_qk_norm(
                 q=q,
-                k=k_pre,
-                q_norm=layer.self_attn.q_norm,
-                k_norm=layer.self_attn.k_norm,
-                head_dim=layer.self_attn.head_dim,
-                alt_stream=layer.self_attn.alt_stream,
+                k=k,
+                q_norm=attn.q_norm,
+                k_norm=attn.k_norm,
+                head_dim=attn.head_dim,
+                alt_stream=attn.alt_stream,
             )
-            q, k = layer.self_attn.rotary_emb(positions, q, k_pre)
-            repair_k = k_pre if raw_kv_position_mode == "pre_rope" else k
-            raw_key_values.append(
-                (
-                    repair_k[span_start:span_end].contiguous().clone(),
-                    v[span_start:span_end].contiguous().clone(),
-                )
+            # Clone BEFORE rope: rotary_emb may rotate k in place, so a pre_rope
+            # capture taken after the call would silently be rotated.
+            k_pre_rope = k[span_start:span_end].contiguous().clone()
+            v_span = v[span_start:span_end].contiguous().clone()
+            q, k = attn.rotary_emb(positions, q, k)
+            repair_k_span = (
+                k_pre_rope
+                if raw_kv_position_mode == "pre_rope"
+                else k[span_start:span_end].contiguous().clone()
             )
+            raw_key_values.append((repair_k_span, v_span))
 
             q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
             k_attn = k.view(
@@ -1428,42 +1547,22 @@ class Qwen3ForCausalLM(nn.Module):
             k_attn = k_attn.transpose(1, 2).contiguous()
             v_attn = v_attn.transpose(1, 2).contiguous()
 
-            if history_method in {"h2o", "snapkv_persistent", "snapkv_refresh"}:
-                try:
-                    if layer.self_attn.num_heads != layer.self_attn.num_kv_heads:
-                        groups = layer.self_attn.num_heads // layer.self_attn.num_kv_heads
-                        score_k = k_attn.repeat_interleave(groups, dim=1)
-                    else:
-                        score_k = k_attn
-                    q_window = max(1, min(int(history_kv_recent_window or 64), seq_len))
-                    q_start = seq_len - q_window
-                    score_q = q[:, :, q_start:seq_len, :]
-                    score_logits = torch.matmul(
-                        score_q.float(), score_k.transpose(-2, -1).float()
-                    ) * layer.self_attn.scaling
-                    q_positions = torch.arange(
-                        q_start, seq_len, dtype=torch.long, device=device
-                    ).view(1, 1, q_window, 1)
-                    k_positions = torch.arange(
-                        0, seq_len, dtype=torch.long, device=device
-                    ).view(1, 1, 1, seq_len)
-                    score_logits = score_logits.masked_fill(
-                        k_positions > q_positions,
-                        float("-inf"),
-                    )
-                    score_probs = torch.softmax(
-                        score_logits, dim=-1, dtype=torch.float32
-                    )
-                    layer_score = score_probs[
-                        :, :, :, span_start:span_end
-                    ].sum(dim=(0, 1, 2))
-                    history_scores.append(layer_score.detach())
-                except Exception:
-                    logger.warning(
-                        "history KV score collection failed at layer %s",
-                        getattr(layer.self_attn.attn, "layer_id", "?"),
-                        exc_info=True,
-                    )
+            if history_method in HEADWISE_HISTORY_KV_METHODS:
+                if history_method == "h2o":
+                    score_query_start = 0
+                else:
+                    observation_window = min(snap_recent_window, seq_len)
+                    score_query_start = seq_len - observation_window
+                layer_score = attention_scores_by_kv_head(
+                    q,
+                    k_attn,
+                    scale=layer.self_attn.scaling,
+                    query_start=score_query_start,
+                    query_end=seq_len,
+                    key_start=span_start,
+                    key_end=span_end,
+                )
+                history_scores.append(layer_score.detach())
 
             if _is_npu:
                 # Match the serving attention path: do not materialize repeated
@@ -1576,10 +1675,40 @@ class Qwen3ForCausalLM(nn.Module):
                 return sorted({int(i) for i in indices if 0 <= int(i) < requested_span_tokens})
 
             if history_method == "streamingllm":
-                selected_rel = list(
-                    range(requested_span_tokens - target_tokens, requested_span_tokens)
+                selected_tensor = select_streamingllm_indices(
+                    requested_span_tokens,
+                    target_tokens=target_tokens,
+                    device=device,
                 )
-                reason = "recent_suffix"
+                selected_rel = [int(index) for index in selected_tensor.tolist()]
+                raw_key_values = [
+                    (
+                        key.index_select(0, selected_tensor).contiguous().clone(),
+                        value.index_select(0, selected_tensor).contiguous().clone(),
+                    )
+                    for key, value in raw_key_values
+                ]
+                repair_positions = repair_positions.index_select(
+                    0, selected_tensor
+                ).contiguous()
+                kept_sinks = min(
+                    4,
+                    max(0, target_tokens - 1),
+                    max(0, requested_span_tokens - 1),
+                )
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "algorithm_version": "streamingllm_history_boundary_v1",
+                    "history_boundary_adaptation": True,
+                    "requested_span_tokens": requested_span_tokens,
+                    "target_tokens": target_tokens,
+                    "selected_token_count": len(selected_rel),
+                    "selected_relative_indices": selected_rel,
+                    "selection_reason": "attention_sinks_plus_recent_suffix",
+                    "sink_tokens": kept_sinks,
+                    "recent_tokens": target_tokens - kept_sinks,
+                    "per_head_selection": False,
+                }
             elif history_method == "pyramidkv":
                 if history_scores:
                     layer_scores = history_scores
@@ -1628,66 +1757,6 @@ class Qwen3ForCausalLM(nn.Module):
                     per_layer_selected_counts.append(len(layer_selected))
                     union_selected.update(layer_selected)
                 selected_rel = sorted(union_selected)
-                reason = "pyramidkv_layer_budget_union_shared_page_table"
-            else:
-                if history_scores:
-                    scores = torch.stack(history_scores, dim=0).mean(dim=0)
-                else:
-                    scores = torch.zeros(
-                        requested_span_tokens, dtype=torch.float32, device=device
-                    )
-                recent_budget = max(
-                    1,
-                    min(
-                        target_tokens,
-                        int(round(target_tokens * float(history_kv_h2o_recent_fraction))),
-                    ),
-                )
-                recent_budget = min(
-                    recent_budget,
-                    int(history_kv_recent_window or recent_budget),
-                    requested_span_tokens,
-                )
-                if history_method.startswith("snapkv"):
-                    recent_budget = min(
-                        target_tokens,
-                        max(1, min(int(history_kv_recent_window or 64), requested_span_tokens)),
-                    )
-                recent_rel = list(
-                    range(requested_span_tokens - recent_budget, requested_span_tokens)
-                )
-                past_budget = max(0, target_tokens - len(recent_rel))
-                past_len = max(0, requested_span_tokens - len(recent_rel))
-                if past_budget > 0 and past_len > 0:
-                    past_scores = scores[:past_len]
-                    if history_method.startswith("snapkv"):
-                        kernel = max(1, int(history_kv_kernel_size or 1))
-                        if kernel > 1 and past_scores.numel() > 1:
-                            pad = kernel // 2
-                            pooled = torch.nn.functional.avg_pool1d(
-                                past_scores.view(1, 1, -1),
-                                kernel_size=kernel,
-                                stride=1,
-                                padding=pad,
-                            ).view(-1)
-                            if pooled.numel() != past_scores.numel():
-                                pooled = pooled[: past_scores.numel()]
-                            past_scores = pooled
-                    _, top_idx = torch.topk(
-                        past_scores,
-                        k=min(past_budget, past_scores.numel()),
-                        largest=True,
-                    )
-                    selected_rel = _unique_sorted(top_idx.tolist() + recent_rel)
-                else:
-                    selected_rel = _unique_sorted(recent_rel)
-                if len(selected_rel) > target_tokens:
-                    selected_rel = selected_rel[-target_tokens:]
-                reason = "attention_heavy_hitter_recent"
-                if history_method.startswith("snapkv"):
-                    reason = "snapkv_attention_pooling_recent"
-
-            if len(selected_rel) != requested_span_tokens:
                 selected_tensor = torch.tensor(
                     selected_rel, dtype=torch.long, device=device
                 )
@@ -1701,23 +1770,189 @@ class Qwen3ForCausalLM(nn.Module):
                 repair_positions = repair_positions.index_select(
                     0, selected_tensor
                 ).contiguous()
-            history_meta = {
-                "history_kv_method": history_method,
-                "requested_span_tokens": requested_span_tokens,
-                "target_tokens": target_tokens,
-                "selected_token_count": len(selected_rel),
-                "selected_relative_indices": selected_rel,
-                "selection_reason": reason,
-                "recent_window": int(history_kv_recent_window or 0),
-            }
-            if history_method == "pyramidkv":
-                history_meta["shared_page_table_approximation"] = True
-                history_meta["per_layer_budget_tokens"] = per_layer_budgets
-                history_meta["per_layer_selected_counts"] = per_layer_selected_counts
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "algorithm_version": "pyramidkv_shared_page_table_approximation_v0",
+                    "history_boundary_adaptation": True,
+                    "official_algorithm_implemented": False,
+                    "requested_span_tokens": requested_span_tokens,
+                    "target_tokens": target_tokens,
+                    "selected_token_count": len(selected_rel),
+                    "selected_relative_indices": selected_rel,
+                    "selection_reason": "layer_budget_union_shared_page_table_approximation",
+                    "per_head_selection": False,
+                    "budget_preserved": len(selected_rel) == target_tokens,
+                    "shared_page_table_approximation": True,
+                    "per_layer_budget_tokens": per_layer_budgets,
+                    "per_layer_selected_counts": per_layer_selected_counts,
+                }
+            else:
+                if len(history_scores) != len(raw_key_values):
+                    raise RuntimeError(
+                        "history KV scoring did not produce exactly one score tensor "
+                        f"per layer: {len(history_scores)} != {len(raw_key_values)}"
+                    )
+                selected_by_layer: List[torch.Tensor] = []
+                compressed_key_values = []
+                for (key, value), layer_scores in zip(
+                    raw_key_values, history_scores
+                ):
+                    if history_method == "h2o":
+                        selected = select_h2o_prefill_indices(
+                            layer_scores,
+                            target_tokens=target_tokens,
+                            recent_fraction=float(history_kv_h2o_recent_fraction),
+                        )
+                    else:
+                        selected = select_snapkv_indices(
+                            layer_scores,
+                            target_tokens=target_tokens,
+                            recent_window=snap_recent_window,
+                            kernel_size=snap_kernel_size,
+                            pooling=snap_pooling,
+                        )
+                    selected_by_layer.append(selected)
+                    compressed_key_values.append(
+                        gather_paired_kv(key, value, selected)
+                    )
+                raw_key_values = compressed_key_values
+
+                # A rotated headwise entry has no single true token position per
+                # physical slot.  The shared vector is ledger-only; its final
+                # value preserves the original history boundary used by in_place.
+                original_span_end = repair_positions[-1].clone()
+                repair_positions = repair_positions[-target_tokens:].contiguous()
+                repair_positions[-1] = original_span_end
+
+                if history_method == "h2o":
+                    recent_budget = max(
+                        1,
+                        min(
+                            target_tokens,
+                            int(
+                                round(
+                                    target_tokens
+                                    * float(history_kv_h2o_recent_fraction)
+                                )
+                            ),
+                        ),
+                    )
+                    algorithm_version = "h2o_prefill_gqa_v1"
+                    reason = "prefill_heavy_hitter_plus_recent_per_kv_head"
+                    scoring_query_tokens = seq_len
+                    algorithm_fields = {
+                        "online_decode_updates": False,
+                        "scope": "prefill_history_boundary",
+                        "heavy_tokens_per_head": target_tokens - recent_budget,
+                        "recent_tokens_per_head": recent_budget,
+                    }
+                else:
+                    observation_window = min(snap_recent_window, seq_len)
+                    recent_budget = min(
+                        target_tokens,
+                        snap_recent_window,
+                        requested_span_tokens,
+                    )
+                    algorithm_version = "snapkv_gqa_headwise_v1"
+                    reason = "observation_pooling_plus_recent_per_kv_head"
+                    scoring_query_tokens = observation_window
+                    algorithm_fields = {
+                        "observation_window": observation_window,
+                        "pooling": snap_pooling,
+                        "kernel_size": snap_kernel_size,
+                        "past_tokens_per_head": target_tokens - recent_budget,
+                        "recent_tokens_per_head": recent_budget,
+                    }
+
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "algorithm_version": algorithm_version,
+                    "history_boundary_adaptation": True,
+                    "requested_span_tokens": requested_span_tokens,
+                    "target_tokens": target_tokens,
+                    "selected_token_count": target_tokens,
+                    # No single source-token set is true across layers/heads.
+                    "selected_relative_indices": None,
+                    "selection_reason": reason,
+                    "per_head_selection": True,
+                    "query_group_reduction": "sum",
+                    "scoring_query_tokens": scoring_query_tokens,
+                    "selection_indices_coordinate_space": "span_relative",
+                    "repair_positions_semantics": "ledger_only_recent_suffix",
+                    **algorithm_fields,
+                    **summarize_headwise_indices(selected_by_layer),
+                }
         repair_positions = repair_positions.view(1, -1).contiguous()
         if history_meta is not None:
             return raw_key_values, repair_positions, history_meta
         return raw_key_values, repair_positions
+
+
+    @torch.no_grad()
+    def generate_cacheblend_kv(
+        self,
+        input_ids: torch.Tensor,
+        span_start: int,
+        span_end: int,
+        *,
+        position_offset: int = 0,
+        raw_kv_position_mode: str = "rotated",
+        history_kv_method: Optional[str] = None,
+        cacheblend: Optional[Dict[str, Any]] = None,
+    ):
+        """CacheBlend repair extraction: the span's KV = per-chunk standalone KV
+        with the highest-deviation ``recomp_ratio`` of its tokens recomputed
+        in context (mem_cache/cacheblend.py, EuroSys artifact semantics).
+
+        Same contract as ``generate_raw_repair_kv``: ``(raw_key_values,
+        repair_positions, meta)`` with K post-RoPE at the span's absolute
+        positions (``rotated``), base projections only (paper 2607.17715
+        section 3.3.2 original-token invariance holds for the recomputed rows;
+        the reused rows are the base model's out-of-context KV by design).
+        The entry can only be placed ``in_place`` at those positions.
+        """
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(
+                f"generate_cacheblend_kv expects input_ids shape (1, L), got {input_ids.shape}."
+            )
+        seq_len = int(input_ids.shape[1])
+        if not (0 <= span_start < span_end <= seq_len):
+            raise ValueError(
+                f"Invalid cacheblend span: {span_start=}, {span_end=}, {seq_len=}."
+            )
+        if raw_kv_position_mode != "rotated":
+            raise ValueError(
+                "cacheblend entries are post-RoPE at their native positions; "
+                f"raw_kv_position_mode must be 'rotated', got {raw_kv_position_mode!r}."
+            )
+        if history_kv_method:
+            raise ValueError(
+                "cacheblend is exclusive with history_kv_method "
+                f"(got {history_kv_method!r})."
+            )
+        config = CacheBlendConfig.from_request(cacheblend)
+        device = input_ids.device
+        positions = torch.arange(
+            position_offset,
+            position_offset + seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+        ops = _Qwen3CacheBlendOps(self)
+        out_kv, meta = cacheblend_blend(
+            ops, input_ids.view(-1), positions, span_start, span_end, config
+        )
+        span_len = span_end - span_start
+        raw_key_values = [
+            (
+                k.reshape(span_len, -1).contiguous(),
+                v.reshape(span_len, -1).contiguous(),
+            )
+            for k, v in out_kv
+        ]
+        repair_positions = positions[span_start:span_end].view(1, -1).contiguous()
+        meta["position_offset"] = int(position_offset)
+        return raw_key_values, repair_positions, meta
 
     @torch.no_grad()
     def generate_pic(self, input_ids, attention_mask, ratio=1, **kwargs):
@@ -1859,3 +2094,146 @@ class Qwen3ForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3ForCausalLM
+
+
+class _Qwen3CacheBlendOps:
+    """``cacheblend.LayerOps`` over this model's BASE projections.
+
+    The primitives are the repair-extract ones of ``generate_raw_repair_kv``
+    (qkv_proj -> qk_norm -> rope, explicit causal attention, o_proj +
+    all-reduce + residual + MLP), so a CacheBlend row is computed with exactly
+    the arithmetic every other repair entry is; only the token set differs.
+    Never touches ``gist_qkv_proj`` (original-token invariance).
+    """
+
+    def __init__(self, model: "Qwen3ForCausalLM"):
+        self.model = model
+        self.layers = model.model.layers
+        self.num_layers = len(self.layers)
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.model.embed_tokens(input_ids.view(1, -1)).squeeze(0)
+
+    def input_norm(self, layer_index: int, hidden_rows: torch.Tensor) -> torch.Tensor:
+        return self.layers[layer_index].input_layernorm(hidden_rows)
+
+    def qkv(self, layer_index: int, attn_input: torch.Tensor):
+        attn = self.layers[layer_index].self_attn
+        qkv, _ = attn.qkv_proj(attn_input)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+            head_dim=attn.head_dim,
+            alt_stream=attn.alt_stream,
+        )
+        n = int(attn_input.shape[0])
+        return (
+            q.reshape(n, attn.num_heads, attn.head_dim),
+            k.reshape(n, attn.num_kv_heads, attn.head_dim),
+            v.reshape(n, attn.num_kv_heads, attn.head_dim),
+        )
+
+    def rope(self, layer_index: int, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
+        attn = self.layers[layer_index].self_attn
+        n = int(q.shape[0])
+        q_flat, k_flat = attn.rotary_emb(
+            positions, q.reshape(n, -1).contiguous(), k.reshape(n, -1).contiguous()
+        )
+        return (
+            q_flat.reshape(n, attn.num_heads, attn.head_dim),
+            k_flat.reshape(n, attn.num_kv_heads, attn.head_dim),
+        )
+
+    def rotate_k(
+        self, layer_index: int, positions: torch.Tensor, k: torch.Tensor
+    ) -> torch.Tensor:
+        attn = self.layers[layer_index].self_attn
+        n = int(k.shape[0])
+        # Qwen3's rotary adapter reshapes Q with num_heads and K with
+        # num_kv_heads. GQA therefore needs a throwaway Q with query-head shape,
+        # rather than zeros_like(K).
+        fake_q = k.new_zeros((n, attn.num_heads, attn.head_dim))
+        _, k_rot = self.rope(layer_index, positions, fake_q, k)
+        return k_rot
+
+    def attention(
+        self,
+        layer_index: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        blocked: torch.Tensor,
+    ) -> torch.Tensor:
+        attn = self.layers[layer_index].self_attn
+        num_q = int(q.shape[0])
+        num_k = int(k.shape[0])
+        q_b = q.reshape(1, num_q, attn.num_heads, attn.head_dim).transpose(1, 2).contiguous()
+        k_b = k.reshape(1, num_k, attn.num_kv_heads, attn.head_dim).transpose(1, 2).contiguous()
+        v_b = v.reshape(1, num_k, attn.num_kv_heads, attn.head_dim).transpose(1, 2).contiguous()
+        mask = blocked.reshape(1, 1, num_q, num_k)
+        if _is_npu:
+            # same ops and the same env switch as generate_raw_repair_kv
+            if os.environ.get(
+                "C2KV_REPAIR_EXTRACT_ATTN_IMPL",
+                "prompt_flash",
+            ) == "prompt_flash" and hasattr(torch_npu, "npu_prompt_flash_attention"):
+                attn_output = torch_npu.npu_prompt_flash_attention(
+                    q_b,
+                    k_b,
+                    v_b,
+                    num_heads=q_b.shape[1],
+                    num_key_value_heads=k_b.shape[1],
+                    input_layout="BNSD",
+                    atten_mask=mask,
+                    scale_value=attn.scaling,
+                    sparse_mode=0,
+                )
+            else:
+                attn_output = torch_npu.npu_fusion_attention(
+                    q_b,
+                    k_b,
+                    v_b,
+                    q_b.shape[1],
+                    input_layout="BNSD",
+                    atten_mask=mask,
+                    scale=attn.scaling,
+                    keep_prob=1.0,
+                    sparse_mode=0,
+                )
+            attn_output = _npu_fusion_attention_output(attn_output, q_b.shape)
+        else:
+            if attn.num_heads != attn.num_kv_heads:
+                groups = attn.num_heads // attn.num_kv_heads
+                k_run = k_b.repeat_interleave(groups, dim=1)
+                v_run = v_b.repeat_interleave(groups, dim=1)
+            else:
+                k_run, v_run = k_b, v_b
+            scores = torch.matmul(q_b.float(), k_run.transpose(-2, -1).float()) * attn.scaling
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v_run.dtype)
+            attn_output = torch.matmul(probs, v_run)
+        return (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .reshape(num_q, attn.num_heads * attn.head_dim)
+        )
+
+    def post_attention(
+        self, layer_index: int, attn_output: torch.Tensor, residual_rows: torch.Tensor
+    ) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        projected, _ = layer.self_attn.o_proj(attn_output)
+        projected = tensor_model_parallel_all_reduce(projected)
+        hidden = residual_rows + projected
+        mlp_input = layer.post_attention_layernorm(hidden)
+        return hidden + layer.mlp(mlp_input)
+
+    def all_reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        # the deviation must be summed over ALL kv heads (artifact), which
+        # under tensor parallelism are sharded across ranks
+        if get_tensor_model_parallel_world_size() > 1:
+            return tensor_model_parallel_all_reduce(value)
+        return value

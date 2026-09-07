@@ -38,6 +38,5 @@ class TestPICUtils(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unpadded"):
             prepare_pic_input(input_ids, torch.tensor([[True, True, False]]))
 
-
 if __name__ == "__main__":
     unittest.main()
