@@ -72,7 +72,8 @@ def get_prepare_gist_input_func(gist_cfg: GistConfig) -> Callable:
 
     Attention mask layout (True = attend):
         input tokens see each other causally; cannot see gist tokens.
-        gist tokens attend all input tokens; see each other causally.
+        gist tokens attend their own input chunk plus the first-ratio sink;
+        they see gist tokens causally.
 
     Each gist token attends to its own chunk plus `gist_overlap` preceding
     tokens (clamped to 0), i.e. [max(j*ratio - gist_overlap, 0), (j+1)*ratio).

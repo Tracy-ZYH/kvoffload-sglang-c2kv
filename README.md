@@ -12,6 +12,35 @@
 
 --------------------------------------------------------------------------------
 
+> **C2KV fork.** This tree serves C2KV gist checkpoints (`--enable-c2kv`).
+> Before changing or interpreting anything C2KV-related read
+> [`c2kv/c2kv_serving_semantics.md`](c2kv/c2kv_serving_semantics.md): it records where the
+> paper text, the training checkpoint and this server disagree (query-token projections,
+> position frames, repair placement) and which server flag / response field covers each.
+>
+> Two server flags change what the model is actually served, so record both next to every
+> run (both are echoed back per request in `metadata.sglang_runtime`):
+> `--c2kv-query-proj {base,gist}` (default `base`) is the per-request default for
+> ordinary query-token projections after a C2KV segment. `base` matches the paper and
+> the reference lowercase-`qkv` semantics; `gist` is an explicit local-fork A/B mode.
+> A request-wide `c2kv_use_gist_projection` overrides the flag, while explicit
+> message-level values must agree. Gist-projection batches run eagerly because the graph
+> runners do not carry the dynamic projection mask. Mixed-case `--c2kv-gist-param`
+> values such as `QkV` are rejected instead of being silently approximated. The second flag,
+> `--c2kv-tools-dump {full,exclude_unset}` (default `full`, `server_args.py:599`) decides how
+> tool schemas are serialized into the prompt -- `full` reproduces the upstream token frame,
+> `exclude_unset` the one the C2KV bench proxy predicts its insertion points in. Runs made
+> under different values of either flag were served different prompts and are not comparable.
+> `metadata.sglang_runtime` is attached to non-streaming responses only: serve C2KV runs with
+> `stream=false`.
+>
+> This tree consolidates upstream `d42ce815f`, `fork/task/c2kv-serve-align`, and the
+> CacheBlend branch; this consolidation has not been run against a model or a server yet
+> (section 9 of the semantics doc). Run `scripts/c2kv/smoke_c2kv_semantics.py` on the NPU box
+> before quoting any number produced by this build.
+> Design docs: `c2kv/c2kv_integration_plan.md`, `c2kv/c2kv_implementation_report.md`.
+
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |

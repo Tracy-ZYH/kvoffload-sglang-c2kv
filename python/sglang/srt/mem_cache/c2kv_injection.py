@@ -6,12 +6,23 @@ and writes K/V tensors into the engine's KV pool.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.mem_cache.c2kv_pool import C2KVEntry, C2KVPool
+from sglang.srt.mem_cache.c2kv_semantics import validate_rope_position_range
+
+
+def _validate_rope_positions(position_ids: torch.Tensor, table_size: int) -> None:
+    if position_ids.numel() == 0:
+        raise ValueError("C2KV_ROPE_POSITION_OUT_OF_RANGE: no positions supplied")
+    validate_rope_position_range(
+        int(position_ids.min().item()),
+        int(position_ids.max().item()),
+        int(table_size),
+    )
 
 
 def inject_c2kv_gist(
@@ -45,12 +56,8 @@ def inject_c2kv_gist(
 
     gist_pos = c2kv_pool.get_position_ids(entry)
 
-    abs_pos = (
-        position_cursor + gist_pos
-    ).clamp(
-        0,
-        cos_sin_cache.shape[0] - 1,
-    )
+    abs_pos = position_cursor + gist_pos
+    _validate_rope_positions(abs_pos, cos_sin_cache.shape[0])
 
     rotary_dim = cos_sin_cache.shape[1]
     half_dim = rotary_dim // 2
@@ -259,13 +266,16 @@ def inject_c2kv_stored_kv(
     attn_layers: List,
     cos_sin_cache: torch.Tensor,
     is_neox_style: bool = True,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> None:
     """Inject a generic stored KV entry into the active paged KV cache.
 
     Repair entries may already contain K with the original absolute RoPE phase
-    (`entry.already_rotated=True`). In that case K is copied verbatim. For
-    neutral/sham entries stored pre-RoPE, apply RoPE exactly once at the stored
-    absolute position ids.
+    (`entry.already_rotated=True`). In that case K is copied verbatim and
+    `position_ids` must be None. Entries stored pre-RoPE (the default for
+    model_prefill repair extraction and for neutral/sham entries) get RoPE
+    applied exactly once, at `position_ids` when given (append_tail placement)
+    or at the stored absolute position ids otherwise.
     """
 
     token_len = entry.token_len
@@ -279,15 +289,30 @@ def inject_c2kv_stored_kv(
             f"{c2kv_pool.num_layers=} != {len(attn_layers)=}"
         )
 
-    abs_pos = c2kv_pool.get_position_ids(entry).clamp(
-        0,
-        cos_sin_cache.shape[0] - 1,
-    )
+    if position_ids is not None:
+        if entry.already_rotated:
+            raise ValueError(
+                "C2KV repair entry was stored post-RoPE (already_rotated=True); "
+                "it cannot be re-placed at new positions. Re-extract it through "
+                "the model_prefill path for append_tail placement."
+            )
+        if position_ids.numel() != token_len:
+            raise ValueError(
+                f"C2KV repair position override length mismatch: "
+                f"{position_ids.numel()} != {token_len=}"
+            )
+        abs_pos = position_ids.to(device=cos_sin_cache.device, dtype=torch.long)
+    else:
+        abs_pos = c2kv_pool.get_position_ids(entry)
     rotary_dim = cos_sin_cache.shape[1]
     half_dim = rotary_dim // 2
-    cos = cos_sin_cache[abs_pos, :half_dim]
-    sin = cos_sin_cache[abs_pos, half_dim:]
     head_dim = half_dim * 2
+    if entry.already_rotated:
+        cos = sin = None
+    else:
+        _validate_rope_positions(abs_pos, cos_sin_cache.shape[0])
+        cos = cos_sin_cache[abs_pos, :half_dim]
+        sin = cos_sin_cache[abs_pos, half_dim:]
 
     for layer_idx in range(c2kv_pool.num_layers):
         k_stored, v_stored = c2kv_pool.get_layer_kv(entry, layer_idx)

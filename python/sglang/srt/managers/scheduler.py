@@ -178,6 +178,11 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
+from sglang.srt.mem_cache.c2kv_semantics import (
+    C2KV_REPAIR_PLACEMENTS,
+    resolve_query_projection,
+    resolve_repair_placement,
+)
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -896,6 +901,12 @@ class Scheduler(
                 f"memory_budget_gib="
                 f"{total_memory_bytes * server_args.c2kv_pool_fraction / (1 << 30):.2f})"
             )
+            if not server_args.disable_cuda_graph:
+                logger.info(
+                    "C2KV: batches that use gist query projections run eagerly "
+                    "because graph captures do not carry the per-token C2KV "
+                    "projection mask. Base-projection batches remain graph eligible."
+                )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2059,9 +2070,27 @@ class Scheduler(
 
         if getattr(recv_req, "c2kv_segments", None):
             req.c2kv_segments = recv_req.c2kv_segments
-            req.c2kv_use_gist_projection = bool(
-                getattr(recv_req, "c2kv_use_gist_projection", True)
-            )
+            # One mode applies to the whole request. A request-level value wins;
+            # otherwise explicit message values must agree. Unset messages do
+            # not override an explicit message value with the server default.
+            req_level_proj = getattr(recv_req, "c2kv_use_gist_projection", None)
+            seg_proj = [
+                getattr(seg, "use_gist_projection", None)
+                for seg in recv_req.c2kv_segments
+            ]
+            try:
+                (
+                    req.c2kv_use_gist_projection,
+                    req.c2kv_query_proj_source,
+                ) = resolve_query_projection(
+                    getattr(self.server_args, "c2kv_query_proj", "base"),
+                    req_level_proj,
+                    seg_proj,
+                )
+            except ValueError as exc:
+                req.set_finish_with_abort(str(exc))
+                self._add_request_to_queue(req)
+                return
             self._init_c2kv_kv_memory_report(
                 req,
                 getattr(recv_req, "c2kv_kv_memory_hint", None),
@@ -2185,7 +2214,26 @@ class Scheduler(
         except ValueError as e:
             return C2KVExtractReqOutput(error=str(e), success=False)
 
-        key_hash = self.c2kv_pool.compute_hash(recv_req.input_ids)
+        hf_config = getattr(self.model_config, "hf_config", None)
+        key_hash = self.c2kv_pool.compute_hash(
+            recv_req.input_ids,
+            compression_ratio=compression_ratio,
+            extractor_config={
+                "gist_type": getattr(
+                    self.server_args, "c2kv_gist_type", "dynamic-interleave"
+                ),
+                "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
+                "gist_extra_embed_num": getattr(
+                    hf_config, "gist_extra_embed_num", 1
+                ),
+                "gist_residual_type": getattr(
+                    hf_config, "gist_residual_type", "none"
+                ),
+                "gist_overlap": getattr(hf_config, "gist_overlap", 0),
+                "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
+                "pic_param": getattr(hf_config, "pic_param", "qkv"),
+            },
+        )
         self._log_c2kv_token_usage(
             "extract_request",
             key_hash=key_hash[:16],
@@ -2430,6 +2478,45 @@ class Scheduler(
                 error=f"Unsupported raw_kv_position_mode: {raw_kv_position_mode!r}.",
                 success=False,
             )
+        kv_reuse_method = (recv_req.kv_reuse_method or "").strip().lower() or None
+        cacheblend_cfg = None
+        cacheblend_meta = None
+        if kv_reuse_method:
+            from sglang.srt.mem_cache.cacheblend import CacheBlendConfig
+
+            if kv_reuse_method != "cacheblend":
+                return C2KVRepairExtractReqOutput(
+                    error=f"Unsupported kv_reuse_method: {kv_reuse_method!r}.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
+            if history_kv_method:
+                return C2KVRepairExtractReqOutput(
+                    error="kv_reuse_method is exclusive with history_kv_method.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    history_kv_method=history_kv_method,
+                    requested_span_tokens=token_len,
+                )
+            if raw_kv_position_mode != "rotated":
+                return C2KVRepairExtractReqOutput(
+                    error="cacheblend entries are post-RoPE at their native "
+                    "positions; raw_kv_position_mode must be 'rotated'.",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
+            try:
+                CacheBlendConfig.from_request(recv_req.cacheblend)  # validate
+                cacheblend_cfg = dict(recv_req.cacheblend or {})
+            except (TypeError, ValueError) as exc:
+                return C2KVRepairExtractReqOutput(
+                    error=f"Invalid cacheblend config: {exc}",
+                    success=False,
+                    kv_reuse_method=kv_reuse_method,
+                    requested_span_tokens=token_len,
+                )
         if recv_req.repair_position_ids is not None and (
             len(recv_req.repair_position_ids) != token_len
         ):
@@ -2484,6 +2571,8 @@ class Scheduler(
             "history_kv_kernel_size": recv_req.history_kv_kernel_size,
             "history_kv_pooling": recv_req.history_kv_pooling,
             "history_kv_h2o_recent_fraction": recv_req.history_kv_h2o_recent_fraction,
+            "kv_reuse_method": kv_reuse_method,
+            "cacheblend": cacheblend_cfg,
         }
         key_hash = hashlib.sha256(
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -2494,6 +2583,14 @@ class Scheduler(
                 error=f"Unsupported repair extract_source: {extract_source!r}.",
                 success=False,
                 extract_source=extract_source,
+            )
+        if extract_source == "serving_cache" and kv_reuse_method:
+            return C2KVRepairExtractReqOutput(
+                error="cacheblend needs the model_prefill extraction path.",
+                success=False,
+                extract_source=extract_source,
+                kv_reuse_method=kv_reuse_method,
+                requested_span_tokens=token_len,
             )
         if extract_source == "serving_cache" and raw_kv_position_mode == "pre_rope":
             return C2KVRepairExtractReqOutput(
@@ -2508,6 +2605,11 @@ class Scheduler(
         existing = self.c2kv_pool.get(key_hash)
         if existing is not None:
             pos = self.c2kv_pool.get_position_ids(existing)
+            repair_metadata = dict(existing.repair_metadata or {})
+            cached_cacheblend = repair_metadata.get("cacheblend")
+            if isinstance(cached_cacheblend, dict):
+                cached_cacheblend = dict(cached_cacheblend)
+                cached_cacheblend["cache_hit"] = True
             return C2KVRepairExtractReqOutput(
                 key_hash=key_hash,
                 token_len=existing.token_len,
@@ -2520,6 +2622,13 @@ class Scheduler(
                 history_kv_method=history_kv_method or None,
                 requested_span_tokens=token_len,
                 selected_token_count=existing.token_len,
+                selected_relative_indices=repair_metadata.get(
+                    "selected_relative_indices"
+                ),
+                history_selection_metadata=repair_metadata.get("history_selection_metadata"),
+                already_rotated=bool(existing.already_rotated),
+                kv_reuse_method=kv_reuse_method,
+                cacheblend=cached_cacheblend,
             )
 
         has_space = self.c2kv_pool.can_allocate(alloc_check_len, existing_key=key_hash)
@@ -2669,11 +2778,17 @@ class Scheduler(
                     history_kv_kernel_size=recv_req.history_kv_kernel_size,
                     history_kv_pooling=recv_req.history_kv_pooling,
                     history_kv_h2o_recent_fraction=recv_req.history_kv_h2o_recent_fraction,
+                    cacheblend=cacheblend_cfg,
                 )
                 if isinstance(repair_result, tuple) and len(repair_result) == 3:
                     key_values, position_ids, history_meta = repair_result
                 else:
                     key_values, position_ids = repair_result
+                if kv_reuse_method and isinstance(history_meta, dict):
+                    # the model returns the CacheBlend accounting in the meta
+                    # slot; it is not a history_kv selection
+                    cacheblend_meta = dict(history_meta)
+                    history_meta = {}
             except Exception as e:
                 logger.error("C2KV repair extract failed: %s", e, exc_info=True)
                 error_msg = str(e)
@@ -2704,19 +2819,39 @@ class Scheduler(
                 extract_source=extract_source,
                 cache_hit_tokens=cache_hit_tokens,
                 history_kv_method=history_kv_method or None,
+                kv_reuse_method=kv_reuse_method,
                 requested_span_tokens=token_len,
             )
 
+        # serving_cache reads K back from the paged cache, i.e. post-RoPE; the
+        # model_prefill path (generate_raw_repair_kv) captures K pre-RoPE.
+        already_rotated = extract_source == "serving_cache" or bool(
+            recv_req.already_rotated
+        )
         try:
             entry = self.c2kv_pool.store_repair(
                 key_hash=key_hash,
                 key_values=key_values,
                 position_ids=position_ids,
                 original_seq_len=input_len,
-                already_rotated=(raw_kv_position_mode != "pre_rope"),
-            repair_mode=recv_req.repair_mode,
-            source_doc_index=recv_req.source_doc_index,
-        )
+                already_rotated=already_rotated,
+                repair_mode=recv_req.repair_mode,
+                source_doc_index=recv_req.source_doc_index,
+                repair_metadata={
+                    "history_selection_metadata": dict(history_meta) if isinstance(history_meta, dict) else None,
+                    "selected_relative_indices": (
+                        list(history_meta.get("selected_relative_indices") or [])
+                        if isinstance(history_meta, dict)
+                        and history_meta.get("selected_relative_indices") is not None
+                        else None
+                    ),
+                    "cacheblend": (
+                        dict(cacheblend_meta)
+                        if isinstance(cacheblend_meta, dict)
+                        else None
+                    ),
+                },
+            )
         except ValueError as e:
             key_values = position_ids = None
             return C2KVRepairExtractReqOutput(
@@ -2770,6 +2905,7 @@ class Scheduler(
             repair_mode=entry.repair_mode or "",
             extract_source=extract_source,
             cache_hit_tokens=cache_hit_tokens,
+            already_rotated=bool(entry.already_rotated),
             serving_kv_buffer_shape=(
                 first_key_buffer_shape
                 if extract_source == "serving_cache"
@@ -2785,28 +2921,22 @@ class Scheduler(
                 and history_meta.get("selected_relative_indices") is not None
                 else None
             ),
+            kv_reuse_method=kv_reuse_method,
+            cacheblend=cacheblend_meta,
+            history_selection_metadata=history_meta if isinstance(history_meta, dict) else None,
         )
 
     def _init_c2kv_kv_memory_report(self, req: "Req", hint) -> None:
+        from sglang.srt.managers.c2kv_kv_accounting import (
+            initialize_c2kv_kv_memory_report,
+        )
+
         if not isinstance(hint, dict):
             hint = {}
-        report = dict(hint)
+        report = initialize_c2kv_kv_memory_report(hint)
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
-        for key in (
-            "full_equivalent_history_tokens",
-            "active_history_kv_tokens",
-            "active_c2kv_gist_tokens",
-            "active_raw_repair_tokens",
-            "active_recomputed_raw_tokens",
-            "active_full_raw_tokens",
-        ):
-            try:
-                report[key] = int(report.get(key) or 0)
-            except Exception:
-                report[key] = 0
-        report["source"] = "sglang_c2kv_runtime_injection"
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
 
@@ -2948,6 +3078,9 @@ class Scheduler(
                 )
                 report["active_history_kv_tokens"] = result.kept_history_tokens
                 report["active_full_raw_tokens"] = result.kept_history_tokens
+                report["active_history_kv_tokens_source"] = (
+                    "physical_eviction_measured"
+                )
                 report["history_kv_runtime_status"] = runtime_status
                 report["physical_slots_freed"] = result.freed_physical_slots
                 report["logical_total_len"] = result.next_rope_position_after
@@ -3155,35 +3288,19 @@ class Scheduler(
         tokens: int,
         original_tokens: int = 0,
     ) -> None:
+        from sglang.srt.managers.c2kv_kv_accounting import (
+            add_c2kv_kv_memory_tokens,
+        )
+
         report = getattr(req, "kv_memory_report", None)
         if not isinstance(report, dict):
             return
-        tokens = max(0, int(tokens or 0))
-        original_tokens = max(0, int(original_tokens or 0))
-        report["active_history_kv_tokens"] = (
-            int(report.get("active_history_kv_tokens") or 0) + tokens
+        add_c2kv_kv_memory_tokens(
+            report,
+            kind=kind,
+            tokens=tokens,
+            original_tokens=original_tokens,
         )
-        if original_tokens and not report.get("full_equivalent_history_tokens"):
-            report["full_equivalent_history_tokens"] = (
-                int(report.get("full_equivalent_history_tokens") or 0)
-                + original_tokens
-            )
-        if kind == "gist":
-            report["active_c2kv_gist_tokens"] = (
-                int(report.get("active_c2kv_gist_tokens") or 0) + tokens
-            )
-        elif kind == "repair":
-            report["active_raw_repair_tokens"] = (
-                int(report.get("active_raw_repair_tokens") or 0) + tokens
-            )
-        elif kind == "recomputed":
-            report["active_recomputed_raw_tokens"] = (
-                int(report.get("active_recomputed_raw_tokens") or 0) + tokens
-            )
-        elif kind == "full":
-            report["active_full_raw_tokens"] = (
-                int(report.get("active_full_raw_tokens") or 0) + tokens
-            )
 
     def _build_c2kv_prefill_rounds(self, req: "Req") -> Optional[str]:
         if not req.c2kv_segments:
@@ -3196,6 +3313,14 @@ class Scheduler(
         original_len = len(original_input_ids)
         segments = sorted(req.c2kv_segments, key=lambda s: s.token_start)
         req.c2kv_segments = segments
+        # D7 = upstream d42ce815f semantics, unchanged: once the resolved mode
+        # is gist, the mask covers every token at or after the FIRST C2KV
+        # segment -- gist or repair-only alike -- so an upstream-fields-only
+        # request runs exactly the projections it ran on d42ce815f (D4).
+        # Serve-align's extra rule (a request whose history is entirely raw
+        # repair KV falls back to base, keyed on Req.c2kv_gist_seen) is DROPPED;
+        # Req.c2kv_gist_seen survives as provenance in metadata.sglang_runtime
+        # only. See c2kv/c2kv_serving_semantics.md section 1.
         if getattr(req, "c2kv_use_gist_projection", False) and segments:
             req.c2kv_gist_projection_start_pos = int(segments[0].token_start)
 
@@ -3214,6 +3339,22 @@ class Scheduler(
                     "Overlapping C2KV segments are not supported: "
                     f"{seg.token_start=} < previous token_end {prev_end}"
                 )
+            # D10: reject an unknown c2kv_repair_placement at admission, the way
+            # handle_repair_extract_request rejects an unknown
+            # raw_kv_position_mode. _resolve_c2kv_repair_placement raises the
+            # same ValueError, but only once prefill is already injecting and
+            # KV is allocated, where it degrades from an HTTP 400 request error
+            # into a per-entry injection error inside an HTTP 200 abort.
+            placement = getattr(seg, "repair_placement", None)
+            if (
+                placement not in (None, "")
+                and placement not in self._C2KV_REPAIR_PLACEMENTS
+            ):
+                return (
+                    "C2KV_REPAIR_PLACEMENT_INVALID: unknown "
+                    f"c2kv_repair_placement {placement!r}; expected one of "
+                    f"{self._C2KV_REPAIR_PLACEMENTS}"
+                )
             prev_end = seg.token_end
 
         entries = []
@@ -3223,7 +3364,7 @@ class Scheduler(
                 entry = self.c2kv_pool.get(seg.key_hash)
                 if entry is None:
                     logger.warning("C2KV cache miss: %s", seg.key_hash)
-                    return f"C2KV cache miss: {seg.key_hash}"
+                    return f"C2KV_CACHE_MISS: C2KV cache miss: {seg.key_hash}"
                 if entry.entry_type != "gist":
                     return f"C2KV segment key is not a gist entry: {seg.key_hash}"
             else:
@@ -3234,7 +3375,7 @@ class Scheduler(
                 repair_entry = self.c2kv_pool.get(repair_key)
                 if repair_entry is None:
                     logger.warning("C2KV repair cache miss: %s", repair_key)
-                    return f"C2KV repair cache miss: {repair_key}"
+                    return f"C2KV_CACHE_MISS: C2KV repair cache miss: {repair_key}"
                 if repair_entry.entry_type != "repair":
                     return f"C2KV repair key is not a repair entry: {repair_key}"
                 cur_repair_entries.append(repair_entry)
@@ -3336,7 +3477,7 @@ class Scheduler(
             pinned_keys.extend(getattr(seg, "repair_key_hashes", []) or [])
         pinned_keys = list(dict.fromkeys(pinned_keys))
         if not self.c2kv_pool.pin_many(pinned_keys):
-            return "C2KV cache miss while pinning segments."
+            return "C2KV_CACHE_MISS: C2KV cache miss while pinning segments."
 
         req.c2kv_rounds = rounds
         req.c2kv_round_idx = 0
@@ -3376,22 +3517,51 @@ class Scheduler(
         """Returns True on success, False on any failure (caller should abort req)."""
         seg = req.c2kv_segments[seg_idx]
         if self.c2kv_pool is None:
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_POOL_UNAVAILABLE: the C2KV pool is not initialised; "
+                "start the server with --enable-c2kv",
+            )
             return False
 
         if not seg.key_hash:
             repair_keys = list(getattr(seg, "repair_key_hashes", []) or [])
             if not repair_keys:
                 logger.warning("C2KV repair-only segment has no repair keys")
+                self._set_c2kv_injection_error(
+                    req,
+                    "C2KV_SEGMENT_NO_REPAIR_KEYS: repair-only segment "
+                    f"{seg_idx} carries neither c2kv_key_hash nor "
+                    "c2kv_repair_only_key_hashes",
+                )
                 return False
             for repair_key in repair_keys:
                 repair_entry = self.c2kv_pool.get(repair_key)
                 if repair_entry is None:
                     logger.warning("C2KV repair-only miss: %s", repair_key[:16])
+                    # Same structured prefix as the admission-time miss in
+                    # _build_c2kv_prefill_rounds, so a client's cache-miss
+                    # retry fires for an eviction discovered at injection too.
+                    self._set_c2kv_injection_error(
+                        req,
+                        "C2KV_CACHE_MISS: repair-only entry "
+                        f"{repair_key} evicted from the C2KV pool before "
+                        "injection",
+                    )
                     return False
-                if not self._inject_c2kv_repair_entry(req, repair_entry):
+                if not self._inject_c2kv_repair_entry(
+                    req, repair_entry, placement=getattr(seg, "repair_placement", None)
+                ):
                     logger.warning(
                         "C2KV repair-only injection failed: %s",
                         repair_key[:16],
+                    )
+                    # No-op when _inject_c2kv_repair_entry already recorded the
+                    # specific reason (first writer wins).
+                    self._set_c2kv_injection_error(
+                        req,
+                        "C2KV_REPAIR_INJECT_FAILED: repair-only entry "
+                        f"{repair_key} could not be injected",
                     )
                     return False
             self._log_c2kv_token_usage(
@@ -3405,6 +3575,11 @@ class Scheduler(
         entry = self.c2kv_pool.get(seg.key_hash)
         if entry is None:
             logger.warning(f"C2KV miss: {seg.key_hash[:16]}...")
+            self._set_c2kv_injection_error(
+                req,
+                f"C2KV_CACHE_MISS: gist entry {seg.key_hash} evicted from the "
+                "C2KV pool before injection",
+            )
             return False
 
         model_runner = self.tp_worker.model_runner
@@ -3425,6 +3600,12 @@ class Scheduler(
                 key_hash=seg.key_hash[:16],
                 gist_len=gist_len,
                 logical_kv_start=kv_start,
+            )
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_INVALID_LOGICAL_KV_START: logical KV start "
+                f"{kv_start} exceeds the committed KV length "
+                f"{req.kv_committed_len}",
             )
             return False
 
@@ -3652,6 +3833,11 @@ class Scheduler(
                 key_hash=seg.key_hash[:16],
                 gist_len=gist_len,
             )
+            self._set_c2kv_injection_error(
+                req,
+                f"C2KV_ALLOC_FAILED: cannot allocate {gist_len} KV slots for "
+                f"gist entry {seg.key_hash} (KV cache out of memory)",
+            )
             return False
 
         def _rollback_c2kv_alloc():
@@ -3687,6 +3873,12 @@ class Scheduler(
                 kv_start=kv_start,
                 max_context_len=max_ctx,
             )
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_CONTEXT_OVERFLOW: gist injection would exceed "
+                f"max_context_len ({kv_start}+{gist_len}="
+                f"{kv_start + gist_len} > {max_ctx})",
+            )
             return False
 
         try:
@@ -3702,6 +3894,11 @@ class Scheduler(
                 seg_idx=seg_idx,
                 key_hash=seg.key_hash[:16],
                 gist_len=gist_len,
+            )
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_REQ_TO_TOKEN_WRITE_FAILED: could not map the gist KV "
+                f"slots of {seg.key_hash} into req_to_token: {e}",
             )
             return False
 
@@ -3742,6 +3939,16 @@ class Scheduler(
                 key_hash=seg.key_hash[:16],
                 gist_len=gist_len,
             )
+            detail = str(e)
+            self._set_c2kv_injection_error(
+                req,
+                detail
+                if detail.startswith("C2KV_")
+                else (
+                    f"C2KV_GIST_INJECTION_FAILED: gist entry {seg.key_hash} "
+                    f"could not be written into the KV cache: {detail}"
+                ),
+            )
             return False
 
         req.kv_committed_len = kv_start + gist_len
@@ -3753,14 +3960,44 @@ class Scheduler(
             original_tokens=entry.original_seq_len,
         )
         req.c2kv_position_correction += entry.original_seq_len - gist_len
+        # From here on ordinary tokens are eligible for the request's resolved
+        # query-projection mode. The default base mode leaves them unchanged.
+        req.c2kv_gist_seen = True
+        self._c2kv_layout_append(
+            req,
+            {
+                "kind": "gist",
+                "key_hash": seg.key_hash[:16],
+                "kv_start": int(kv_start),
+                "gist_len": int(gist_len),
+                "original_seq_len": int(entry.original_seq_len),
+                "position_cursor": int(position_cursor),
+                "position_correction_after": int(req.c2kv_position_correction),
+            },
+        )
 
         for repair_key in getattr(seg, "repair_key_hashes", []) or []:
             repair_entry = self.c2kv_pool.get(repair_key)
             if repair_entry is None:
                 logger.warning("C2KV repair miss: %s", repair_key[:16])
+                self._set_c2kv_injection_error(
+                    req,
+                    f"C2KV_CACHE_MISS: repair entry {repair_key} attached to "
+                    f"gist {seg.key_hash} evicted from the C2KV pool before "
+                    "injection",
+                )
                 return False
-            if not self._inject_c2kv_repair_entry(req, repair_entry):
+            if not self._inject_c2kv_repair_entry(
+                req, repair_entry, placement=getattr(seg, "repair_placement", None)
+            ):
                 logger.warning("C2KV repair injection failed: %s", repair_key[:16])
+                # No-op when _inject_c2kv_repair_entry already recorded the
+                # specific reason (first writer wins).
+                self._set_c2kv_injection_error(
+                    req,
+                    f"C2KV_REPAIR_INJECT_FAILED: repair entry {repair_key} "
+                    f"attached to gist {seg.key_hash} could not be injected",
+                )
                 return False
 
         self._log_c2kv_token_usage(
@@ -3773,9 +4010,73 @@ class Scheduler(
         )
         return True
 
-    def _inject_c2kv_repair_entry(self, req: "Req", entry) -> bool:
-        """Inject an already stored repair KV entry after the current prefix."""
+    # Repair modes whose raw span replaces (rather than duplicates) the gist of
+    # the same history unit; the query must then continue from the raw span's
+    # own absolute end. Legacy behaviour, used when a segment carries no
+    # explicit repair_placement. See c2kv/c2kv_serving_semantics.md.
+    _C2KV_REPAIR_PLACEMENTS = C2KV_REPAIR_PLACEMENTS
+
+    @staticmethod
+    def _set_c2kv_injection_error(req: "Req", reason: str) -> None:
+        """Record the FIRST machine-readable reason an injection failed.
+
+        Every injection-time failure path below sets one, so the FINISH_ABORT
+        built by the prefill result handler
+        (scheduler_output_processor_mixin.py, "C2KV injection failed" fallback)
+        always carries a C2KV_* code, and _get_kv_runtime_stats echoes it as
+        metadata.sglang_runtime.c2kv_injection_error -- the only channel an
+        OpenAI client can read it on, because that abort carries no status_code
+        and /v1/chat/completions copies only finish_reason["type"] into the
+        choice. Setting a reason does NOT change the finish reason's
+        status_code, so the HTTP status of the response is unchanged (D4).
+
+        First writer wins: an outer wrapper (a repair entry attached to a gist
+        segment) must not overwrite the specific reason the inner call already
+        set. See c2kv/c2kv_serving_semantics.md section 3.
+        """
+        if not getattr(req, "c2kv_injection_error", None):
+            req.c2kv_injection_error = reason
+
+    @staticmethod
+    def _c2kv_layout_append(req: "Req", record: dict) -> None:
+        layout = getattr(req, "c2kv_layout", None)
+        if layout is None:
+            layout = []
+            req.c2kv_layout = layout
+        layout.append(record)
+
+    def _resolve_c2kv_repair_placement(self, entry, placement) -> str:
+        return resolve_repair_placement(entry.repair_mode, placement)
+
+    def _inject_c2kv_repair_entry(self, req: "Req", entry, placement=None) -> bool:
+        """Inject an already stored repair KV entry after the current prefix.
+
+        `placement` (see c2kv/c2kv_serving_semantics.md, "Repair placement"):
+          in_place           - the raw span stands in for its gist; the query
+                               continues at the span's absolute end.
+          append_keep_ledger - the raw span is a duplicate of a gist that stays;
+                               K keeps its original phase, the logical position
+                               of the query is unchanged (D-line corr / keepG,
+                               upstream d_corr_w*).
+          append_tail        - the raw span is re-rotated to a fresh tail
+                               position right after the current logical end and
+                               the ledger advances by its length (D-line
+                               raw_erratum_tail). Needs a pre-RoPE entry.
+        None derives the legacy behaviour from entry.repair_mode.
+        """
         if self.c2kv_pool is None:
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_POOL_UNAVAILABLE: the C2KV pool is not initialised; "
+                "start the server with --enable-c2kv",
+            )
+            return False
+        try:
+            placement = self._resolve_c2kv_repair_placement(entry, placement)
+        except ValueError as exc:
+            reason = f"C2KV_REPAIR_PLACEMENT_INVALID: {exc}"
+            logger.warning("%s", reason)
+            self._set_c2kv_injection_error(req, reason)
             return False
 
         model_runner = self.tp_worker.model_runner
@@ -3854,6 +4155,12 @@ class Scheduler(
                 key_hash=entry.key_hash[:16],
                 repair_len=repair_len,
             )
+            self._set_c2kv_injection_error(
+                req,
+                f"C2KV_REPAIR_ALLOC_FAILED: cannot allocate {repair_len} KV "
+                f"slots for repair entry {entry.key_hash} (KV cache out of "
+                "memory)",
+            )
             return False
 
         def _rollback():
@@ -3871,6 +4178,12 @@ class Scheduler(
                 kv_start=kv_start,
                 max_context_len=max_ctx,
             )
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_REPAIR_CONTEXT_OVERFLOW: repair injection would exceed "
+                f"max_context_len ({kv_start}+{repair_len}="
+                f"{kv_start + repair_len} > {max_ctx})",
+            )
             return False
 
         try:
@@ -3881,7 +4194,35 @@ class Scheduler(
         except Exception as e:
             logger.warning("C2KV repair req_to_token_pool write failed: %s", e)
             _rollback()
+            self._set_c2kv_injection_error(
+                req,
+                "C2KV_REPAIR_REQ_TO_TOKEN_WRITE_FAILED: could not map the "
+                f"repair KV slots of {entry.key_hash} into req_to_token: {e}",
+            )
             return False
+
+        # Where the span lands in RoPE position space.
+        logical_before = kv_start + req.c2kv_position_correction
+        position_override = None
+        if placement == "append_tail":
+            if entry.already_rotated:
+                reason = (
+                    "C2KV_APPEND_TAIL_REQUIRES_PRE_ROPE: repair entry "
+                    f"{entry.key_hash[:16]} was stored post-RoPE "
+                    "(raw_kv_position_mode='rotated', or extract_source="
+                    "'serving_cache'); re-extract it with "
+                    "raw_kv_position_mode='pre_rope' to use append_tail"
+                )
+                logger.warning("%s", reason)
+                self._set_c2kv_injection_error(req, reason)
+                _rollback()
+                return False
+            position_override = torch.arange(
+                logical_before,
+                logical_before + repair_len,
+                dtype=torch.int64,
+                device=self.c2kv_pool.position_buffer.device,
+            )
 
         try:
             from sglang.srt.mem_cache.c2kv_injection import inject_c2kv_stored_kv
@@ -3900,15 +4241,31 @@ class Scheduler(
                 attn_layers=attn_layers,
                 cos_sin_cache=cos_sin_cache,
                 is_neox_style=True,
+                position_ids=position_override,
             )
         except Exception as e:
             logger.error("C2KV repair injection failed: %s", e, exc_info=True)
             _rollback()
+            detail = str(e)
+            self._set_c2kv_injection_error(
+                req,
+                detail
+                if detail.startswith("C2KV_")
+                else (
+                    f"C2KV_REPAIR_INJECTION_FAILED: repair entry "
+                    f"{entry.key_hash} could not be written into the KV "
+                    f"cache: {detail}"
+                ),
+            )
             return False
 
-        position_ids = self.c2kv_pool.get_position_ids(entry)
-        position_start = int(position_ids[0].item())
-        position_end = int(position_ids[-1].item()) + 1
+        if position_override is not None:
+            position_start = int(logical_before)
+            position_end = int(logical_before + repair_len)
+        else:
+            position_ids = self.c2kv_pool.get_position_ids(entry)
+            position_start = int(position_ids[0].item())
+            position_end = int(position_ids[-1].item()) + 1
 
         req.kv_committed_len = kv_start + repair_len
         req.kv_allocated_len = kv_start + repair_len
@@ -3923,32 +4280,45 @@ class Scheduler(
             tokens=repair_len,
             original_tokens=entry.original_seq_len,
         )
-        repair_advances_logical_position = entry.repair_mode in {
-            "d_corr_recompute",
-            "d_corr_recompute_w2",
-            "d_corr_replace_w1",
-            "d_corr_replace_w2",
-            "d_corr_replace_w4",
-            "d_corr_replace_all",
-            "append_masked_w2",
-            "raw_all_replace",
-            "raw_all_replace_direct",
-        } or str(entry.repair_mode or "").startswith("history_kv_")
-        if repair_advances_logical_position:
-            # Raw replacement repair KV is already RoPE-rotated at its original
-            # Full-prompt absolute positions.  The compressed active prompt may
-            # inject the raw span at a shorter physical KV offset, so following
-            # query tokens must continue from the raw span's absolute end.
+        if placement == "in_place":
+            # The raw span stands in for its history unit and is RoPE-rotated at
+            # its original Full-prompt absolute positions. The compressed active
+            # prompt may inject it at a shorter physical KV offset, so the
+            # following query tokens continue from the span's absolute end.
             req.c2kv_position_correction = position_end - req.kv_committed_len
-        else:
+        elif placement == "append_keep_ledger":
+            # Duplicate of a gist that stays: physical length grew by repair_len
+            # but the logical position of the query must not move.
             req.c2kv_position_correction -= repair_len
+        else:  # append_tail
+            # Logical and physical both advanced by repair_len: correction unchanged.
+            pass
+        self._c2kv_layout_append(
+            req,
+            {
+                "kind": "repair",
+                "key_hash": entry.key_hash[:16],
+                "repair_mode": entry.repair_mode,
+                "placement": placement,
+                "already_rotated": bool(entry.already_rotated),
+                "raw_kv_position_mode": (
+                    "rotated" if entry.already_rotated else "pre_rope"
+                ),
+                "kv_start": int(kv_start),
+                "repair_len": int(repair_len),
+                "position_start": position_start,
+                "position_end": position_end,
+                "logical_before": int(logical_before),
+                "position_correction_after": int(req.c2kv_position_correction),
+            },
+        )
         self._log_c2kv_token_usage(
             "repair_inject_success",
             req=req,
             key_hash=entry.key_hash[:16],
             repair_mode=entry.repair_mode,
             repair_len=repair_len,
-            repair_advances_logical_position=repair_advances_logical_position,
+            placement=placement,
             position_start=position_start,
             position_end=position_end,
             kv_start=kv_start,
