@@ -2761,6 +2761,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        history_kv_recovery_mode: str = None,
+        history_kv_recovery_relative_indices=None,
         cacheblend: Optional[dict] = None,
     ):
         """Capture ordinary full-prefill KV for a repair span."""
@@ -2782,6 +2784,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             history_kv_kernel_size=history_kv_kernel_size,
             history_kv_pooling=history_kv_pooling,
             history_kv_h2o_recent_fraction=history_kv_h2o_recent_fraction,
+            history_kv_recovery_mode=history_kv_recovery_mode,
+            history_kv_recovery_relative_indices=history_kv_recovery_relative_indices,
             cacheblend=cacheblend,
         )
 

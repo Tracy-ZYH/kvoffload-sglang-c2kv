@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.gist_utils import (
 from sglang.srt.mem_cache.history_kv_selection import (
     HEADWISE_HISTORY_KV_METHODS,
     attention_scores_by_kv_head,
+    deduplicated_recovery_indices,
     gather_paired_kv,
     require_rotated_headwise_storage,
     select_h2o_prefill_indices,
@@ -1388,6 +1389,8 @@ class Qwen3ForCausalLM(nn.Module):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        history_kv_recovery_mode: Optional[str] = None,
+        history_kv_recovery_relative_indices: Optional[List[int]] = None,
         cacheblend: Optional[Dict[str, Any]] = None,
     ):
         """Run a correctness-first full prefill and capture raw repair KV.
@@ -1644,6 +1647,8 @@ class Qwen3ForCausalLM(nn.Module):
             repair_positions = torch.tensor(
                 repair_position_ids, dtype=torch.long, device=device
             )
+        full_raw_key_values = raw_key_values
+        full_repair_positions = repair_positions
 
         history_meta = None
         if history_method:
@@ -1653,6 +1658,7 @@ class Qwen3ForCausalLM(nn.Module):
                 "snapkv_persistent",
                 "snapkv_refresh",
                 "pyramidkv",
+                "kivi",
             }:
                 raise ValueError(
                     f"Unsupported history_kv_method for repair extraction: {history_method!r}."
@@ -1674,7 +1680,92 @@ class Qwen3ForCausalLM(nn.Module):
             def _unique_sorted(indices: Iterable[int]) -> List[int]:
                 return sorted({int(i) for i in indices if 0 <= int(i) < requested_span_tokens})
 
-            if history_method == "streamingllm":
+            def _kivi_qdq(
+                tensor: torch.Tensor,
+                *,
+                bits: int,
+                group_size: int,
+                residual_length: int,
+                per_token: bool,
+            ) -> torch.Tensor:
+                """Apply KIVI-style asymmetric fake quantize/dequantize."""
+                if tensor.numel() == 0:
+                    return tensor
+                levels = float((1 << bits) - 1)
+                residual = max(0, min(residual_length, int(tensor.shape[0])))
+                main = tensor[:-residual] if residual else tensor
+                tail = tensor[-residual:] if residual else None
+                if main.numel() == 0:
+                    return tensor.clone()
+                source = main.float()
+                restored_parts = []
+                if per_token:
+                    # KIVI values: quantize each token independently in groups
+                    # along the head dimension.
+                    for start in range(0, int(source.shape[-1]), group_size):
+                        chunk = source[..., start : start + group_size]
+                        minimum = chunk.amin(dim=-1, keepdim=True)
+                        maximum = chunk.amax(dim=-1, keepdim=True)
+                        scale = (maximum - minimum).clamp_min(1e-6) / levels
+                        quantized = torch.round((chunk - minimum) / scale).clamp_(0, levels)
+                        restored_parts.append(quantized * scale + minimum)
+                    restored = torch.cat(restored_parts, dim=-1)
+                else:
+                    # KIVI keys: per-channel groups over the token dimension.
+                    for start in range(0, int(source.shape[0]), group_size):
+                        chunk = source[start : start + group_size]
+                        minimum = chunk.amin(dim=0, keepdim=True)
+                        maximum = chunk.amax(dim=0, keepdim=True)
+                        scale = (maximum - minimum).clamp_min(1e-6) / levels
+                        quantized = torch.round((chunk - minimum) / scale).clamp_(0, levels)
+                        restored_parts.append(quantized * scale + minimum)
+                    restored = torch.cat(restored_parts, dim=0)
+                restored = restored.to(dtype=tensor.dtype)
+                if tail is not None:
+                    restored = torch.cat([restored, tail.clone()], dim=0)
+                return restored.contiguous()
+
+            if history_method == "kivi":
+                bits = max(1, int(os.environ.get("C2KV_KIVI_BITS", "2")))
+                group_size = max(1, int(os.environ.get("C2KV_KIVI_GROUP_SIZE", "32")))
+                residual_length = max(
+                    0, int(os.environ.get("C2KV_KIVI_RESIDUAL_LENGTH", "32"))
+                )
+                raw_key_values = [
+                    (
+                        _kivi_qdq(
+                            key,
+                            bits=bits,
+                            group_size=group_size,
+                            residual_length=residual_length,
+                            per_token=False,
+                        ),
+                        _kivi_qdq(
+                            value,
+                            bits=bits,
+                            group_size=group_size,
+                            residual_length=residual_length,
+                            per_token=True,
+                        ),
+                    )
+                    for key, value in raw_key_values
+                ]
+                selected_rel = list(range(requested_span_tokens))
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "algorithm_version": "kivi_2bit_qdq_v1",
+                    "history_boundary_adaptation": True,
+                    "requested_span_tokens": requested_span_tokens,
+                    "target_tokens": requested_span_tokens,
+                    "selected_token_count": requested_span_tokens,
+                    "selected_relative_indices": selected_rel,
+                    "selection_reason": "kivi_qdq_full_history_no_token_eviction",
+                    "per_head_selection": False,
+                    "kivi_bits": bits,
+                    "kivi_group_size": group_size,
+                    "kivi_residual_length": residual_length,
+                }
+            elif history_method == "streamingllm":
                 selected_tensor = select_streamingllm_indices(
                     requested_span_tokens,
                     target_tokens=target_tokens,
@@ -1720,10 +1811,14 @@ class Qwen3ForCausalLM(nn.Module):
                             device=device,
                         )
                         for _ in range(len(self.model.layers))
-                    ]
+                ]
                 num_layers = max(1, len(layer_scores))
-                low_budget = max(1, min(requested_span_tokens, int(round(target_tokens * 1.5))))
-                high_budget = max(1, min(requested_span_tokens, int(round(target_tokens * 0.5))))
+                budget_scale = float(
+                    os.environ.get("C2KV_PYRAMIDKV_BUDGET_SCALE", "0.66")
+                )
+                scaled_target = max(1, int(round(target_tokens * budget_scale)))
+                low_budget = max(1, min(requested_span_tokens, int(round(scaled_target * 1.5))))
+                high_budget = max(1, min(requested_span_tokens, int(round(scaled_target * 0.5))))
                 per_layer_budgets = []
                 per_layer_selected_counts = []
                 union_selected: set[int] = set()
@@ -1783,6 +1878,8 @@ class Qwen3ForCausalLM(nn.Module):
                     "per_head_selection": False,
                     "budget_preserved": len(selected_rel) == target_tokens,
                     "shared_page_table_approximation": True,
+                    "pyramidkv_budget_scale": budget_scale,
+                    "scaled_target_tokens": scaled_target,
                     "per_layer_budget_tokens": per_layer_budgets,
                     "per_layer_selected_counts": per_layer_selected_counts,
                 }
@@ -1882,6 +1979,46 @@ class Qwen3ForCausalLM(nn.Module):
                     **algorithm_fields,
                     **summarize_headwise_indices(selected_by_layer),
                 }
+            recovery_mode = (history_kv_recovery_mode or "").strip().lower()
+            if recovery_mode:
+                if recovery_mode not in {"append", "replace"}:
+                    raise ValueError(
+                        f"Unsupported history_kv_recovery_mode: {recovery_mode!r}")
+                if history_method in HEADWISE_HISTORY_KV_METHODS:
+                    raise ValueError(
+                        "GENERIC_HISTORY_RECOVERY_UNSUPPORTED_HEADWISE: "
+                        f"{history_method} stores different source positions per "
+                        "layer/KV head in one dense shared-slot entry, so exact "
+                        "deduplication cannot be represented")
+                recovery_rel = _unique_sorted(
+                    history_kv_recovery_relative_indices or [])
+                if not recovery_rel:
+                    raise ValueError(
+                        "history_kv recovery requires non-empty source-token indices")
+                retained_before = _unique_sorted(selected_rel)
+                merged_rel, recovery_accounting = deduplicated_recovery_indices(
+                    retained_before, recovery_rel,
+                    seq_len=requested_span_tokens)
+                selected_tensor = torch.tensor(
+                    merged_rel, dtype=torch.long, device=device)
+                raw_key_values = [
+                    (
+                        key.index_select(0, selected_tensor).contiguous().clone(),
+                        value.index_select(0, selected_tensor).contiguous().clone(),
+                    )
+                    for key, value in full_raw_key_values
+                ]
+                repair_positions = full_repair_positions.index_select(
+                    0, selected_tensor).contiguous()
+                history_meta.update({
+                    "recovery_mode": recovery_mode,
+                    "recovery_semantics": "deduplicated_raw_token_union",
+                    "operator_equivalent_for_raw_token_eviction": True,
+                    **recovery_accounting,
+                    "recovery_relative_indices": recovery_rel,
+                    "selected_token_count": len(merged_rel),
+                    "selected_relative_indices": merged_rel,
+                })
         repair_positions = repair_positions.view(1, -1).contiguous()
         if history_meta is not None:
             return raw_key_values, repair_positions, history_meta

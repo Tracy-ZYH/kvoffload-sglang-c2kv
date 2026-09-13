@@ -1931,7 +1931,12 @@ def get_compiler_backend(mode=None) -> str:
         if mode == "npugraph_ex":
             compiler_config.mode = "reduce-overhead"
             compiler_config.debug.run_eagerly = True
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+        # Import from the defining module directly.  In the reused torch-npu
+        # environment, ``torchair`` is a lazy proxy whose top-level attribute
+        # is absent even after other torchair submodules have been imported.
+        from torchair.npu_fx_compiler import get_npu_backend
+
+        npu_backend = get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"

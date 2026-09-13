@@ -997,6 +997,13 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
+        # Checkpoint release/restore can invalidate a leaf after `evict()` has
+        # snapshotted `evictable_leaves`.  Treat that stale heap entry as an
+        # idempotent no-op instead of passing None to the device allocator.
+        if node.value is None:
+            self.evictable_leaves.discard(node)
+            self._update_host_leaf_status(node)
+            return 0
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
