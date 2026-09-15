@@ -173,6 +173,11 @@ class NPUGraphRunner(CudaGraphRunner):
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.update_c2kv_gist_projection_mask(
+                forward_batch,
+                raw_num_token=self.raw_num_token,
+                graph_num_token=self.bs * self.num_tokens_per_bs,
+            )
 
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()

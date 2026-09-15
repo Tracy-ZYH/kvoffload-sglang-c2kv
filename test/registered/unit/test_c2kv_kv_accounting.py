@@ -55,7 +55,6 @@ def test_gist_and_repair_are_each_counted_once():
         "scheduler_first_injected_original_legacy"
     )
 
-
 def test_full_block_uses_the_same_runtime_accounting_contract():
     report = accounting.initialize_c2kv_kv_memory_report({
         "active_history_kv_tokens": 900,

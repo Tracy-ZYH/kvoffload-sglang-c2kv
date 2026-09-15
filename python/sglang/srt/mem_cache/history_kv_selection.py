@@ -20,6 +20,36 @@ DEFAULT_SCORE_QUERY_CHUNK_SIZE = 64
 DEFAULT_STREAMINGLLM_SINK_TOKENS = 4
 
 
+def deduplicated_recovery_indices(
+    retained_indices: Sequence[int],
+    recovery_indices: Sequence[int],
+    *,
+    seq_len: int,
+) -> tuple[list[int], dict[str, int]]:
+    """Union a common token selection with an exact raw recovery segment.
+
+    This helper deliberately accepts one common source-index vector only.
+    Headwise methods must not collapse their per-head vectors before calling
+    it, because that would silently create duplicate or wrongly positioned KV.
+    """
+    if seq_len < 1:
+        raise ValueError("seq_len must be positive")
+    retained = sorted({int(i) for i in retained_indices})
+    recovery = sorted({int(i) for i in recovery_indices})
+    if any(i < 0 or i >= seq_len for i in retained + recovery):
+        raise ValueError("history recovery indices are outside the source span")
+    if not recovery:
+        raise ValueError("history recovery indices must be non-empty")
+    merged = sorted(set(retained).union(recovery))
+    return merged, {
+        "before_recovery_active_tokens": len(retained),
+        "after_recovery_active_tokens": len(merged),
+        "recovered_segment_size": len(recovery),
+        "restored_raw_token_count": len(set(recovery) - set(retained)),
+        "duplicate_raw_token_count": 0,
+    }
+
+
 def require_rotated_headwise_storage(method: str, position_mode: str) -> None:
     """Reject a shared-position storage form for headwise token origins."""
 

@@ -1606,6 +1606,12 @@ class C2KVRepairExtractRequest(BaseModel):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    # Compression-agnostic recovery over a common source-token selection.
+    # Indices are relative to the extracted history span.
+    history_kv_recovery_mode: Optional[str] = None
+    history_kv_recovery_relative_indices: Optional[List[int]] = None
+    history_kv_recovery_char_start: Optional[int] = None
+    history_kv_recovery_char_end: Optional[int] = None
     # KV reuse with selective recompute (CacheBlend, arXiv 2405.16444):
     # kv_reuse_method="cacheblend" stores the span as per-chunk standalone KV
     # with the `cacheblend_recomp_ratio` highest-deviation tokens recomputed in

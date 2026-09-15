@@ -1693,6 +1693,8 @@ async def v1_c2kv_repair_extract(
         span_end = request.span_end
         position_offset = request.position_offset
         raw_kv_position_mode = request.raw_kv_position_mode
+        history_kv_recovery_relative_indices = (
+            request.history_kv_recovery_relative_indices)
         rendered_prefix_len = 0
         kv_reuse_method = (request.kv_reuse_method or "").strip().lower() or None
         cacheblend_cfg = None
@@ -1767,6 +1769,52 @@ async def v1_c2kv_repair_extract(
             if "raw_kv_position_mode" not in fields_set:
                 # CacheBlend entries are post-RoPE at their native positions
                 raw_kv_position_mode = "rotated" if cacheblend_cfg else "pre_rope"
+            if request.history_kv_recovery_mode:
+                char_start = request.history_kv_recovery_char_start
+                char_end = request.history_kv_recovery_char_end
+                if char_start is None or char_end is None:
+                    raise ValueError(
+                        "history KV recovery requires char_start and char_end")
+                target_text = str(
+                    (request.messages[request.target_index] or {}).get("content") or "")
+                if not (0 <= int(char_start) < int(char_end) <= len(target_text)):
+                    raise ValueError(
+                        "invalid history recovery character range "
+                        f"[{char_start}, {char_end}) for {len(target_text)} chars")
+                flat_tools = _c2kv_flat_tools(request.tools)
+                rendered = tokenizer.apply_chat_template(
+                    list(request.messages[: request.target_index + 1]),
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    tools=flat_tools,
+                    **chat_template_kwargs,
+                )
+                if tokenizer.bos_token and rendered.startswith(tokenizer.bos_token):
+                    rendered = rendered[len(tokenizer.bos_token):]
+                content_start = rendered.rfind(target_text)
+                if content_start < 0:
+                    raise ValueError(
+                        "could not locate history content in rendered repair prompt")
+                encoded = tokenizer(
+                    rendered, add_special_tokens=False,
+                    return_offsets_mapping=True)
+                if list(encoded["input_ids"]) != list(input_ids):
+                    raise ValueError(
+                        "offset tokenization differs from repair prompt tokenization")
+                absolute_char_start = content_start + int(char_start)
+                absolute_char_end = content_start + int(char_end)
+                selected_absolute = [
+                    index for index, (start, end) in enumerate(
+                        encoded["offset_mapping"])
+                    if int(end) > absolute_char_start
+                    and int(start) < absolute_char_end
+                    and span_start <= index < span_end
+                ]
+                history_kv_recovery_relative_indices = [
+                    index - span_start for index in selected_absolute]
+                if not history_kv_recovery_relative_indices:
+                    raise ValueError(
+                        "history recovery character range maps to no span tokens")
         elif request.input_ids is not None:
             input_ids = list(request.input_ids)
         elif request.role:
@@ -1815,6 +1863,9 @@ async def v1_c2kv_repair_extract(
             history_kv_kernel_size=request.history_kv_kernel_size,
             history_kv_pooling=request.history_kv_pooling,
             history_kv_h2o_recent_fraction=request.history_kv_h2o_recent_fraction,
+            history_kv_recovery_mode=request.history_kv_recovery_mode,
+            history_kv_recovery_relative_indices=(
+                history_kv_recovery_relative_indices),
             kv_reuse_method=kv_reuse_method,
             cacheblend=cacheblend_cfg,
         )

@@ -2114,6 +2114,8 @@ class TokenizedRepairExtractReqInput(BaseReq):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    history_kv_recovery_mode: Optional[str] = None
+    history_kv_recovery_relative_indices: Optional[List[int]] = None
     # KV reuse with selective recompute (CacheBlend); exclusive with
     # history_kv_method.  `cacheblend` carries recomp_ratio / check_layer /
     # metric / mask / chunk_tokens / chunk_bounds (mem_cache/cacheblend.py).

@@ -2465,6 +2465,7 @@ class Scheduler(
             "snapkv_persistent",
             "snapkv_refresh",
             "pyramidkv",
+            "kivi",
         }:
             return C2KVRepairExtractReqOutput(
                 error=f"Unsupported history_kv_method: {history_kv_method!r}.",
@@ -2539,6 +2540,13 @@ class Scheduler(
                         int(math.ceil(token_len * float(recv_req.history_kv_retention_ratio))),
                     ),
                 )
+            if recv_req.history_kv_recovery_mode:
+                # Exact dedup can add at most every selected recovery token.
+                alloc_check_len = min(
+                    token_len,
+                    alloc_check_len
+                    + len(recv_req.history_kv_recovery_relative_indices or []),
+                )
         if alloc_check_len > min(
             self.c2kv_pool.max_entry_tokens,
             self.c2kv_pool.max_total_tokens,
@@ -2571,6 +2579,9 @@ class Scheduler(
             "history_kv_kernel_size": recv_req.history_kv_kernel_size,
             "history_kv_pooling": recv_req.history_kv_pooling,
             "history_kv_h2o_recent_fraction": recv_req.history_kv_h2o_recent_fraction,
+            "history_kv_recovery_mode": recv_req.history_kv_recovery_mode,
+            "history_kv_recovery_relative_indices": (
+                recv_req.history_kv_recovery_relative_indices),
             "kv_reuse_method": kv_reuse_method,
             "cacheblend": cacheblend_cfg,
         }
@@ -2778,6 +2789,9 @@ class Scheduler(
                     history_kv_kernel_size=recv_req.history_kv_kernel_size,
                     history_kv_pooling=recv_req.history_kv_pooling,
                     history_kv_h2o_recent_fraction=recv_req.history_kv_h2o_recent_fraction,
+                    history_kv_recovery_mode=recv_req.history_kv_recovery_mode,
+                    history_kv_recovery_relative_indices=(
+                        recv_req.history_kv_recovery_relative_indices),
                     cacheblend=cacheblend_cfg,
                 )
                 if isinstance(repair_result, tuple) and len(repair_result) == 3:

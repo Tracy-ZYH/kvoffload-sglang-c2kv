@@ -30,6 +30,27 @@ sys.modules["history_kv_selection_under_test"] = history
 _SPEC.loader.exec_module(history)
 
 
+def test_common_index_recovery_restores_only_missing_tokens_without_duplicates():
+    merged, accounting = history.deduplicated_recovery_indices(
+        [0, 1, 8, 9], [1, 2, 3], seq_len=10)
+
+    assert merged == [0, 1, 2, 3, 8, 9]
+    assert accounting == {
+        "before_recovery_active_tokens": 4,
+        "after_recovery_active_tokens": 6,
+        "recovered_segment_size": 3,
+        "restored_raw_token_count": 2,
+        "duplicate_raw_token_count": 0,
+    }
+
+
+def test_common_index_recovery_rejects_empty_or_out_of_span_targets():
+    with pytest.raises(ValueError, match="non-empty"):
+        history.deduplicated_recovery_indices([0], [], seq_len=2)
+    with pytest.raises(ValueError, match="outside"):
+        history.deduplicated_recovery_indices([0], [2], seq_len=2)
+
+
 def test_gqa_scores_reduce_contiguous_query_groups_to_native_kv_heads():
     query = torch.zeros(1, 4, 4, 2)
     key = torch.zeros(1, 2, 4, 2)
