@@ -228,8 +228,16 @@ class PhysicalHistoryKVEvictor:
         for layer_id in range(self.kv_cache.start_layer, self.kv_cache.start_layer + self.kv_cache.layer_num):
             key_buffer = self.kv_cache._get_key_buffer(layer_id)
             value_buffer = self.kv_cache._get_value_buffer(layer_id)
-            key_buffer[dst_slots] = key_buffer[src_slots].clone()
-            value_buffer[dst_slots] = value_buffer[src_slots].clone()
+            # Slot IDs refer to TOKENS. Ascend exposes page-major buffers;
+            # indexing their first axis copies entire pages and corrupts KV
+            # outside the retained token set, even when indices stay in bounds.
+            for buffer in (key_buffer, value_buffer):
+                if buffer.ndim not in (3, 4):
+                    raise RuntimeError("HISTORY_KV_UNSUPPORTED_COMPACTION_LAYOUT")
+                tokens = buffer.reshape(-1, *buffer.shape[-2:])
+                if tokens.data_ptr() != buffer.data_ptr():
+                    raise RuntimeError("HISTORY_KV_COMPACTION_REQUIRES_CONTIGUOUS_TOKEN_VIEW")
+                tokens[dst_slots] = tokens[src_slots].clone()
 
     @staticmethod
     def _page_aligned_slots(token_len: int, page_size: int) -> int:

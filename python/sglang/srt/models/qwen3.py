@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.history_kv_selection import (
     HEADWISE_HISTORY_KV_METHODS,
     attention_scores_by_kv_head,
     deduplicated_recovery_indices,
+    dense_headwise_recovery_indices,
     gather_paired_kv,
     require_rotated_headwise_storage,
     select_h2o_prefill_indices,
@@ -52,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.mem_cache.cacheblend import CacheBlendConfig
+from sglang.srt.mem_cache.cacheblend import CacheBlendConfig, ChunkKVCache
 from sglang.srt.mem_cache.cacheblend import blend as cacheblend_blend
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
@@ -373,22 +374,17 @@ class Qwen3Attention(nn.Module):
             offset = token_end
             if not isinstance(config, dict):
                 continue
-            # The first runtime-eviction implementation scores a full history
-            # prefill round. Prefix scoring against cached K/V can be added
-            # later, but silently mixing the two would corrupt token indices.
-            if prefix_len != 0:
-                continue
-
             history_start = int(config.get("history_start") or 0)
             history_end = int(config.get("history_end") or 0)
-            if not (0 <= history_start < history_end <= extend_len):
+            available_end = prefix_len + extend_len
+            if not (0 <= history_start < history_end <= available_end):
                 continue
 
             method = str(config.get("method") or "").strip().lower()
             if method in {"", "streamingllm"}:
                 continue
             recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
-            q_end = history_end
+            q_end = min(extend_len, max(1, history_end - prefix_len))
             q_start = max(0, q_end - recent_window)
             if q_start >= q_end:
                 continue
@@ -398,7 +394,25 @@ class Qwen3Attention(nn.Module):
             ).transpose(0, 1).contiguous()
             k_req = k[token_start:token_end].view(
                 extend_len, self.num_kv_heads, self.head_dim
-            ).transpose(0, 1).contiguous()
+            )
+            # Keys of an evicted token do not exist in this candidate set.
+            # Read only the resident request-table prefix, never repair_extract
+            # or full-history text. Cached K is already at its original RoPE.
+            if prefix_len:
+                req_pool_idx = int(forward_batch.req_pool_indices[batch_idx].item())
+                slots = forward_batch.req_to_token_pool.req_to_token[req_pool_idx, :prefix_len].long()
+                key_buffer = forward_batch.token_to_kv_pool._get_key_buffer(self.attn.layer_id)
+                # Request-table values are physical TOKEN slots, not page IDs.
+                # Ascend stores [pages, page_size, Hkv, D] (FIA uses
+                # [tokens, 1, Hkv, D]); normalize before gathering. Indexing
+                # the page axis with token slots reads whole pages and can OOB.
+                if key_buffer.ndim not in (3, 4) or tuple(key_buffer.shape[-2:]) != (
+                    self.num_kv_heads, self.head_dim
+                ):
+                    raise RuntimeError("HISTORY_KV_UNSUPPORTED_KEY_BUFFER_LAYOUT")
+                cached = key_buffer.reshape(-1, self.num_kv_heads, self.head_dim)[slots]
+                k_req = torch.cat([cached.to(k_req.dtype), k_req], dim=0)
+            k_req = k_req.transpose(0, 1).contiguous()
             if self.num_heads != self.num_kv_heads:
                 groups = self.num_heads // self.num_kv_heads
                 k_score = k_req.repeat_interleave(groups, dim=0)
@@ -414,9 +428,15 @@ class Qwen3Attention(nn.Module):
             q_pos = flat_positions[token_start + q_start : token_start + q_end].to(
                 logits.device
             ).view(1, -1, 1)
-            k_pos = flat_positions[token_start : token_start + history_end].to(
-                logits.device
-            ).view(1, 1, -1)
+            ledger = config.get("resident_logical_positions")
+            if ledger is not None:
+                key_positions = torch.tensor(ledger[:history_end], device=logits.device)
+            elif prefix_len:
+                # First-request chunked prefill has not evicted anything yet.
+                key_positions = torch.arange(history_end, device=logits.device)
+            else:
+                key_positions = flat_positions[token_start : token_start + history_end].to(logits.device)
+            k_pos = key_positions.view(1, 1, -1)
             logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
             probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
             layer_score = probs[:, :, history_start:history_end].sum(dim=(0, 1))
@@ -1984,17 +2004,33 @@ class Qwen3ForCausalLM(nn.Module):
                 if recovery_mode not in {"append", "replace"}:
                     raise ValueError(
                         f"Unsupported history_kv_recovery_mode: {recovery_mode!r}")
-                if history_method in HEADWISE_HISTORY_KV_METHODS:
-                    raise ValueError(
-                        "GENERIC_HISTORY_RECOVERY_UNSUPPORTED_HEADWISE: "
-                        f"{history_method} stores different source positions per "
-                        "layer/KV head in one dense shared-slot entry, so exact "
-                        "deduplication cannot be represented")
                 recovery_rel = _unique_sorted(
                     history_kv_recovery_relative_indices or [])
                 if not recovery_rel:
                     raise ValueError(
                         "history_kv recovery requires non-empty source-token indices")
+                if history_method in HEADWISE_HISTORY_KV_METHODS:
+                    restored, recovery_accounting = dense_headwise_recovery_indices(
+                        selected_by_layer, recovery_rel, seq_len=requested_span_tokens)
+                    raw_key_values = [
+                        gather_paired_kv(key, value, indices)
+                        for (key, value), indices in zip(full_raw_key_values, restored)
+                    ]
+                    length = recovery_accounting["after_recovery_active_tokens"]
+                    # Keys already carry each source token's original RoPE.
+                    # Shared positions remain ledger-only and preserve span end.
+                    repair_positions = full_repair_positions[-length:].contiguous().clone()
+                    history_meta.update({
+                        "recovery_mode": recovery_mode,
+                        "recovery_semantics": "headwise_raw_union_dense_completion_v1",
+                        "operator_equivalent_for_raw_token_eviction": True,
+                        **recovery_accounting,
+                        "recovery_relative_indices": recovery_rel,
+                        "selected_token_count": length,
+                        "selected_relative_indices": None,
+                        **summarize_headwise_indices(restored),
+                    })
+                    return raw_key_values, repair_positions.view(1, -1), history_meta
                 retained_before = _unique_sorted(selected_rel)
                 merged_rel, recovery_accounting = deduplicated_recovery_indices(
                     retained_before, recovery_rel,
@@ -2014,6 +2050,7 @@ class Qwen3ForCausalLM(nn.Module):
                     "recovery_mode": recovery_mode,
                     "recovery_semantics": "deduplicated_raw_token_union",
                     "operator_equivalent_for_raw_token_eviction": True,
+                    "recovery_target_coverage": 1.0,
                     **recovery_accounting,
                     "recovery_relative_indices": recovery_rel,
                     "selected_token_count": len(merged_rel),
@@ -2076,8 +2113,15 @@ class Qwen3ForCausalLM(nn.Module):
             device=device,
         )
         ops = _Qwen3CacheBlendOps(self)
+        if not hasattr(self, "_cacheblend_chunk_cache"):
+            # Process/model-local cache: never shared across checkpoints or TP
+            # ranks. CPU LRU is bounded independently of the accelerator pool.
+            self._cacheblend_chunk_cache = ChunkKVCache(
+                int(os.environ.get("SGLANG_CACHEBLEND_CHUNK_CACHE_BYTES", str(256 * 1024 * 1024)))
+            )
         out_kv, meta = cacheblend_blend(
-            ops, input_ids.view(-1), positions, span_start, span_end, config
+            ops, input_ids.view(-1), positions, span_start, span_end, config,
+            chunk_cache=self._cacheblend_chunk_cache,
         )
         span_len = span_end - span_start
         raw_key_values = [
@@ -2111,6 +2155,8 @@ class Qwen3ForCausalLM(nn.Module):
         return pic_key_values, pic_mask, position_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if hasattr(self, "_cacheblend_chunk_cache"):
+            self._cacheblend_chunk_cache.clear()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2247,6 +2293,7 @@ class _Qwen3CacheBlendOps:
         self.model = model
         self.layers = model.model.layers
         self.num_layers = len(self.layers)
+        self.cache_dtype = model.model.embed_tokens.weight.dtype
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.model.embed_tokens(input_ids.view(1, -1)).squeeze(0)

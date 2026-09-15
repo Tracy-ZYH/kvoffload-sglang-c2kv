@@ -148,6 +148,60 @@ def _inputs(prologue=5, chunks=(6, 7, 4), suffix=2, offset=0):
 
 # ------------------------------------------------------------------ helpers
 
+def test_cross_request_chunk_reuse_preserves_absolute_rope_and_adds_only_new_chunks(monkeypatch):
+    model = TinyDecoder()
+    cache = cb.ChunkKVCache(1024 * 1024)
+    cfg = cb.CacheBlendConfig(chunk_tokens=3)
+    calls = []
+    original = cb.chunk_kv
+    def count(ops, ids):
+        calls.append(tuple(ids.tolist()))
+        return original(ops, ids)
+    monkeypatch.setattr(cb, "chunk_kv", count)
+    ids = torch.tensor([1, 2, 3, 4, 5, 6])
+    cb.blend(model, ids, torch.arange(6), 0, 6, cfg, chunk_cache=cache)
+    assert len(calls) == 2
+    extended = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    # Same chunks at new absolute positions reuse pre-RoPE cache, not blended KV.
+    cached, meta = cb.blend(model, extended, torch.arange(9)+10, 0, 9, cfg, chunk_cache=cache)
+    assert len(calls) == 3
+    assert meta["chunk_cache_hit_chunks"] == 2
+    assert meta["chunk_cache_hit_tokens"] == 6 and meta["chunk_prefill_tokens"] == 3
+    uncached, _ = cb.blend(model, extended, torch.arange(9)+10, 0, 9, cfg)
+    for (k, v), (k2, v2) in zip(cached, uncached):
+        torch.testing.assert_close(k, k2)
+        torch.testing.assert_close(v, v2)
+    _, warm = cb.blend(model, extended, torch.arange(9)+10, 0, 9, cfg, chunk_cache=cache)
+    assert warm["chunk_prefill_tokens"] == 0
+
+
+def test_chunk_cache_is_bounded_immutable_and_clearable():
+    model = TinyDecoder()
+    ids = torch.tensor([1, 2, 3])
+    raw = cb.chunk_kv(model, ids)
+    size = sum(t.numel()*t.element_size() for pair in raw for t in pair)
+    cache = cb.ChunkKVCache(size)
+    first, hit = cache.get_or_compute(model, ids)
+    assert not hit
+    first[0][0].zero_()  # caller writes must not poison standalone CPU storage
+    reused, hit = cache.get_or_compute(model, ids)
+    assert hit
+    torch.testing.assert_close(reused[0][0], raw[0][0])
+    reused[0][0].zero_()
+    again, hit = cache.get_or_compute(model, ids)
+    assert hit
+    torch.testing.assert_close(again[0][0], raw[0][0])
+    cache.get_or_compute(model, torch.tensor([4, 5, 6]))
+    assert cache.bytes <= size and len(cache.entries) == 1
+    assert not cache.get_or_compute(model, ids)[1]
+    cache.clear()
+    assert cache.bytes == 0 and not cache.entries
+    disabled = cb.ChunkKVCache(0)
+    assert not disabled.get_or_compute(model, ids)[1]
+    assert not disabled.get_or_compute(model, ids)[1]
+    assert disabled.bytes == 0
+
+
 def test_resolve_chunk_bounds_explicit_grid_and_errors():
     assert cb.resolve_chunk_bounds(10, [(0, 4), (4, 10)]) == [(0, 4), (4, 10)]
     assert cb.resolve_chunk_bounds(10, None, 4) == [(0, 4), (4, 8), (8, 10)]

@@ -51,6 +51,38 @@ def test_common_index_recovery_rejects_empty_or_out_of_span_targets():
         history.deduplicated_recovery_indices([0], [2], seq_len=2)
 
 
+def test_dense_headwise_restore_preserves_selection_target_and_valid_rope_rows():
+    selected = [torch.tensor([[0, 1, 7], [4, 6, 7]]),
+                torch.tensor([[0, 4, 7], [1, 5, 7]])]
+    restored, meta = history.dense_headwise_recovery_indices(selected, [0, 1, 2], seq_len=8)
+    assert meta["before_recovery_active_tokens"] == 3
+    assert meta["after_recovery_active_tokens"] == 6
+    assert meta["dense_alignment_extra_tokens_per_head_max"] == 2
+    for original, indices in zip(selected, restored):
+        assert indices.shape == (2, 6)
+        for old, new in zip(original.tolist(), indices.tolist()):
+            assert set(old).issubset(new)
+            assert {0, 1, 2}.issubset(new)
+            assert len(new) == len(set(new))
+            assert new == sorted(new)
+        # Each head's K/V rows must come from its own recorded source index.
+        key = torch.arange(8 * 4).reshape(8, 4).float()
+        value = key + 100
+        k, v = history.gather_paired_kv(key, value, indices)
+        for h in range(2):
+            assert torch.equal(k[:, h*2:(h+1)*2], key[indices[h], h*2:(h+1)*2])
+            assert torch.equal(v[:, h*2:(h+1)*2], value[indices[h], h*2:(h+1)*2])
+
+
+def test_dense_headwise_restore_full_span_has_no_alignment_overhead():
+    restored, meta = history.dense_headwise_recovery_indices(
+        [torch.tensor([[0, 2], [1, 3]])], range(4), seq_len=4)
+    assert restored[0].tolist() == [[0, 1, 2, 3], [0, 1, 2, 3]]
+    assert meta["dense_alignment_extra_tokens_per_head_mean"] == 0
+    with pytest.raises(ValueError):
+        history.dense_headwise_recovery_indices([torch.tensor([[0, 0]])], [1], seq_len=4)
+
+
 def test_gqa_scores_reduce_contiguous_query_groups_to_native_kv_heads():
     query = torch.zeros(1, 4, 4, 2)
     key = torch.zeros(1, 2, 4, 2)

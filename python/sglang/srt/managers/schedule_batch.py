@@ -1002,6 +1002,18 @@ class Req(ReqDllmMixin):
 
     def prepare_c2kv_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         """Build the transient fill_ids view for the active C2KV prefill round."""
+        if isinstance(self.history_kv_eviction, dict) and self.history_kv_eviction.get("persistent_continuation_pending"):
+            # The multi-round path normally bypasses match_prefix entirely.
+            # Restore session ownership BEFORE preparing the resident+delta
+            # rounds, otherwise a continuation silently prefills its old IDs.
+            if tree_cache is None:
+                raise RuntimeError("PERSISTENT_HISTORY_SESSION_CACHE_REQUIRED")
+            result = tree_cache.match_prefix(MatchPrefixParams(
+                key=RadixKey(token_ids=self.origin_input_ids, extra_key=self.extra_key), req=self))
+            self.prefix_indices = result.device_indices
+            self.last_node = result.last_device_node
+            self.last_host_node = result.last_host_node
+            self.cache_protected_len = result.cache_protected_len or 0
         self.c2kv_requeued = False
         self.host_hit_length = 0
         root_node = getattr(tree_cache, "root_node", None)

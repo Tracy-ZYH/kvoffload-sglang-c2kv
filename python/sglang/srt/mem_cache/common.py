@@ -491,7 +491,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    if getattr(req, "c2kv_rounds", None) is not None and not is_insert:
+    # Multi-round physical eviction disables radix insertion, but streaming
+    # requests still transfer their resident KV to SessionAwareCache. Bypassing
+    # that transfer frees the previous session's live pages and leaves its slot
+    # pointing at allocator-free memory.
+    owns_finished_request = getattr(tree_cache, "owns_finished_request", None)
+    session_owned = callable(owns_finished_request) and owns_finished_request(req)
+    if (
+        getattr(req, "c2kv_rounds", None) is not None
+        and not is_insert
+        and not session_owned
+    ):
         start_p = getattr(req, "c2kv_tree_cache_prefix_len", 0)
         end_p = req.kv_allocated_len
         if start_p < end_p:

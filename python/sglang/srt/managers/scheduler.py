@@ -2980,12 +2980,13 @@ class Scheduler(
         original_len = len(original_input_ids)
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
-        if not (0 <= history_start <= history_end <= original_len):
+        persistent_continuation = bool(config.get("persistent_continuation"))
+        if not persistent_continuation and not (0 <= history_start <= history_end <= original_len):
             return (
                 "Invalid physical history KV eviction range: "
                 f"{history_start=}, {history_end=}, {original_len=}"
             )
-        if history_end <= 0:
+        if history_end <= 0 and not persistent_continuation:
             return None
 
         persistent_session = bool(config.get("persistent_session"))
@@ -3064,6 +3065,8 @@ class Scheduler(
                 bytes_per_kv_token=self._bytes_per_kv_token(),
             )
             selected = config.get("selected_history_indices")
+            if config.get("persistent_session") and getattr(req, "history_kv_resident_positions", None) is None:
+                req.history_kv_resident_positions = list(range(len(req.c2kv_virtual_input_ids)))
             if not isinstance(selected, list):
                 selected = self._select_history_kv_eviction_indices(req, config)
             result = evictor.evict(
@@ -3141,15 +3144,40 @@ class Scheduler(
                 + virtual_ids[history_end:]
             )
             expected_compacted_prefix_len = history_start + len(selected)
-            if expected_compacted_prefix_len != int(result.new_physical_kv_slots):
+            if expected_compacted_prefix_len != int(req.kv_committed_len) - int(result.current_tokens):
                 req.to_finish = _FA(
                     "PERSISTENT_HISTORY_ACTIVE_SEQUENCE_LENGTH_MISMATCH: "
                     f"{expected_compacted_prefix_len=}, "
-                    f"{result.new_physical_kv_slots=}"
+                    f"committed_len={req.kv_committed_len}"
                 )
                 req.check_finished()
                 return False
             req.c2kv_persistent_active_input_ids = active_input_ids
+            req.c2kv_virtual_input_ids = list(active_input_ids)
+            from sglang.srt.mem_cache.history_kv_lifecycle import compact_positions, position_summary
+            ledger = getattr(req, "history_kv_resident_positions", None)
+            if ledger is None:
+                ledger = list(range(len(virtual_ids)))
+            req.history_kv_resident_positions = compact_positions(ledger, history_start, history_end, selected)
+            lifecycle = {
+                **{k: (req.c2kv_kv_memory_hint or {}).get(k) for k in ("episode_id", "turn_id", "step_id")},
+                "history_kv_backend": "physical_eviction", "persistent_session_enabled": True,
+                "session_id": req.session.session_id,
+                "full_history_tokens": int(config.get("persistent_canonical_history_end", config.get("canonical_history_end", history_end))) - int(config.get("persistent_protected_prefix_tokens", history_start)),
+                "resident_tokens_before_append": int(config.get("persistent_prior_physical_tokens", 0)),
+                "new_turn_tokens": int((req.c2kv_kv_memory_hint or {}).get("persistent_session_delta_tokens", len(virtual_ids))),
+                "resident_tokens_after_append": len(ledger),
+                "resident_tokens_after_eviction": len(req.history_kv_resident_positions),
+                "evicted_tokens_this_turn": len(ledger) - len(req.history_kv_resident_positions),
+                "retained_tokens_this_turn": len(selected),
+                "history_prefill_tokens": int(config.get("persistent_delta_history_tokens", history_end)),
+                "full_history_reprefill_performed": False,
+                "previous_resident_position_summary": config.get("previous_resident_position_summary"),
+                "resident_position_summary": position_summary(req.history_kv_resident_positions),
+                "cache_layout": "shared_token_indices_across_layers_heads",
+            }
+            req.kv_memory_report["history_kv_lifecycle"] = lifecycle
+            logger.info("HISTORY_KV_LIFECYCLE %s", json.dumps(lifecycle, sort_keys=True))
         # Keep a detached copy: request teardown/requeue paths must not make a
         # successfully measured eviction disappear before the final response.
         if isinstance(getattr(req, "kv_memory_report", None), dict):
@@ -3217,6 +3245,19 @@ class Scheduler(
 
         recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
         if method == "h2o":
+            # Accumulate only observed resident-token scores. Positions absent
+            # from the session cannot re-enter the candidate set.
+            ledger = getattr(req, "history_kv_resident_positions", None)
+            if config.get("persistent_session") and ledger is not None:
+                state = dict(getattr(req, "history_kv_score_state", {}) or {})
+                for layer, scores in enumerate(layer_scores):
+                    prior = state.get(layer, {})
+                    positions = ledger[history_start:history_end]
+                    updated = scores + torch.tensor([prior.get(p, 0.0) for p in positions])
+                    layer_scores[layer] = updated
+                    state[layer] = dict(zip(positions, updated.tolist()))
+                req.history_kv_score_state = state
+                config["h2o_score_state_mode"] = "cumulative_resident_recent_query_attention"
             recent_budget = max(
                 0,
                 min(
