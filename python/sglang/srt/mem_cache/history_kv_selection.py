@@ -20,6 +20,62 @@ DEFAULT_SCORE_QUERY_CHUNK_SIZE = 64
 DEFAULT_STREAMINGLLM_SINK_TOKENS = 4
 
 
+def dense_headwise_recovery_indices(layer_indices, recovery_indices, *, seq_len):
+    """Restore all target tokens, retaining each head's original selection.
+
+    Different overlap with the target gives different union lengths. Existing
+    dense storage needs one common length: fill shorter heads with additional
+    real source tokens (most recent first), never duplicate or zero-pad K/V.
+    This is explicitly a superset restore, not target-only recovery.
+    """
+    if not layer_indices or seq_len < 1:
+        raise ValueError("non-empty layers and positive seq_len required")
+    target = set(int(i) for i in recovery_indices)
+    if not target or min(target) < 0 or max(target) >= seq_len:
+        raise ValueError("non-empty recovery indices within source span required")
+    shape = tuple(layer_indices[0].shape)
+    if len(shape) != 2 or min(shape) < 1:
+        raise ValueError("selection must have shape [Hkv, K]")
+    unions, missing = [], []
+    for indices in layer_indices:
+        if tuple(indices.shape) != shape:
+            raise ValueError("all layers require equal [Hkv, K] shapes")
+        heads = []
+        for head in indices.tolist():
+            retained = set(int(i) for i in head)
+            if len(retained) != shape[1] or min(retained) < 0 or max(retained) >= seq_len:
+                raise ValueError("retained indices must be unique and within source span")
+            heads.append(retained | target)
+            missing.append(len(target - retained))
+        unions.append(heads)
+    length = max(len(head) for layer in unions for head in layer)
+    completed, extras = [], []
+    for indices, heads in zip(layer_indices, unions):
+        rows = []
+        for head in heads:
+            extra = length - len(head)
+            extras.append(extra)
+            if extra:
+                for i in range(seq_len - 1, -1, -1):
+                    if i not in head:
+                        head.add(i)
+                        if len(head) == length:
+                            break
+            rows.append(sorted(head))
+        completed.append(torch.tensor(rows, dtype=torch.long, device=indices.device))
+    return completed, {
+        "before_recovery_active_tokens": shape[1],
+        "after_recovery_active_tokens": length,
+        "recovered_segment_size": len(target),
+        "restored_raw_token_count": length - shape[1],
+        "target_restored_tokens_per_head_mean": sum(missing) / len(missing),
+        "dense_alignment_extra_tokens_per_head_mean": sum(extras) / len(extras),
+        "dense_alignment_extra_tokens_per_head_max": max(extras),
+        "duplicate_raw_token_count": 0,
+        "recovery_target_coverage": 1.0,
+    }
+
+
 def deduplicated_recovery_indices(
     retained_indices: Sequence[int],
     recovery_indices: Sequence[int],

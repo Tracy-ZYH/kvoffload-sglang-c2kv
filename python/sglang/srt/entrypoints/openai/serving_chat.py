@@ -154,6 +154,9 @@ class OpenAIServingChat(OpenAIServingBase):
         session_id = params.get("id")
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("PERSISTENT_HISTORY_SESSION_ID_REQUIRED")
+        expected_id = (request.c2kv_kv_memory_hint.get("persistent_history_session") or {}).get("session_id")
+        if expected_id and expected_id != session_id:
+            raise ValueError("PERSISTENT_HISTORY_SESSION_ID_MISMATCH")
         # Store the canonical prompt *before* decode, not raw generated IDs.
         # Tool parsers may return a structured assistant/tool-call message whose
         # next-turn chat-template serialization differs from the raw completion.
@@ -169,6 +172,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if isinstance(hint, dict):
                 hint["persistent_session_logical_prefix_tokens"] = 0
                 hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
+                hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
             params["drop_previous_output"] = True
             return full_prompt_ids, session_id, full_prompt_ids
 
@@ -196,10 +200,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(hint, dict):
             hint["persistent_session_logical_prefix_tokens"] = len(previous)
             hint["persistent_session_delta_tokens"] = len(delta)
+            hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
         if isinstance(config, dict):
             history_end = int(config.get("history_end") or 0)
             history_start = int(config.get("history_start") or 0)
-            if not (history_start <= history_end and history_end >= len(previous)):
+            if not (0 <= history_start <= history_end <= len(full_prompt_ids)):
                 raise ValueError(
                     "PERSISTENT_HISTORY_SESSION_BOUNDARY_MISMATCH: "
                     f"history_start={history_start}, history_end={history_end}, "
@@ -208,7 +213,8 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_session"] = True
             config["persistent_continuation"] = True
             config["persistent_protected_prefix_tokens"] = history_start
-            config["persistent_delta_history_tokens"] = history_end - len(previous)
+            config["persistent_delta_history_tokens"] = max(0, history_end - len(previous))
+            config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
         return delta, session_id, full_prompt_ids
 

@@ -39,19 +39,61 @@ Deltas that are NOT the artifact's, all documented in
 ``c2kv/c2kv_serving_semantics.md`` section 10: chunks are the bench's history
 docs (rendered chat messages) or a fixed token grid, never the artifact's
 per-dataset passages; the system/tool prologue is prefilled fresh in the same
-forward (the artifact caches it as chunk 0); the chunk cache is materialised
-per request instead of being loaded from storage (identical values, no
-wall-clock claim).
+forward (the artifact caches it as chunk 0). Standalone chunk KV can be
+reused across requests through a model-owned, bounded CPU LRU. Cold misses
+still require standalone prefill; CPU/device transfers and the dense early
+blend layers must be included in any wall-clock measurement.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
 CACHEBLEND_METRICS = ("v", "k")
 CACHEBLEND_MASKS = ("causal", "bottom_right")
+
+
+class ChunkKVCache:
+    """Model-local CPU LRU of immutable standalone, pre-RoPE KV.
+
+    Exact token tuples prevent content collisions. The owning model supplies
+    the weight namespace; dtype/device are included so dtype changes cannot
+    reuse stale precision. No context-dependent blended rows enter this cache.
+    CPU storage avoids holding unaccounted persistent accelerator allocations.
+    """
+
+    def __init__(self, max_bytes: int = 256 * 1024 * 1024):
+        if max_bytes < 0:
+            raise ValueError("CacheBlend chunk cache max_bytes must be nonnegative")
+        self.max_bytes = int(max_bytes)
+        self.bytes = 0
+        self.entries = OrderedDict()
+
+    def clear(self):
+        self.entries.clear()
+        self.bytes = 0
+
+    def get_or_compute(self, ops, ids):
+        key = (str(ids.device), str(getattr(ops, "cache_dtype", "default")),
+               tuple(ids.detach().cpu().tolist()))
+        cached = self.entries.pop(key, None)
+        if cached is not None:
+            self.entries[key] = cached
+            return [(k.to(ids.device, copy=True), v.to(ids.device, copy=True))
+                    for k, v in cached], True
+        result = chunk_kv(ops, ids)
+        size = sum(t.numel() * t.element_size() for pair in result for t in pair)
+        if size <= self.max_bytes and self.max_bytes:
+            while self.bytes + size > self.max_bytes:
+                _, removed = self.entries.popitem(last=False)
+                self.bytes -= sum(t.numel() * t.element_size() for pair in removed for t in pair)
+            self.entries[key] = [(k.detach().to("cpu").clone(), v.detach().to("cpu").clone())
+                                 for k, v in result]
+            self.bytes += size
+        return result, False
 
 
 @dataclass
@@ -310,6 +352,7 @@ def blend(
     span_start: int,
     span_end: int,
     config: CacheBlendConfig,
+    chunk_cache: Optional[ChunkKVCache] = None,
 ) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor]], Dict[str, Any]]:
     """The CacheBlend forward over ``input_ids`` (1-D, L tokens) at absolute
     ``positions`` (L).  ``[span_start, span_end)`` is the reused span; tokens
@@ -342,9 +385,18 @@ def blend(
     device = input_ids.device
 
     # 1. chunk cache: standalone KV per chunk, concatenated over the span
-    per_chunk = [
-        chunk_kv(ops, input_ids[span_start + a : span_start + b]) for a, b in bounds
-    ]
+    per_chunk = []
+    hit_chunks = hit_tokens = miss_tokens = 0
+    for a, b in bounds:
+        ids = input_ids[span_start + a : span_start + b]
+        if chunk_cache is None:
+            kv, hit = chunk_kv(ops, ids), False
+        else:
+            kv, hit = chunk_cache.get_or_compute(ops, ids)
+        per_chunk.append(kv)
+        hit_chunks += int(hit)
+        hit_tokens += (b - a) if hit else 0
+        miss_tokens += 0 if hit else (b - a)
     old_k: List[torch.Tensor] = []
     old_v: List[torch.Tensor] = []
     for li in range(num_layers):
@@ -432,6 +484,13 @@ def blend(
         "requested_span_tokens": span_len,
         "chunk_count": len(bounds),
         "chunk_bounds": [list(b) for b in bounds],
+        "chunk_cache_enabled": chunk_cache is not None and chunk_cache.max_bytes > 0,
+        "chunk_cache_hit_chunks": hit_chunks,
+        "chunk_cache_miss_chunks": len(bounds) - hit_chunks,
+        "chunk_cache_hit_tokens": hit_tokens,
+        "chunk_prefill_tokens": miss_tokens,
+        "chunk_cache_bytes": chunk_cache.bytes if chunk_cache is not None else 0,
+        "dense_blend_prefix_tokens": total,
         "recomputed_tokens": int(selected_rel.numel()),
         "recomputed_relative_indices": [int(i) for i in selected_rel.tolist()],
         "fresh_outside_tokens": int(outside_rows.numel()),
