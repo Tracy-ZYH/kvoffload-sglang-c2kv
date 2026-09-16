@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 import types
+import math
 from typing import Optional
 
 import pytest
@@ -174,6 +175,37 @@ def test_serving_delta_prefix_mismatch_fails_without_full_prefill_fallback():
     req.session_params['id'] = 'other'
     with pytest.raises(ValueError, match="ID_MISMATCH"):
         prepare(self, req, [0, 1, 2, 3, 4, 5])
+
+
+def test_physical_ratio_budget_uses_exact_server_tokenized_history_span():
+    path = ROOT / "python/sglang/srt/entrypoints/openai/serving_chat.py"
+    resolve = method(
+        path, "OpenAIServingChat", "_resolve_history_kv_eviction_range",
+        {"ChatCompletionRequest": object, "List": list, "math": math},
+    )
+    self = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(tokenizer=SimpleNamespace(bos_token_id=None)),
+        _chat_template_tools=lambda request: ["tool"],
+        _c2kv_chat_template_input_ids=(
+            lambda request, completed, tools: [10, 20, 21] if tools else [20, 21]
+        ),
+        _find_token_subsequence=lambda haystack, needle: next(
+            (i for i in range(len(haystack) - len(needle) + 1)
+             if haystack[i:i + len(needle)] == needle), -1),
+    )
+    req = SimpleNamespace(
+        messages=[object(), object()],
+        c2kv_kv_memory_hint={"history_kv_eviction": {
+            "history_message_count": 1,
+            "retention_ratio": 0.25,
+        }},
+    )
+    resolve(self, req, [10, 20, 21, 30])
+    config = req.c2kv_kv_memory_hint["history_kv_eviction"]
+    assert config["history_start"] == 1 and config["history_end"] == 3
+    assert config["target_tokens"] == 1
+    assert config["target_tokens_source"] == "server_tokenized_retention_ratio"
+    assert req.c2kv_kv_memory_hint["full_equivalent_history_tokens"] == 2
 
 
 def test_session_match_restores_prefix_and_builds_only_new_history_round(monkeypatch):

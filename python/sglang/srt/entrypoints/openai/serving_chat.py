@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import time
 import uuid
 from http import HTTPStatus
@@ -682,9 +683,32 @@ class OpenAIServingChat(OpenAIServingBase):
         config["history_start"] = history_start
         config["history_end"] = history_end
         config["server_tokenized"] = True
+        span_tokens = history_end - history_start
+        if config.get("target_tokens") is None:
+            ratio = config.get("retention_ratio")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Physical history KV eviction requires target_tokens or "
+                    "retention_ratio"
+                ) from exc
+            if not 0.0 < ratio <= 1.0:
+                raise ValueError(
+                    f"Invalid physical history retention_ratio: {ratio!r}"
+                )
+            config["target_tokens"] = max(
+                1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
+            )
+            config["target_tokens_source"] = "server_tokenized_retention_ratio"
+        else:
+            config["target_tokens"] = max(
+                1, min(span_tokens, int(config["target_tokens"]))
+            )
+            config["target_tokens_source"] = "absolute_request_budget"
         # The server owns the final chat template, so this is the only exact
         # full-history token count used by persistent physical accounting.
-        hint["full_equivalent_history_tokens"] = history_end - history_start
+        hint["full_equivalent_history_tokens"] = span_tokens
 
     def _convert_to_internal_request(
         self,
