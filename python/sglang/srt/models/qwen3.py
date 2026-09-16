@@ -384,7 +384,16 @@ class Qwen3Attention(nn.Module):
             if method in {"", "streamingllm"}:
                 continue
             recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
-            q_end = min(extend_len, max(1, history_end - prefix_len))
+            # On the first prefill, history may end inside the extend input;
+            # do not use current-turn rows that precede no completed history.
+            # On a persistent continuation the completed history is already
+            # wholly resident in the prefix, so score it with the RECENT NEW
+            # query window. The old max(1, history_end-prefix_len) silently
+            # reduced every later turn to its first new query token.
+            if prefix_len > 0 and history_end <= prefix_len:
+                q_end = extend_len
+            else:
+                q_end = min(extend_len, max(1, history_end - prefix_len))
             q_start = max(0, q_end - recent_window)
             if q_start >= q_end:
                 continue

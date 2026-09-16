@@ -229,14 +229,16 @@ def test_attention_eviction_scores_cached_resident_keys_not_full_history(method_
             'resident_logical_positions':[0,1,4,7,8]}
     fb=SimpleNamespace(c2kv_history_kv_eviction_configs=[config],
         forward_mode=SimpleNamespace(is_extend_or_draft_extend_or_mixed=lambda:True),
-        extend_seq_lens_cpu=[1],extend_prefix_lens_cpu=[4],req_pool_indices=torch.tensor([0]),
-        req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[4,8,9,13,14]])),
+        extend_seq_lens_cpu=[3],extend_prefix_lens_cpu=[4],req_pool_indices=torch.tensor([0]),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[4,8,9,13,14,15,16]])),
         token_to_kv_pool=SimpleNamespace(_get_key_buffer=lambda _:keys))
     self=SimpleNamespace(num_heads=1,num_kv_heads=1,head_dim=1,scaling=1.,attn=SimpleNamespace(layer_id=0))
-    collect(self,torch.ones(1,1),torch.tensor([[8.]]),torch.tensor([8]),fb)
+    collect(self,torch.ones(3,1),torch.tensor([[8.],[9.],[10.]]),torch.tensor([8,9,10]),fb)
     scores=fb.c2kv_history_kv_selection_scores[0]['layers'][0]
     assert scores.numel()==3 and scores.argmax().item()==2
-    assert torch.allclose(scores,torch.softmax(torch.tensor([0.,1.,4.,7.]),0)[1:])
+    # All three new queries, rather than only the first token, contribute.
+    one_query = torch.softmax(torch.tensor([0., 1., 4., 7.]), 0)[1:].sum()
+    assert torch.allclose(scores.sum(), 3 * one_query, atol=1e-5)
 
 
 def test_missing_persistent_slot_never_falls_back_to_reprefill():
