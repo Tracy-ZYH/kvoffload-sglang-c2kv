@@ -420,7 +420,12 @@ class Qwen3Attention(nn.Module):
                 k_score = k_req
 
             q_window = q_req[:, q_start:q_end, :]
-            k_all = k_score[:, :history_end, :]
+            # The query may follow an already-cached history boundary. Include
+            # the resident current prefix and query's own key in the softmax;
+            # only slice to history candidates after normalization. Otherwise
+            # heads attending to current content get overstated history scores.
+            key_end = prefix_len + q_end
+            k_all = k_score[:, :key_end, :]
             logits = torch.matmul(
                 q_window.float(),
                 k_all.transpose(-2, -1).float(),
@@ -430,12 +435,12 @@ class Qwen3Attention(nn.Module):
             ).view(1, -1, 1)
             ledger = config.get("resident_logical_positions")
             if ledger is not None:
-                key_positions = torch.tensor(ledger[:history_end], device=logits.device)
+                key_positions = torch.tensor(ledger[:key_end], device=logits.device)
             elif prefix_len:
                 # First-request chunked prefill has not evicted anything yet.
-                key_positions = torch.arange(history_end, device=logits.device)
+                key_positions = torch.arange(key_end, device=logits.device)
             else:
-                key_positions = flat_positions[token_start : token_start + history_end].to(logits.device)
+                key_positions = flat_positions[token_start : token_start + key_end].to(logits.device)
             k_pos = key_positions.view(1, 1, -1)
             logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
             probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
