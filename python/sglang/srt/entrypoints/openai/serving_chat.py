@@ -649,36 +649,57 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"history_message_count={count}, messages={len(request.messages)}"
             )
 
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid history_start_message_count: {start_count!r}") from exc
+        if not (0 <= start_count < count):
+            raise ValueError(
+                "Invalid physical history start boundary: "
+                f"history_start_message_count={start_count}, "
+                f"history_message_count={count}"
+            )
+
         tools = self._chat_template_tools(request)
         completed = list(request.messages[:count])
-        with_tools = self._c2kv_chat_template_input_ids(request, completed, tools)
-        without_tools = self._c2kv_chat_template_input_ids(request, completed, None)
-        bos_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
-        while without_tools and bos_id is not None and without_tools[0] == bos_id:
-            without_tools = without_tools[1:]
-        if not without_tools:
-            raise ValueError("Cannot resolve an empty physical history token span")
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(
+            request, completed, tools)
+        if not completed_ids:
+            raise ValueError("Cannot resolve an empty completed-history prefix")
 
         prefix_start = 0
-        if prompt_ids[: len(with_tools)] != with_tools:
-            prefix_start = self._find_token_subsequence(prompt_ids, with_tools)
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
         if prefix_start < 0:
             raise ValueError(
                 "Server chat template prefix is not present in the final prompt; "
                 "refusing physical history KV eviction."
             )
-        history_relative_start = self._find_token_subsequence(with_tools, without_tools)
-        if history_relative_start < 0:
-            raise ValueError(
-                "Cannot isolate completed history from the server tool prologue; "
-                "refusing physical history KV eviction."
-            )
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools)
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Protected system/tool prefix is not a prefix of completed "
+                    "history in the server chat template; refusing physical "
+                    "history KV eviction."
+                )
+            history_relative_start = len(protected_ids)
+        else:
+            # No explicit protected messages: retain any template-generated
+            # tool/system prologue and begin at the first real message.
+            history_relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools)
         history_start = prefix_start + history_relative_start
-        history_end = history_start + len(without_tools)
-        if history_end > len(prompt_ids) or prompt_ids[history_start:history_end] != without_tools:
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
             raise ValueError(
-                "Resolved physical history range does not match the server prompt IDs; "
-                "refusing physical history KV eviction."
+                "Resolved physical history range is empty/outside the server "
+                f"prompt: start={history_start}, end={history_end}, "
+                f"prompt={len(prompt_ids)}"
             )
         config["history_start"] = history_start
         config["history_end"] = history_end
