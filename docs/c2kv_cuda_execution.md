@@ -1,15 +1,25 @@
-# CUDA execution profile for C2KV
+# CUDA execution for C2KV
 
-`scripts/c2kv/start_cuda_server.sh` selects FlashInfer attention and leaves
-decode CUDA graphs enabled. It uses the existing SGLang kernels and C2KV graph
-eligibility checks; it does not change compression, query projection, history
-selection, or recovery policy. The Ascend launcher is unchanged.
+The normal `python -m sglang.launch_server` and Python `Engine` entry points
+already select FlashInfer on RTX PRO 6000 Blackwell when it is installed and
+no attention backend is specified. Decode CUDA graphs are enabled by default.
+Merging this change and restarting the server applies the loader cleanup and
+persistent-KV ownership fixes through those same entry points; no wrapper or
+new feature flag is required. Compression, query projection, history selection,
+and recovery policy remain caller settings. The Ascend launcher is unchanged.
+
+For a runner that explicitly chose the old slow path, set its existing
+`attention_backend` to `flashinfer` and `disable_cuda_graph` to `false` (CLI:
+`--attention-backend flashinfer` and remove `--disable-cuda-graph`). These options
+work independently of this example script. Explicit user overrides remain in
+effect; merging a PR does not rewrite an external runner's configuration.
 
 ## Launch
 
 Use the Python environment containing the CUDA build of PyTorch, FlashInfer,
-and this checkout's SGLang dependencies. Pass the model and memory settings
-appropriate to the checkpoint and GPU:
+and this checkout's SGLang dependencies. The optional example launcher selects
+the single-flight measurement profile used by the local probes. Pass the model
+and memory settings appropriate to the checkpoint and GPU:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHON_BIN=/path/to/venv/bin/python \
@@ -62,7 +72,9 @@ The existing paper benchmark integration completed real generation and
 Full-prefix replay for Full, HiAgent, ACON, C2KV4, H2O, and SnapKV; persistent
 H2O/SnapKV also completed a second turn without full-history re-prefill.
 Those checks used the paper integration branch, including its separate
-telemetry and persistent-history fixes; this PR does not import that branch.
+telemetry and selection changes. This change ports only the CUDA loader cleanup
+and persistent-page ownership fixes, with focused CPU regressions; it does not
+import that branch's instrumentation or selection policy.
 
 RTX PRO 6000 Blackwell is SM120, which is included in FlashInfer 0.6.7's
 hardware support. Compile/download kernels for the target GPU; do not copy
@@ -75,3 +87,9 @@ be run on that GPU; the laptop checks do not supply a PRO 6000 speedup factor.
 The CUDA loader also collects temporary module cycles and releases unused
 allocator blocks after loading weights, before KV-pool sizing. This avoids
 counting lingering FP32-to-BF16 loader allocations as live model weights.
+
+Persistent H2O/SnapKV pages remain request/session-owned in both multi-round
+chunk stashing and the unfinished-request cache path. They are not inserted into
+radix: eviction may rewrite or free them. This prevents stale tree references
+and negative session accounting after compaction while retaining ordinary C2KV
+protected-prefix behavior.
