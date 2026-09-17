@@ -474,7 +474,12 @@ class _PaperTelemetry:
         }
 
     def _finish_locked(
-        self, *, req: Any = None, success: bool = True, error: Optional[str] = None
+        self,
+        *,
+        req: Any = None,
+        success: bool = True,
+        error: Optional[str] = None,
+        metric_overrides: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         active = self._active
         if active is None:
@@ -508,6 +513,7 @@ class _PaperTelemetry:
         final_nvml = final.get("nvml_process_bytes")
         peak_kv = active["peak"]["kv"]
         evictable_peak_tokens = _as_int(active.get("cached_evictable_peak_tokens"))
+        duration_ns = final["monotonic_ns"] - active["started_ns"]
         metrics = {
             # Gist encoding is a separate synchronous scheduler request.  A
             # normal generation row contributes zero to the additive decision
@@ -575,6 +581,10 @@ class _PaperTelemetry:
             ),
             **semantics,
         }
+        if active["kind"] == "c2kv_extract":
+            metrics["extraction_duration_ns"] = duration_ns
+        if metric_overrides:
+            metrics.update(metric_overrides)
         result = {
             "schema_version": 1,
             "outer_request_id": active["outer_request_id"],
@@ -590,7 +600,7 @@ class _PaperTelemetry:
             "generation_start": active.get("generation_start"),
             "final": final,
             "phases": active["phases"],
-            "duration_ns": final["monotonic_ns"] - active["started_ns"],
+            "duration_ns": duration_ns,
         }
         self._completed[active["server_request_id"]] = result
         self._completed = dict(list(self._completed.items())[-128:])
@@ -604,12 +614,22 @@ class _PaperTelemetry:
         return result
 
     def finish(
-        self, *, req: Any = None, success: bool = True, error: Optional[str] = None
+        self,
+        *,
+        req: Any = None,
+        success: bool = True,
+        error: Optional[str] = None,
+        metric_overrides: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not enabled():
             return None
         with self._lock:
-            return self._finish_locked(req=req, success=success, error=error)
+            return self._finish_locked(
+                req=req,
+                success=success,
+                error=error,
+                metric_overrides=metric_overrides,
+            )
 
     def report(self, req: Any, finalize: bool) -> Optional[Dict[str, Any]]:
         if not enabled():
@@ -675,26 +695,23 @@ def measure_synchronous_request(kind: str, default_phase: str):
             except Exception as exc:
                 finish_request(success=False, error=str(exc))
                 raise
+            metric_overrides = None
+            if kind == "c2kv_extract":
+                metric_overrides = {
+                    "gist_generation_duration_ns": getattr(
+                        output, "gist_generation_duration_ns", None
+                    ),
+                    "cache_hit": bool(getattr(output, "cache_hit", False)),
+                }
             result = finish_request(
                 success=bool(getattr(output, "success", True)),
                 error=getattr(output, "error", None) or None,
+                metric_overrides=metric_overrides,
             )
             if result is not None:
                 if kind == "c2kv_extract":
                     extraction_duration_ns = result.get("duration_ns")
-                    gist_generation_duration_ns = getattr(
-                        output, "gist_generation_duration_ns", None
-                    )
                     output.extraction_duration_ns = extraction_duration_ns
-                    result["metrics"]["extraction_duration_ns"] = (
-                        extraction_duration_ns
-                    )
-                    result["metrics"]["gist_generation_duration_ns"] = (
-                        gist_generation_duration_ns
-                    )
-                    result["metrics"]["cache_hit"] = bool(
-                        getattr(output, "cache_hit", False)
-                    )
                 output.paper_measurement = result
             return output
 

@@ -300,17 +300,16 @@ def test_chunk_cache_without_radix_reports_zero_evictable(monkeypatch):
     assert result["metrics"]["request_peak_resident_kv_tokens"] == 35
 
 
-def test_extract_wrapper_reports_cache_miss_only_gist_duration(monkeypatch):
-    reports = [
-        {"duration_ns": 101, "metrics": {}},
-        {"duration_ns": 202, "metrics": {}},
-    ]
-    monkeypatch.setattr(paper_telemetry, "start_request", lambda **kwargs: None)
-    monkeypatch.setattr(
-        paper_telemetry,
-        "finish_request",
-        lambda **kwargs: reports.pop(0),
-    )
+def test_extract_wrapper_persists_cache_miss_only_gist_duration(
+    monkeypatch, tmp_path
+):
+    log_path = tmp_path / "extract.jsonl"
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY_LOG", str(log_path))
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4)
+    monkeypatch.setattr(paper_telemetry, "start_request", telemetry.start)
+    monkeypatch.setattr(paper_telemetry, "finish_request", telemetry.finish)
 
     class Handler:
         @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
@@ -343,15 +342,23 @@ def test_extract_wrapper_reports_cache_miss_only_gist_duration(monkeypatch):
     miss_result = Handler().extract(request, miss)
     hit_result = Handler().extract(request, hit)
 
-    assert miss_result.extraction_duration_ns == 101
-    assert miss_result.paper_measurement["metrics"] == {
-        "extraction_duration_ns": 101,
-        "gist_generation_duration_ns": 77,
-        "cache_hit": False,
-    }
-    assert hit_result.extraction_duration_ns == 202
-    assert hit_result.paper_measurement["metrics"] == {
-        "extraction_duration_ns": 202,
-        "gist_generation_duration_ns": 0,
-        "cache_hit": True,
-    }
+    persisted = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert (
+        miss_result.extraction_duration_ns
+        == miss_result.paper_measurement["duration_ns"]
+    )
+    assert (
+        hit_result.extraction_duration_ns
+        == hit_result.paper_measurement["duration_ns"]
+    )
+    for report, expected_duration, expected_hit in (
+        (miss_result.paper_measurement, 77, False),
+        (hit_result.paper_measurement, 0, True),
+        (persisted[0], 77, False),
+        (persisted[1], 0, True),
+    ):
+        assert report["metrics"]["extraction_duration_ns"] == report["duration_ns"]
+        assert report["metrics"]["gist_generation_duration_ns"] == expected_duration
+        assert report["metrics"]["cache_hit"] is expected_hit
