@@ -1169,6 +1169,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
             torch.npu.empty_cache()
+        elif self.device == "cuda":
+            # Release temporary loader/module cycles before sizing the KV pool.
+            # FP32 tensors converted to BF16 can otherwise survive until an
+            # unrelated Python garbage-collection cycle.
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
