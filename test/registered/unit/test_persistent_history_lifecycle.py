@@ -163,6 +163,80 @@ def test_ledger_rejects_duplicate_and_resurrected_old_positions():
         ledger.compact_positions([0, 1, 5], 1, 3, [0, 0])
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_persistent_history_unfinished_kv_stays_out_of_radix_tree(chunked):
+    cache_unfinished = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "cache_unfinished_req",
+        {"torch": torch, "Req": SimpleNamespace, "_is_streaming": lambda _: True},
+    )
+    row = torch.arange(400, 800).reshape(1, 400)
+    owner = SimpleNamespace(
+        _is_persistent_history_req=lambda _: True,
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        inner=SimpleNamespace(
+            cache_unfinished_req=lambda *args, **kwargs: pytest.fail(
+                "persistent history pages must not enter radix"
+            )
+        ),
+    )
+    req = SimpleNamespace(
+        req_pool_idx=0, fill_ids=list(range(134)),
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        cache_protected_len=256,
+    )
+    cache_unfinished(owner, req, chunked=chunked)
+    assert req.cache_protected_len == 0
+    assert req.prefix_indices.tolist() == list(range(400, 534))
+
+
+def test_chunked_persistent_history_preserves_session_ownership_after_compaction():
+    stash = method(
+        ROOT / "python/sglang/srt/managers/scheduler.py",
+        "Scheduler", "stash_chunked_request",
+        {"torch": torch, "Req": SimpleNamespace},
+    )
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.arange(400, 1200).reshape(1, 800)
+        ),
+        tree_cache=SimpleNamespace(
+            cache_unfinished_req=lambda *args, **kwargs: pytest.fail(
+                "multi-round stash must not enter tree cache"
+            )
+        ),
+    )
+    req = SimpleNamespace(
+        c2kv_rounds=[object(), object()], c2kv_round_idx=0,
+        req_pool_idx=0, kv_committed_len=256,
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        already_computed=0, cache_protected_len=999,
+        c2kv_kv_memory_hint={"persistent_history_session": {"enabled": True}},
+    )
+    stash(owner, req)
+    assert req.prefix_indices.tolist() == list(range(400, 656))
+    assert req.already_computed == 256
+    assert req.cache_protected_len == 0
+
+    # Once eviction shrinks the prompt, all remaining pages still belong to
+    # the session. The stale 256-token prefix previously produced -122 here.
+    session_held = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "session_held_tokens",
+        {"ceil_align": lambda value, page: ((value + page - 1) // page) * page},
+    )
+    slot = SimpleNamespace(
+        is_holding_kv=True, kv_allocated_len=134,
+        cache_protected_len=req.cache_protected_len,
+    )
+    assert session_held(SimpleNamespace(slots={"history": slot}, page_size=1)) == 134
+
+    # Ordinary C2KV keeps its existing protected-prefix behavior.
+    req.c2kv_kv_memory_hint = {}
+    stash(owner, req)
+    assert req.cache_protected_len == 256
+
+
 def test_decode_cleanup_never_frees_prompt_pages_at_nonzero_allocator_offset():
     discard = method(CACHE / "session_aware_cache.py", "SessionAwareCache",
                      "_discard_persistent_decode_suffix", {"torch": torch, "Req": SimpleNamespace})

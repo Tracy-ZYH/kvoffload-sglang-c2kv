@@ -528,6 +528,15 @@ class SessionAwareCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):
+            if self._is_persistent_history_req(req):
+                # Physical eviction can rewrite/free these pages. Keep them
+                # request/session-owned instead of inserting them into radix.
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ]
+                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                req.cache_protected_len = 0
+                return
             # in chunked_prefill for streaming, we skip the stash path which triggers radix.
             # only the last chunk in first turn trigger a full prompt radix insert.
             if kwargs.get("chunked", False):
