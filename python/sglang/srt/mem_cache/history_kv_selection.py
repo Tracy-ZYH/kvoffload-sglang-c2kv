@@ -240,6 +240,71 @@ def _pool_snapkv_scores(
     return pooled[..., : scores.shape[-1]]
 
 
+def pool_snapkv_scores_by_position(
+    scores: torch.Tensor,
+    canonical_positions: Sequence[int],
+    kernel_size: int,
+    pooling: str,
+) -> torch.Tensor:
+    """Pool SnapKV scores without bridging gaps left by persistent eviction."""
+    positions = [int(position) for position in canonical_positions]
+    if len(positions) != scores.shape[-1]:
+        raise ValueError(
+            "canonical_positions must match the SnapKV score length, got "
+            f"{len(positions)} positions for {scores.shape[-1]} scores"
+        )
+    if any(right <= left for left, right in zip(positions, positions[1:])):
+        raise ValueError("canonical_positions must be strictly increasing")
+    if kernel_size <= 0:
+        raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+    pooling = pooling.strip().lower()
+    if pooling not in {"avgpool", "maxpool"}:
+        raise ValueError(
+            f"SnapKV pooling must be 'avgpool' or 'maxpool', got {pooling!r}"
+        )
+    if kernel_size == 1 or scores.shape[-1] <= 1:
+        return scores
+    if all(right == left + 1 for left, right in zip(positions, positions[1:])):
+        return _pool_snapkv_scores(scores, kernel_size, pooling)
+
+    position_to_index = {position: index for index, position in enumerate(positions)}
+    padding = kernel_size // 2
+    offsets = range(-padding, kernel_size - padding)
+    if pooling == "avgpool":
+        pooled = torch.zeros_like(scores)
+    else:
+        pooled = torch.full_like(scores, float("-inf"))
+
+    for offset in offsets:
+        source_indices = [
+            position_to_index.get(position + offset, -1) for position in positions
+        ]
+        present = torch.tensor(
+            [index >= 0 for index in source_indices],
+            dtype=torch.bool,
+            device=scores.device,
+        )
+        safe_indices = torch.tensor(
+            [max(index, 0) for index in source_indices],
+            dtype=torch.long,
+            device=scores.device,
+        )
+        values = scores.index_select(-1, safe_indices)
+        if pooling == "avgpool":
+            pooled = pooled + torch.where(present, values, torch.zeros_like(values))
+        else:
+            pooled = torch.maximum(
+                pooled,
+                torch.where(
+                    present,
+                    values,
+                    torch.full_like(values, float("-inf")),
+                ),
+            )
+
+    return pooled / kernel_size if pooling == "avgpool" else pooled
+
+
 def select_snapkv_indices(
     scores: torch.Tensor,
     *,

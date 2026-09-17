@@ -1169,6 +1169,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
             torch.npu.empty_cache()
+        elif self.device == "cuda":
+            # Collect temporary loader/module cycles before sizing the KV pool.
+            # FP32 checkpoint tensors cast to BF16 may otherwise remain alive
+            # until a later, unrelated Python garbage-collection cycle.
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
@@ -1240,6 +1248,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        if os.environ.get("C2KV_PAPER_TELEMETRY") == "1" and self.device == "cuda":
+            parameter_bytes = {}
+            for parameter in self.model.parameters():
+                dtype_name = str(parameter.dtype)
+                parameter_bytes[dtype_name] = (
+                    parameter_bytes.get(dtype_name, 0)
+                    + parameter.numel() * parameter.element_size()
+                )
+            buffer_storages = {}
+            for buffer in self.model.buffers():
+                storage = buffer.untyped_storage()
+                buffer_storages[(str(buffer.device), storage.data_ptr())] = (
+                    storage.nbytes()
+                )
+            logger.info(
+                "Paper model footprint: parameter_bytes=%s unique_buffer_storage_bytes=%s allocated_bytes=%s reserved_bytes=%s",
+                parameter_bytes,
+                sum(buffer_storages.values()),
+                torch.cuda.memory_allocated(self.gpu_id),
+                torch.cuda.memory_reserved(self.gpu_id),
+            )
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()

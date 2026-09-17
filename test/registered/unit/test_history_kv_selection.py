@@ -232,6 +232,60 @@ def test_snapkv_avgpool_and_maxpool_take_distinct_paths():
     assert average[0, -2:].tolist() == maximum[0, -2:].tolist() == [8, 9]
 
 
+@pytest.mark.parametrize("pooling", ["avgpool", "maxpool"])
+@pytest.mark.parametrize("kernel_size", [2, 3, 4, 5])
+def test_snapkv_position_pooling_matches_native_pooling_without_gaps(
+    pooling, kernel_size
+):
+    scores = torch.tensor(
+        [[-2.0, 1.0, 4.0, -1.0, 3.0, 2.0, 5.0],
+         [6.0, -3.0, 2.0, 8.0, 0.0, 7.0, 1.0]]
+    )
+
+    expected = history._pool_snapkv_scores(scores, kernel_size, pooling)
+    actual = history.pool_snapkv_scores_by_position(
+        scores, range(20, 27), kernel_size, pooling
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_snapkv_position_pooling_gap_changes_selected_set():
+    scores = torch.tensor([8.0, 0.0, 10.0, 0.0, 0.0])
+    physical = history._pool_snapkv_scores(scores, 3, "avgpool")
+    canonical = history.pool_snapkv_scores_by_position(
+        scores, [0, 1, 100, 101, 102], 3, "avgpool"
+    )
+
+    assert set(torch.topk(physical, 2).indices.tolist()) == {1, 2}
+    assert set(torch.topk(canonical, 2).indices.tolist()) == {2, 3}
+    assert canonical[1].item() == pytest.approx(8.0 / 3.0)
+
+
+def test_snapkv_position_avgpool_counts_missing_canonical_neighbors_as_padding():
+    pooled = history.pool_snapkv_scores_by_position(
+        torch.tensor([6.0, 9.0]), [10, 12], 3, "avgpool"
+    )
+
+    torch.testing.assert_close(pooled, torch.tensor([2.0, 3.0]))
+
+
+def test_snapkv_position_maxpool_does_not_replace_missing_neighbors_with_zero():
+    pooled = history.pool_snapkv_scores_by_position(
+        torch.tensor([-6.0, -9.0]), [10, 12], 3, "maxpool"
+    )
+
+    torch.testing.assert_close(pooled, torch.tensor([-6.0, -9.0]))
+
+
+@pytest.mark.parametrize("positions", [[0, 0], [1, 0]])
+def test_snapkv_position_pooling_rejects_non_increasing_positions(positions):
+    with pytest.raises(ValueError, match="strictly increasing"):
+        history.pool_snapkv_scores_by_position(
+            torch.tensor([1.0, 2.0]), positions, 3, "avgpool"
+        )
+
+
 def test_h2o_recent_fraction_is_not_capped_at_64_tokens():
     scores = torch.arange(200, dtype=torch.float32).repeat(2, 1)
     selected = history.select_h2o_prefill_indices(

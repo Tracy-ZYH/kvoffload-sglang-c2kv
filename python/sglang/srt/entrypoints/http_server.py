@@ -1541,6 +1541,10 @@ async def v1_c2kv_extract(
             input_ids=input_ids,
             input_text=request.text,
             compression_ratio=request.compression_ratio,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
         )
         return C2KVExtractResponse(
             key_hash=result.key_hash,
@@ -1548,6 +1552,7 @@ async def v1_c2kv_extract(
             original_seq_len=result.original_seq_len,
             success=result.success,
             error=result.error or None,
+            paper_measurement=result.paper_measurement,
         )
     except Exception as e:
         return C2KVExtractResponse(
@@ -1868,6 +1873,10 @@ async def v1_c2kv_repair_extract(
                 history_kv_recovery_relative_indices),
             kv_reuse_method=kv_reuse_method,
             cacheblend=cacheblend_cfg,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
         )
         return C2KVRepairExtractResponse(
             key_hash=result.key_hash,
@@ -1883,6 +1892,7 @@ async def v1_c2kv_repair_extract(
                 if result.serving_kv_buffer_shape is not None
                 else None
             ),
+            paper_measurement=result.paper_measurement,
             history_kv_method=result.history_kv_method,
             requested_span_tokens=result.requested_span_tokens,
             selected_token_count=result.selected_token_count,

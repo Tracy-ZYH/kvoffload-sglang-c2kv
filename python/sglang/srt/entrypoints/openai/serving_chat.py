@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import time
 import uuid
 from http import HTTPStatus
@@ -193,6 +194,17 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         delta = full_prompt_ids[len(previous) :]
+        if not delta and isinstance(config, dict):
+            from sglang.srt.mem_cache.history_kv_lifecycle import (
+                ATTENTION_SELECTION_METHODS,
+            )
+
+            method = str(config.get("method") or "").strip().lower()
+            if method in ATTENTION_SELECTION_METHODS:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SELECTION_REQUIRES_NEW_QUERY: "
+                    f"method={method}, session_id={session_id}"
+                )
         # Session.create_req must not append last_req.output_ids. Those raw
         # decode tokens are not necessarily the canonical serialization of an
         # OpenAI tool call; the delta above contains that serialization.
@@ -648,43 +660,157 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"history_message_count={count}, messages={len(request.messages)}"
             )
 
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid history_start_message_count: {start_count!r}"
+            ) from exc
+        if not (0 <= start_count < count):
+            raise ValueError(
+                "Invalid physical history start boundary: "
+                f"history_start_message_count={start_count}, "
+                f"history_message_count={count}"
+            )
+
         tools = self._chat_template_tools(request)
         completed = list(request.messages[:count])
-        with_tools = self._c2kv_chat_template_input_ids(request, completed, tools)
-        without_tools = self._c2kv_chat_template_input_ids(request, completed, None)
-        bos_id = getattr(self.tokenizer_manager.tokenizer, "bos_token_id", None)
-        while without_tools and bos_id is not None and without_tools[0] == bos_id:
-            without_tools = without_tools[1:]
-        if not without_tools:
-            raise ValueError("Cannot resolve an empty physical history token span")
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(
+            request, completed, tools
+        )
+        if not completed_ids:
+            raise ValueError("Cannot resolve an empty completed-history prefix")
 
         prefix_start = 0
-        if prompt_ids[: len(with_tools)] != with_tools:
-            prefix_start = self._find_token_subsequence(prompt_ids, with_tools)
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
         if prefix_start < 0:
             raise ValueError(
                 "Server chat template prefix is not present in the final prompt; "
                 "refusing physical history KV eviction."
             )
-        history_relative_start = self._find_token_subsequence(with_tools, without_tools)
-        if history_relative_start < 0:
-            raise ValueError(
-                "Cannot isolate completed history from the server tool prologue; "
-                "refusing physical history KV eviction."
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools
+            )
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Protected system/tool prefix is not a prefix of completed "
+                    "history in the server chat template; refusing physical "
+                    "history KV eviction."
+                )
+            history_relative_start = len(protected_ids)
+        else:
+            history_relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools
             )
         history_start = prefix_start + history_relative_start
-        history_end = history_start + len(without_tools)
-        if history_end > len(prompt_ids) or prompt_ids[history_start:history_end] != without_tools:
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
             raise ValueError(
-                "Resolved physical history range does not match the server prompt IDs; "
-                "refusing physical history KV eviction."
+                "Resolved physical history range is empty/outside the server prompt: "
+                f"start={history_start}, end={history_end}, prompt={len(prompt_ids)}"
             )
+        span_tokens = history_end - history_start
+        if config.get("target_tokens") is None:
+            ratio = config.get("retention_ratio")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Physical history KV eviction requires target_tokens or "
+                    "retention_ratio"
+                ) from exc
+            if not 0.0 < ratio <= 1.0:
+                raise ValueError(
+                    f"Invalid physical history retention_ratio: {ratio!r}"
+                )
+            target_tokens = max(
+                1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
+            )
+            target_source = "server_tokenized_retention_ratio"
+        else:
+            target_tokens = max(
+                1, min(span_tokens, int(config["target_tokens"]))
+            )
+            target_source = "absolute_request_budget"
         config["history_start"] = history_start
         config["history_end"] = history_end
+        config["target_tokens"] = target_tokens
+        config["target_tokens_source"] = target_source
         config["server_tokenized"] = True
         # The server owns the final chat template, so this is the only exact
         # full-history token count used by persistent physical accounting.
-        hint["full_equivalent_history_tokens"] = history_end - history_start
+        hint["full_equivalent_history_tokens"] = span_tokens
+
+    def _resolve_paper_history_token_count(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> Optional[int]:
+        """Resolve the common history denominator in the server token frame."""
+
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("paper_measurement") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return None
+        count = config.get("history_message_count")
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            count = int(count)
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid paper measurement history boundary") from exc
+        if count == 0 and start_count == 0:
+            config.update(
+                history_start=0,
+                history_end=0,
+                history_full_kv_tokens=0,
+                server_tokenized=True,
+            )
+            return 0
+        if not (0 <= start_count < count <= len(request.messages)):
+            raise ValueError(
+                "Invalid paper measurement history boundary: "
+                f"start={start_count}, end={count}, messages={len(request.messages)}"
+            )
+        tools = self._chat_template_tools(request)
+        completed = list(request.messages[:count])
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(request, completed, tools)
+        prefix_start = 0
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
+        if prefix_start < 0:
+            raise ValueError(
+                "Paper measurement history prefix is absent from the final prompt"
+            )
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools
+            )
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Paper measurement protected prefix is not a history prefix"
+                )
+            relative_start = len(protected_ids)
+        else:
+            relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools
+            )
+        history_start = prefix_start + relative_start
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
+            raise ValueError("Paper measurement history range is empty or invalid")
+        config.update(
+            history_start=history_start,
+            history_end=history_end,
+            history_full_kv_tokens=history_end - history_start,
+            server_tokenized=True,
+        )
+        return history_end - history_start
 
     def _convert_to_internal_request(
         self,
@@ -707,6 +833,41 @@ class OpenAIServingChat(OpenAIServingBase):
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
+        # Resolve measurement denominators before _compute_c2kv_segments removes
+        # annotated history messages. This copy follows the same server chat
+        # template and therefore gives every arm one canonical full-history
+        # token frame, independent of its active compressed representation.
+        paper_whole_full_kv_tokens = None
+        paper_history_full_kv_tokens = None
+        paper_history_active_kv_tokens = None
+        paper_canonical_full_source = False
+        paper_denominator_tokenization_duration_ns = None
+        paper_hint = request.c2kv_kv_memory_hint
+        if (
+            not is_multimodal
+            and isinstance(paper_hint, dict)
+            and isinstance(paper_hint.get("paper_measurement"), dict)
+        ):
+            measurement_config = paper_hint["paper_measurement"]
+            paper_canonical_full_source = bool(
+                measurement_config.get("canonical_full_source", False)
+            )
+            denominator_start_ns = time.monotonic_ns()
+            canonical_request = copy.deepcopy(request)
+            canonical_processed = self._process_messages(canonical_request, False)
+            if isinstance(canonical_processed.prompt_ids, list):
+                resolved_history_tokens = self._resolve_paper_history_token_count(
+                    canonical_request, canonical_processed.prompt_ids
+                )
+                if paper_canonical_full_source:
+                    paper_whole_full_kv_tokens = len(canonical_processed.prompt_ids)
+                    paper_history_full_kv_tokens = resolved_history_tokens
+                else:
+                    paper_history_active_kv_tokens = resolved_history_tokens
+            paper_denominator_tokenization_duration_ns = (
+                time.monotonic_ns() - denominator_start_ns
+            )
+
         # Compute C2KV segment boundaries before the chat template is applied
         c2kv_segments = self._compute_c2kv_segments(request)
 
@@ -714,6 +875,12 @@ class OpenAIServingChat(OpenAIServingBase):
         processed_messages = self._process_messages(request, is_multimodal)
         if not is_multimodal and isinstance(processed_messages.prompt_ids, list):
             self._resolve_history_kv_eviction_range(request, processed_messages.prompt_ids)
+            if paper_history_full_kv_tokens is None and isinstance(
+                request.c2kv_kv_memory_hint, dict
+            ):
+                paper_history_full_kv_tokens = request.c2kv_kv_memory_hint.get(
+                    "full_equivalent_history_tokens"
+                )
             input_ids, persistent_session_id, canonical_prompt_ids = (
                 self._prepare_persistent_history_delta(
                     request, list(processed_messages.prompt_ids)
@@ -774,6 +941,25 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
+            c2kv_outer_request_id=(
+                raw_request.headers.get("X-C2KV-Measurement-Request-Id")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_measurement_phase=(
+                raw_request.headers.get("X-C2KV-Measurement-Phase")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_paper_whole_full_kv_tokens=(
+                paper_whole_full_kv_tokens
+            ),
+            c2kv_paper_history_full_kv_tokens=paper_history_full_kv_tokens,
+            c2kv_paper_history_active_kv_tokens=paper_history_active_kv_tokens,
+            c2kv_paper_canonical_full_source=paper_canonical_full_source,
+            c2kv_paper_denominator_tokenization_duration_ns=(
+                paper_denominator_tokenization_duration_ns
+            ),
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,

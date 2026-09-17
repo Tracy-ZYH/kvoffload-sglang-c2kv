@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.history_kv_selection import (
     summarize_headwise_indices,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -384,7 +385,10 @@ class Qwen3Attention(nn.Module):
             if method in {"", "streamingllm"}:
                 continue
             recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
-            q_end = min(extend_len, max(1, history_end - prefix_len))
+            if prefix_len > 0 and history_end <= prefix_len:
+                q_end = extend_len
+            else:
+                q_end = min(extend_len, max(1, history_end - prefix_len))
             q_start = max(0, q_end - recent_window)
             if q_start >= q_end:
                 continue
@@ -435,7 +439,14 @@ class Qwen3Attention(nn.Module):
             ).view(1, -1, 1)
             ledger = config.get("resident_logical_positions")
             if ledger is not None:
-                key_positions = torch.tensor(ledger[:key_end], device=logits.device)
+                prefix_positions = list(ledger[:prefix_len])
+                extend_positions = flat_positions[
+                    token_start : token_start + q_end
+                ].tolist()
+                key_positions = torch.tensor(
+                    prefix_positions + extend_positions,
+                    device=logits.device,
+                )
             elif prefix_len:
                 # First-request chunked prefill has not evicted anything yet.
                 key_positions = torch.arange(key_end, device=logits.device)
@@ -454,6 +465,10 @@ class Qwen3Attention(nn.Module):
                     "history_start": history_start,
                     "history_end": history_end,
                     "history_len": history_end - history_start,
+                    "query_tokens": q_end - q_start,
+                    "selection_query_start": config.get("selection_query_start"),
+                    "selection_query_end": config.get("selection_query_end"),
+                    "selection_query_phase": config.get("selection_query_phase"),
                     "layers": [],
                 },
             )
@@ -1371,6 +1386,14 @@ class Qwen3ForCausalLM(nn.Module):
                 ratio=ratio,
             )
             gist_key_values.append(layer_kv)
+            # These are cloned K/V payload tensors. Logical bytes therefore
+            # exclude the fused QKV backing storage; CUDA allocator peaks still
+            # account for the full Q/K/V workspace separately.
+            paper_telemetry.sample(
+                "forward_with_gist",
+                tensors=gist_key_values,
+                temporary_kv=True,
+            )
 
         gist_position_ids = position_ids[:, -gist_len:].contiguous()
 
@@ -1557,6 +1580,11 @@ class Qwen3ForCausalLM(nn.Module):
                 else k[span_start:span_end].contiguous().clone()
             )
             raw_key_values.append((repair_k_span, v_span))
+            paper_telemetry.sample(
+                "forward_repair_kv",
+                tensors=raw_key_values,
+                temporary_kv=True,
+            )
 
             q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
             k_attn = k.view(

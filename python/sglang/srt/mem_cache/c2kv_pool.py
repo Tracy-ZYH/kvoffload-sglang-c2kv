@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.observability import paper_telemetry
+
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.c2kv_semantics import compute_gist_cache_key
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -328,6 +330,9 @@ class C2KVPool:
         )
         self._cache[key_hash] = entry
         self._current_tokens += gist_len
+        paper_telemetry.sample(
+            "c2kv_pool_store", tensors=gist_key_values, temporary_kv=True
+        )
         return entry
 
     def store_repair(
@@ -440,6 +445,9 @@ class C2KVPool:
         )
         self._cache[key_hash] = entry
         self._current_tokens += token_len
+        paper_telemetry.sample(
+            "c2kv_pool_store_repair", tensors=key_values, temporary_kv=True
+        )
         return entry
 
     def get(self, key_hash: str) -> Optional[C2KVEntry]:
@@ -501,3 +509,4 @@ class C2KVPool:
         self._cache.clear()
         self._pin_counts.clear()
         self._current_tokens = 0
+        paper_telemetry.sample("c2kv_pool_clear")

@@ -1581,6 +1581,7 @@ class C2KVExtractResponse(BaseModel):
     original_seq_len: int
     success: bool = True
     error: Optional[str] = None
+    paper_measurement: Optional[Dict[str, Any]] = None
 
 
 class C2KVRepairExtractRequest(BaseModel):
@@ -1662,6 +1663,7 @@ class C2KVRepairExtractResponse(BaseModel):
     # recomputed_relative_indices, effective_recomp_ratio, config).
     kv_reuse_method: Optional[str] = None
     cacheblend: Optional[Dict[str, Any]] = None
+    paper_measurement: Optional[Dict[str, Any]] = None
     # True when K was captured post-RoPE (serving_cache source, or the
     # "rotated" storage form) and can only be placed at its original
     # positions; False = pre-RoPE, re-rotatable (required by append_tail).

@@ -6,6 +6,15 @@ ledger independent of token IDs detects resurrection even for repeated text.
 import hashlib
 
 
+ATTENTION_SELECTION_METHODS = {
+    "h2o",
+    "snapkv",
+    "snapkv_persistent",
+    "pyramid",
+    "pyramidkv",
+}
+
+
 def position_summary(positions):
     positions = list(positions)
     return {"count": len(positions), "min": min(positions, default=None),
@@ -30,6 +39,31 @@ def physical_history_range(positions, history_start, history_end):
         raise ValueError("PERSISTENT_HISTORY_INVALID_CANONICAL_BOUNDARY")
     return (sum(p < history_start for p in positions),
             sum(p < history_end for p in positions))
+
+
+def selection_query_window(
+    method, prefix_len, history_end, prompt_len, recent_window
+):
+    """Return newly-prefilled tail queries used to score resident history."""
+    method = str(method or "").strip().lower()
+    if method not in ATTENTION_SELECTION_METHODS:
+        return None
+    prefix_len = int(prefix_len)
+    history_end = int(history_end)
+    prompt_len = int(prompt_len)
+    recent_window = max(1, int(recent_window or 64))
+    if not 0 <= prefix_len <= prompt_len:
+        raise ValueError("HISTORY_KV_INVALID_SELECTION_PREFIX")
+    if not 0 <= history_end <= prompt_len:
+        raise ValueError("HISTORY_KV_INVALID_SELECTION_HISTORY_END")
+    if prompt_len <= prefix_len:
+        raise ValueError("HISTORY_KV_SELECTION_REQUIRES_NEW_QUERY")
+
+    query_end = prompt_len
+    query_start = max(prefix_len, history_end, query_end - recent_window)
+    if query_start >= query_end:
+        query_start = query_end - 1
+    return query_start, query_end
 
 
 def compact_positions(positions, history_start, history_end, selected):

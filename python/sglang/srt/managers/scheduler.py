@@ -69,6 +69,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
@@ -200,6 +201,9 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache, release_kv_cache
+from sglang.srt.mem_cache.history_kv_selection import (
+    pool_snapkv_scores_by_position,
+)
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -264,6 +268,17 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 ENABLE_C2KV_LOGGING = get_bool_env_var("SGLANG_ENABLE_C2KV_LOGGING")
 
 _is_npu = is_npu()
+
+
+def _c2kv_pending_result_requires_early_process(req) -> bool:
+    """Whether overlap scheduling must apply this prefill result first."""
+    rounds = getattr(req, "c2kv_rounds", None)
+    round_idx = int(getattr(req, "c2kv_round_idx", 0) or 0)
+    if rounds is None or not 0 <= round_idx < len(rounds):
+        return False
+    return round_idx < len(rounds) - 1 or bool(
+        getattr(rounds[round_idx], "post_history_kv_eviction", False)
+    )
 
 
 @dataclass
@@ -908,6 +923,12 @@ class Scheduler(
                     "projection mask. Base-projection batches remain graph eligible."
                 )
 
+        paper_telemetry.configure(
+            self.token_to_kv_pool_allocator,
+            self.c2kv_pool,
+            self._bytes_per_kv_token() or 0,
+        )
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -1468,10 +1489,14 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        def pop_and_process(*, sync_c2kv_early_batch=False):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if sync_c2kv_early_batch and self.last_batch is not None:
+                self.last_batch.seq_lens = tmp_batch.seq_lens
+                self.last_batch.seq_lens_cpu = tmp_batch.seq_lens_cpu
+                self.last_batch.seq_lens_sum = tmp_batch.seq_lens_sum
 
         while True:
             # Receive requests
@@ -1487,14 +1512,13 @@ class Scheduler(
                 self.last_batch
                 and len(self.result_queue) > 0
                 and any(
-                    getattr(r, "c2kv_rounds", None) is not None
-                    and getattr(r, "c2kv_round_idx", 0)
-                    < len(r.c2kv_rounds) - 1
+                    _c2kv_pending_result_requires_early_process(r)
                     for r in self.last_batch.reqs
                 )
+
             )
             if c2kv_early_process:
-                pop_and_process()
+                pop_and_process(sync_c2kv_early_batch=True)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1875,6 +1899,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        paper_telemetry.start_request(
+            server_request_id=recv_req.rid,
+            outer_request_id=recv_req.c2kv_outer_request_id,
+            phase=recv_req.c2kv_measurement_phase or "prefill",
+            kind="generation",
+            whole_full_kv_tokens=recv_req.c2kv_paper_whole_full_kv_tokens,
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -1978,6 +2009,24 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        req.c2kv_outer_request_id = recv_req.c2kv_outer_request_id
+        req.c2kv_measurement_phase = recv_req.c2kv_measurement_phase
+        req.c2kv_paper_whole_full_kv_tokens = (
+            recv_req.c2kv_paper_whole_full_kv_tokens
+        )
+        req.c2kv_paper_history_full_kv_tokens = (
+            recv_req.c2kv_paper_history_full_kv_tokens
+        )
+        req.c2kv_paper_history_active_kv_tokens = (
+            recv_req.c2kv_paper_history_active_kv_tokens
+        )
+        req.c2kv_paper_canonical_full_source = (
+            recv_req.c2kv_paper_canonical_full_source
+        )
+        req.c2kv_paper_denominator_tokenization_duration_ns = (
+            recv_req.c2kv_paper_denominator_tokenization_duration_ns
+        )
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2194,6 +2243,7 @@ class Scheduler(
         ):
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
+    @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
         from sglang.srt.managers.io_struct import C2KVExtractReqOutput
 
@@ -2427,6 +2477,7 @@ class Scheduler(
             original_seq_len=original_seq_len,
         )
 
+    @paper_telemetry.measure_synchronous_request("c2kv_repair_extract", "recovery")
     def handle_repair_extract_request(
         self, recv_req: "TokenizedRepairExtractReqInput"
     ):
@@ -3021,15 +3072,57 @@ class Scheduler(
             )
             return None
 
-        rounds = [
-            C2KVPrefillRound(
-                original_input_ids[:history_end],
-                [],
-                post_history_kv_eviction=True,
+        from sglang.srt.mem_cache.history_kv_lifecycle import (
+            selection_query_window,
+        )
+
+        query_window = selection_query_window(
+            method,
+            0,
+            history_end,
+            original_len,
+            config.get("history_kv_recent_window"),
+        )
+        if query_window is None:
+            rounds = [
+                C2KVPrefillRound(
+                    original_input_ids[:history_end],
+                    [],
+                    post_history_kv_eviction=True,
+                )
+            ]
+            if history_end < original_len:
+                rounds.append(C2KVPrefillRound(original_input_ids[history_end:], []))
+        else:
+            query_start, query_end = query_window
+            rounds = []
+            if query_start > 0:
+                rounds.append(C2KVPrefillRound(original_input_ids[:query_start], []))
+            rounds.append(
+                C2KVPrefillRound(
+                    original_input_ids[query_start:query_end],
+                    [],
+                    post_history_kv_eviction=True,
+                )
             )
-        ]
-        if history_end < original_len:
-            rounds.append(C2KVPrefillRound(original_input_ids[history_end:], []))
+            config.update(
+                {
+                    "selection_query_start": query_start,
+                    "selection_query_end": query_end,
+                    "selection_query_tokens": query_end - query_start,
+                    "selection_query_phase": "new_tail_prefill_before_eviction",
+                }
+            )
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                report.update(
+                    {
+                        "selection_query_start": query_start,
+                        "selection_query_end": query_end,
+                        "selection_query_tokens": query_end - query_start,
+                        "selection_query_phase": "new_tail_prefill_before_eviction",
+                    }
+                )
 
         req.c2kv_rounds = rounds
         req.c2kv_round_idx = 0
@@ -3046,6 +3139,9 @@ class Scheduler(
             history_start=history_start,
             history_end=history_end,
             target_tokens=config.get("target_tokens"),
+            selection_query_start=config.get("selection_query_start"),
+            selection_query_end=config.get("selection_query_end"),
+            selection_query_tokens=config.get("selection_query_tokens"),
             round_lens=[len(round_info.tokens) for round_info in rounds],
         )
         return None
@@ -3056,9 +3152,34 @@ class Scheduler(
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
+        paper_telemetry.set_phase("selection")
+        score_info = getattr(req, "history_kv_selection_scores", None)
+        selection_query_tokens_observed = (
+            int(score_info.get("query_tokens") or 0)
+            if isinstance(score_info, dict)
+            else 0
+        )
         try:
             from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
 
+            method = str(config.get("method") or "").strip().lower()
+            if method in {
+                "snapkv",
+                "snapkv_persistent",
+                "h2o",
+                "pyramid",
+                "pyramidkv",
+            }:
+                expected_query_tokens = config.get("selection_query_tokens")
+                if (
+                    expected_query_tokens is not None
+                    and selection_query_tokens_observed != int(expected_query_tokens)
+                ):
+                    raise RuntimeError(
+                        "HISTORY_KV_SELECTION_QUERY_COVERAGE_MISMATCH: "
+                        f"expected={int(expected_query_tokens)}, "
+                        f"observed={selection_query_tokens_observed}"
+                    )
             evictor = PhysicalHistoryKVEvictor(
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
@@ -3086,6 +3207,9 @@ class Scheduler(
 
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
+            report["selection_query_tokens_observed"] = (
+                selection_query_tokens_observed
+            )
             report["history_kv_physical_eviction"] = (
                 result.as_dict() if result is not None else {"success": False, "error": error}
             )
@@ -3120,8 +3244,11 @@ class Scheduler(
                 )
 
         if result is None or not result.success:
+            req.persistent_history_eviction_failed = True
             req.to_finish = _FA(error or "Physical history KV eviction failed")
             req.check_finished()
+            paper_telemetry.sample("history_kv_eviction_failed")
+            paper_telemetry.set_phase("prefill")
             return False
 
         req.history_kv_eviction_result = result.as_dict()
@@ -3137,6 +3264,8 @@ class Scheduler(
             if not (0 <= history_start <= history_end <= len(virtual_ids)):
                 req.to_finish = _FA("PERSISTENT_HISTORY_ACTIVE_SEQUENCE_INVALID")
                 req.check_finished()
+                paper_telemetry.sample("history_kv_active_sequence_invalid")
+                paper_telemetry.set_phase("prefill")
                 return False
             active_input_ids = (
                 virtual_ids[:history_start]
@@ -3151,6 +3280,8 @@ class Scheduler(
                     f"committed_len={req.kv_committed_len}"
                 )
                 req.check_finished()
+                paper_telemetry.sample("history_kv_active_sequence_length_mismatch")
+                paper_telemetry.set_phase("prefill")
                 return False
             req.c2kv_persistent_active_input_ids = active_input_ids
             req.c2kv_virtual_input_ids = list(active_input_ids)
@@ -3196,6 +3327,8 @@ class Scheduler(
             req=req,
             **result.as_dict(),
         )
+        paper_telemetry.sample("history_kv_eviction_applied")
+        paper_telemetry.set_phase("prefill")
         return True
 
     def _select_history_kv_eviction_indices(self, req: "Req", config: dict) -> Optional[list[int]]:
@@ -3250,12 +3383,19 @@ class Scheduler(
             ledger = getattr(req, "history_kv_resident_positions", None)
             if config.get("persistent_session") and ledger is not None:
                 state = dict(getattr(req, "history_kv_score_state", {}) or {})
+                resident_positions = set(ledger)
                 for layer, scores in enumerate(layer_scores):
                     prior = state.get(layer, {})
                     positions = ledger[history_start:history_end]
                     updated = scores + torch.tensor([prior.get(p, 0.0) for p in positions])
                     layer_scores[layer] = updated
-                    state[layer] = dict(zip(positions, updated.tolist()))
+                    merged = {
+                        position: score
+                        for position, score in prior.items()
+                        if position in resident_positions
+                    }
+                    merged.update(zip(positions, updated.tolist()))
+                    state[layer] = merged
                 req.history_kv_score_state = state
                 config["h2o_score_state_mode"] = "cumulative_resident_recent_query_attention"
             recent_budget = max(
@@ -3287,14 +3427,19 @@ class Scheduler(
                 kernel = max(1, int(config.get("history_kv_kernel_size") or 1))
                 pooling = str(config.get("history_kv_pooling") or "avgpool").lower()
                 if kernel > 1 and past_scores.numel() > 1:
-                    fn = torch.nn.functional.max_pool1d if pooling == "maxpool" else torch.nn.functional.avg_pool1d
-                    pooled = fn(
-                        past_scores.view(1, 1, -1),
-                        kernel_size=kernel,
-                        stride=1,
-                        padding=kernel // 2,
-                    ).view(-1)
-                    past_scores = pooled[: past_scores.numel()]
+                    ledger = getattr(req, "history_kv_resident_positions", None)
+                    if ledger is None:
+                        canonical_positions = range(past_limit)
+                    else:
+                        canonical_positions = ledger[
+                            history_start : history_start + past_limit
+                        ]
+                    past_scores = pool_snapkv_scores_by_position(
+                        past_scores,
+                        canonical_positions,
+                        kernel,
+                        pooling,
+                    )
                 selected = _unique_sorted(_topk(past_scores, past_budget) + recent)
             else:
                 selected = recent
@@ -4623,7 +4768,21 @@ class Scheduler(
                 req.req_pool_idx, : req.kv_committed_len
             ].to(torch.int64)
             req.already_computed = req.kv_committed_len
-            req.cache_protected_len = len(req.prefix_indices)
+            hint = getattr(req, "c2kv_kv_memory_hint", None)
+            persistent_history = bool(
+                isinstance(hint, dict)
+                and isinstance(hint.get("persistent_history_session"), dict)
+                and hint["persistent_history_session"].get("enabled")
+            )
+            # Multi-round C2KV stashing bypasses SessionAwareCache.  Physical
+            # history requests keep these pages request/session-owned, so they
+            # must not be counted as a radix-protected prefix.  Otherwise the
+            # first 256-token chunk survives in cache_protected_len after the
+            # request is compacted to (for example) 134 resident tokens, and
+            # idle accounting reports session_held=134-256=-122.
+            req.cache_protected_len = (
+                0 if persistent_history else len(req.prefix_indices)
+            )
             return
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 

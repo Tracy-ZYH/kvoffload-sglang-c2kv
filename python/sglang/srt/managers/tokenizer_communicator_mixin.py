@@ -411,6 +411,8 @@ class TokenizerCommunicatorMixin:
         input_text: str,
         compression_ratio: int = 4,
         rid: Optional[str] = None,
+        outer_request_id: Optional[str] = None,
+        measurement_phase: Optional[str] = None,
     ) -> C2KVExtractReqOutput:
         """Run C2KV gist extraction via the scheduler."""
         import uuid
@@ -421,6 +423,8 @@ class TokenizerCommunicatorMixin:
             input_ids=input_ids,
             input_text=input_text,
             compression_ratio=compression_ratio,
+            c2kv_outer_request_id=outer_request_id,
+            c2kv_measurement_phase=measurement_phase,
         )
         return (await self.c2kv_extract_communicator(req))[0]
 
@@ -449,6 +453,8 @@ class TokenizerCommunicatorMixin:
         cacheblend: Optional[dict] = None,
         rid: Optional[str] = None,
         already_rotated: bool = False,
+        outer_request_id: Optional[str] = None,
+        measurement_phase: Optional[str] = None,
     ) -> C2KVRepairExtractReqOutput:
         """Run C2KV repair KV extraction via the scheduler.
 
@@ -491,6 +497,8 @@ class TokenizerCommunicatorMixin:
             history_kv_recovery_relative_indices=history_kv_recovery_relative_indices,
             kv_reuse_method=kv_reuse_method,
             cacheblend=cacheblend,
+            c2kv_outer_request_id=outer_request_id,
+            c2kv_measurement_phase=measurement_phase,
         )
         return (await self.c2kv_repair_extract_communicator(req))[0]
 

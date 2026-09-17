@@ -233,7 +233,12 @@ class SessionAwareCache(BasePrefixCache):
         ):
             from sglang.srt.managers.schedule_batch import C2KVPrefillRound
 
-            from sglang.srt.mem_cache.history_kv_lifecycle import append_resident_positions, physical_history_range, position_summary
+            from sglang.srt.mem_cache.history_kv_lifecycle import (
+                append_resident_positions,
+                physical_history_range,
+                position_summary,
+                selection_query_window,
+            )
             hint = req.c2kv_kv_memory_hint or {}
             logical_prefix = int(hint["persistent_session_logical_prefix_tokens"])
             canonical_len = int(hint["persistent_session_canonical_prompt_tokens"])
@@ -254,19 +259,65 @@ class SessionAwareCache(BasePrefixCache):
                     f"{protected=}, {prefix_len=}, {delta_history=}, {origin_len=}"
                 )
             else:
-                rounds = [
-                    C2KVPrefillRound(
-                        list(req.origin_input_ids[:max(prefix_len + 1, history_end)]),
-                        [],
-                        post_history_kv_eviction=True,
+                method = str(config.get("method") or "").strip().lower()
+                query_window = selection_query_window(
+                    method,
+                    prefix_len,
+                    history_end,
+                    origin_len,
+                    config.get("history_kv_recent_window"),
+                )
+                if query_window is None:
+                    rounds = [
+                        C2KVPrefillRound(
+                            list(
+                                req.origin_input_ids[
+                                    : max(prefix_len + 1, history_end)
+                                ]
+                            ),
+                            [],
+                            post_history_kv_eviction=True,
+                        )
+                    ]
+                    round_end = min(
+                        origin_len, max(prefix_len + 1, history_end)
                     )
-                ]
-                round_end = min(origin_len, max(prefix_len + 1, history_end))
-                if round_end < origin_len:
+                    if round_end < origin_len:
+                        rounds.append(
+                            C2KVPrefillRound(
+                                list(req.origin_input_ids[round_end:]), []
+                            )
+                        )
+                else:
+                    query_start, query_end = query_window
+                    rounds = []
+                    if query_start > prefix_len:
+                        rounds.append(
+                            C2KVPrefillRound(
+                                list(req.origin_input_ids[:query_start]), []
+                            )
+                        )
+                        query_tokens = list(
+                            req.origin_input_ids[query_start:query_end]
+                        )
+                    else:
+                        query_tokens = list(req.origin_input_ids[:query_end])
                     rounds.append(
                         C2KVPrefillRound(
-                            list(req.origin_input_ids[round_end:]), []
+                            query_tokens,
+                            [],
+                            post_history_kv_eviction=True,
                         )
+                    )
+                    config.update(
+                        {
+                            "selection_query_start": query_start,
+                            "selection_query_end": query_end,
+                            "selection_query_tokens": query_end - query_start,
+                            "selection_query_phase": (
+                                "new_tail_prefill_before_eviction"
+                            ),
+                        }
                     )
                 req.c2kv_rounds = rounds
                 req.c2kv_round_idx = 0
@@ -281,6 +332,14 @@ class SessionAwareCache(BasePrefixCache):
                     report["persistent_session_history_start"] = protected
                     report["persistent_session_history_end"] = history_end
                     report["persistent_session_delta_history_tokens"] = delta_history
+                    for key in (
+                        "selection_query_start",
+                        "selection_query_end",
+                        "selection_query_tokens",
+                        "selection_query_phase",
+                    ):
+                        if key in config:
+                            report[key] = config[key]
                 config.pop("persistent_continuation_pending", None)
 
         # logprob_start_len is already forced to -1 for streaming sessions
@@ -303,6 +362,9 @@ class SessionAwareCache(BasePrefixCache):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
         if self._is_persistent_history_req(req):
+            if getattr(req, "persistent_history_eviction_failed", False):
+                self._rollback_failed_persistent_request(req)
+                return
             from sglang.srt.mem_cache.history_kv_lifecycle import append_resident_positions, position_summary
             positions = getattr(req, "history_kv_resident_positions", None)
             hint = req.c2kv_kv_memory_hint or {}
@@ -397,8 +459,54 @@ class SessionAwareCache(BasePrefixCache):
             report["persistent_session_prompt_physical_tokens"] = prompt_len
             report["persistent_session_decode_page_free_scope"] = "request_owned_pages_excluding_prompt_pages"
 
+    def _rollback_failed_persistent_request(self, req: Req) -> None:
+        """Drop a failed turn's partial suffix while preserving prior session KV."""
+        session_id = req.session.session_id
+        slot = self.slots.get(session_id)
+        if slot is None or slot.req_pool_idx is None:
+            self.slots.pop(session_id, None)
+            self.inner.cache_finished_req(req, is_insert=False)
+            return
+
+        keep_len = int(slot.kv_committed_len)
+        allocated_len = int(getattr(req, "kv_allocated_len", keep_len) or 0)
+        row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+        keep_slots = row[:keep_len].long()
+        keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+        tail_slots = row[keep_len:max(keep_len, allocated_len)].long()
+        tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+        free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+        if free_pages.numel():
+            self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+        row[keep_len:max(keep_len, allocated_len)] = 0
+
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["persistent_session_failed_turn_rolled_back"] = True
+            report["persistent_session_rollback_kept_tokens"] = keep_len
+            report["persistent_session_rollback_freed_pages"] = int(
+                free_pages.numel()
+            )
+        req.req_pool_idx = None
+        req.mamba_pool_idx = None
+
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):
+            if self._is_persistent_history_req(req):
+                # Physical history eviction rewrites and frees request-owned
+                # KV pages.  Those pages must never also be inserted into the
+                # radix tree: after compaction its cached prefix length can be
+                # larger than the entire resident session (for example a
+                # 256-token cached chunk compacted to 134 tokens), producing
+                # negative session-held accounting and stale tree references.
+                # Keep the already computed prefix directly on the request;
+                # SessionSlot takes sole ownership when the request finishes.
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ]
+                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                req.cache_protected_len = 0
+                return
             # in chunked_prefill for streaming, we skip the stash path which triggers radix.
             # only the last chunk in first turn trigger a full prompt radix insert.
             if kwargs.get("chunked", False):

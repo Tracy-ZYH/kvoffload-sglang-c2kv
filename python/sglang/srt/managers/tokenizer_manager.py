@@ -964,6 +964,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
+                c2kv_outer_request_id=obj.c2kv_outer_request_id,
+                c2kv_measurement_phase=obj.c2kv_measurement_phase,
+                c2kv_paper_whole_full_kv_tokens=obj.c2kv_paper_whole_full_kv_tokens,
+                c2kv_paper_history_full_kv_tokens=(
+                    obj.c2kv_paper_history_full_kv_tokens
+                ),
+                c2kv_paper_history_active_kv_tokens=(
+                    obj.c2kv_paper_history_active_kv_tokens
+                ),
+                c2kv_paper_canonical_full_source=(
+                    obj.c2kv_paper_canonical_full_source
+                ),
+                c2kv_paper_denominator_tokenization_duration_ns=(
+                    obj.c2kv_paper_denominator_tokenization_duration_ns
+                ),
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,

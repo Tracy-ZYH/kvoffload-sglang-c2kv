@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -40,6 +41,57 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def _accumulate_history_kv_selection_scores(self, req: Req, result) -> None:
+        """Merge score sums from every chunk of the selection-query round."""
+        score_map = getattr(result, "history_kv_selection_scores", None)
+        if not isinstance(score_map, dict):
+            return
+        incoming = score_map.get(int(req.req_pool_idx))
+        if not isinstance(incoming, dict):
+            return
+        incoming_layers = incoming.get("layers") or []
+        if not incoming_layers:
+            return
+
+        current = getattr(req, "history_kv_selection_scores", None)
+        if not isinstance(current, dict):
+            req.history_kv_selection_scores = {
+                **incoming,
+                "layers": list(incoming_layers),
+                "query_tokens": int(incoming.get("query_tokens") or 0),
+            }
+            return
+
+        current_layers = current.get("layers") or []
+        compatible = (
+            current.get("method") == incoming.get("method")
+            and current.get("history_start") == incoming.get("history_start")
+            and current.get("history_end") == incoming.get("history_end")
+            and len(current_layers) == len(incoming_layers)
+            and all(
+                tuple(left.shape) == tuple(right.shape)
+                for left, right in zip(current_layers, incoming_layers)
+            )
+        )
+        if not compatible:
+            logger.error(
+                "HISTORY_KV_SELECTION_CHUNK_MISMATCH rid=%s",
+                req.rid,
+            )
+            req.history_kv_selection_scores = {
+                "error": "HISTORY_KV_SELECTION_CHUNK_MISMATCH",
+                "layers": [],
+                "query_tokens": 0,
+            }
+            return
+
+        current["layers"] = [
+            left + right for left, right in zip(current_layers, incoming_layers)
+        ]
+        current["query_tokens"] = int(current.get("query_tokens") or 0) + int(
+            incoming.get("query_tokens") or 0
+        )
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -202,6 +254,11 @@ class SchedulerOutputProcessorMixin:
             injection_error = getattr(req, "c2kv_injection_error", None)
             if injection_error:
                 stats["c2kv_injection_error"] = str(injection_error)
+            paper_measurement = paper_telemetry.request_report(
+                req, finalize=req.finished()
+            )
+            if paper_measurement is not None:
+                stats["paper_measurement"] = paper_measurement
         return stats
 
     def _bytes_per_kv_token(self: Scheduler) -> Optional[int]:
@@ -405,6 +462,17 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
+                if (
+                    req.c2kv_rounds is not None
+                    and req.c2kv_round_idx < len(req.c2kv_rounds)
+                    and getattr(
+                        req.c2kv_rounds[req.c2kv_round_idx],
+                        "post_history_kv_eviction",
+                        False,
+                    )
+                ):
+                    self._accumulate_history_kv_selection_scores(req, result)
+
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
 
@@ -422,9 +490,12 @@ class SchedulerOutputProcessorMixin:
                         abort = False
                         logical_kv_start = int(batch.seq_lens_cpu[i].item())
                         for seg_idx in cur_round.post_inject_seg_indices:
+                            paper_telemetry.set_phase("injection")
                             if not self._inject_c2kv_gist_segment(
                                 req, seg_idx, logical_kv_start
                             ):
+                                paper_telemetry.sample("c2kv_injection_failed")
+                                paper_telemetry.set_phase("prefill")
                                 logger.warning(
                                     f"C2KV injection failed for {req.rid}; aborting"
                                 )
@@ -471,16 +542,13 @@ class SchedulerOutputProcessorMixin:
                                 self.stream_output([req], req.return_logprob)
                                 abort = True
                                 break
+                            paper_telemetry.sample("c2kv_injection_applied")
+                            paper_telemetry.set_phase("prefill")
                             logical_kv_start = req.kv_committed_len
                         if abort:
                             continue
 
                         if getattr(cur_round, "post_history_kv_eviction", False):
-                            score_map = getattr(result, "history_kv_selection_scores", None)
-                            if isinstance(score_map, dict):
-                                req.history_kv_selection_scores = score_map.get(
-                                    int(req.req_pool_idx)
-                                )
                             if not self._apply_history_kv_eviction(req):
                                 self._release_c2kv_pins(req)
                                 release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -565,6 +633,8 @@ class SchedulerOutputProcessorMixin:
                             req.origin_input_ids_unpadded = list(persistent_active_ids)
                             req.c2kv_virtual_input_ids = list(persistent_active_ids)
                         self._release_c2kv_pins(req)
+
+                    paper_telemetry.mark_generation_start(req)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -769,6 +839,8 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        paper_telemetry.set_phase("decode")
+        paper_telemetry.sample("decode_step")
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -910,8 +982,9 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+        paper_telemetry.sample("decode_release_complete")
+        self.stream_output(batch.reqs, batch.return_logprob)
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(
