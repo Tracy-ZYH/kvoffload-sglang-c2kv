@@ -212,3 +212,88 @@ def test_nested_tensor_storage_is_deduplicated_globally():
     )
     assert measured["logical_bytes"] == (4 + 4 + 8) * 4
     assert measured["storage_bytes"] == base.untyped_storage().nbytes()
+
+
+class _TreeCache:
+    """Radix-cache stand-in whose evictable size changes between samples."""
+
+    def __init__(self):
+        self.evictable = 0
+        self.protected = 0
+
+    def evictable_size(self):
+        return self.evictable
+
+    def protected_size(self):
+        return self.protected
+
+
+def test_cached_evictable_kv_is_a_line_item_of_the_resident_total(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    cache = _TreeCache()
+    cache.evictable = 20  # left behind by an earlier (auxiliary) request
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4, tree_cache=cache)
+    telemetry.start(server_request_id="s", outer_request_id="o", phase="chat", kind="generation")
+    cache.evictable = 25
+    cache.protected = 10
+    telemetry.sample("prefill")
+    cache.evictable = 3  # evicted to make room; resident total is unchanged
+    telemetry.sample("decode")
+    result = telemetry.finish(req=SimpleNamespace(rid="s", kv_committed_len=30), success=True)
+    metrics = result["metrics"]
+    # The resident total still counts every live pool slot (30 main + 5 c2kv).
+    assert metrics["request_peak_resident_kv_tokens"] == 35
+    assert metrics["request_peak_resident_kv_bytes"] == 140
+    # Evictable cache is reported alongside, never subtracted.
+    assert metrics["baseline_cached_evictable_kv_tokens"] == 20
+    assert metrics["cached_evictable_kv_peak_tokens"] == 25
+    assert metrics["cached_evictable_kv_peak_bytes"] == 100
+    # The resident total never rose above the baseline, so the peak is the
+    # first sample at that level (the baseline), when 20 tokens were cache.
+    assert metrics["request_peak_cached_evictable_kv_tokens"] == 20
+
+
+def test_peak_keeps_first_sample_so_released_kv_is_not_reported_as_cache(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+
+    class _GrowingAllocator:
+        size = 100
+        used = 30
+
+        def available_size(self):
+            return self.size - self.used
+
+    allocator = _GrowingAllocator()
+    cache = _TreeCache()
+    telemetry = _PaperTelemetry()
+    telemetry.configure(allocator, _C2KVPool(), bytes_per_kv_token=4, tree_cache=cache)
+    cache.evictable = 20  # auxiliary call's leftover cache
+    telemetry.start(server_request_id="s", outer_request_id="o", phase="chat", kind="generation")
+    allocator.used = 40  # this request prefills 10 new tokens, which are protected
+    cache.protected = 10
+    telemetry.sample("prefill")
+    # Finishing moves the request's slots into the evictable cache: same
+    # resident total, but now all 30 cached tokens are evictable.
+    cache.protected = 0
+    cache.evictable = 30
+    result = telemetry.finish(req=SimpleNamespace(rid="s", kv_committed_len=10), success=True)
+    metrics = result["metrics"]
+    assert metrics["request_peak_resident_kv_tokens"] == 45
+    assert metrics["request_peak_cached_evictable_kv_tokens"] == 20
+    assert result["peak"]["kv"]["cached_protected_kv_tokens"] == 10
+    assert metrics["cached_evictable_kv_peak_tokens"] == 30
+
+
+def test_chunk_cache_without_radix_reports_zero_evictable(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4)
+    telemetry.start(server_request_id="s", outer_request_id="o", phase="chat", kind="generation")
+    result = telemetry.finish(req=SimpleNamespace(rid="s", kv_committed_len=1), success=True)
+    assert result["metrics"]["cached_evictable_kv_peak_tokens"] == 0
+    assert result["metrics"]["request_peak_cached_evictable_kv_bytes"] == 0
+    assert result["metrics"]["request_peak_resident_kv_tokens"] == 35

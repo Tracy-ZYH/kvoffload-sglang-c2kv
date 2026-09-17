@@ -927,6 +927,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.c2kv_pool,
             self._bytes_per_kv_token() or 0,
+            tree_cache=self.tree_cache,
         )
 
         if (

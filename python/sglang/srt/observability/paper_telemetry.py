@@ -40,19 +40,40 @@ class _PaperTelemetry:
         self._lock = threading.RLock()
         self._main_allocator = None
         self._c2kv_pool = None
+        self._tree_cache = None
         self._bytes_per_kv_token = 0
         self._active: Optional[Dict[str, Any]] = None
         self._completed: Dict[str, Dict[str, Any]] = {}
         self._nvml = None
         self._nvml_handle = None
 
-    def configure(self, main_allocator, c2kv_pool, bytes_per_kv_token: int) -> None:
+    def configure(
+        self, main_allocator, c2kv_pool, bytes_per_kv_token: int, tree_cache=None
+    ) -> None:
         if not enabled():
             return
         with self._lock:
             self._main_allocator = main_allocator
             self._c2kv_pool = c2kv_pool
+            self._tree_cache = tree_cache
             self._bytes_per_kv_token = max(_as_int(bytes_per_kv_token), 0)
+
+    def _tree_cache_sizes(self) -> Dict[str, int]:
+        """Prefix-cache slots inside the live pool, split by whether they are
+        held by a running request (protected) or merely kept for reuse
+        (evictable).  A ChunkCache (radix cache disabled) reports 0 for both."""
+        cache = self._tree_cache
+        evictable = protected = 0
+        if cache is not None:
+            try:
+                evictable = max(_as_int(cache.evictable_size()), 0)
+            except Exception:
+                evictable = 0
+            try:
+                protected = max(_as_int(cache.protected_size()), 0)
+            except Exception:
+                protected = 0
+        return {"evictable": evictable, "protected": protected}
 
     def _torch_snapshot(self) -> Dict[str, Optional[int]]:
         values: Dict[str, Optional[int]] = {
@@ -131,6 +152,7 @@ class _PaperTelemetry:
             c2kv_tokens = 0
         resident_tokens = main_tokens + c2kv_tokens
         bpt = self._bytes_per_kv_token
+        cache = self._tree_cache_sizes()
         return {
             "bytes_per_kv_token": bpt,
             "main_live_kv_tokens": main_tokens,
@@ -139,6 +161,14 @@ class _PaperTelemetry:
             "c2kv_live_kv_bytes": c2kv_tokens * bpt,
             "resident_kv_tokens": resident_tokens,
             "resident_kv_bytes": resident_tokens * bpt,
+            # Line items of the resident total, never subtracted from it:
+            # evictable prefix-cache slots are real occupancy that the server
+            # keeps for reuse (e.g. left by an auxiliary call), protected ones
+            # are locked by a running request.
+            "cached_evictable_kv_tokens": cache["evictable"],
+            "cached_evictable_kv_bytes": cache["evictable"] * bpt,
+            "cached_protected_kv_tokens": cache["protected"],
+            "cached_protected_kv_bytes": cache["protected"] * bpt,
             # Canonical request peak includes temporary K/V payload that is
             # alive at this exact sample.  With no temporary tensors, it is
             # identical to the pooled live payload.
@@ -230,6 +260,9 @@ class _PaperTelemetry:
                 "current_phase": {"name": phase_name, "start_ns": now, "start_snapshot": baseline},
                 "temporary_logical_peak_bytes": 0,
                 "temporary_storage_peak_bytes": 0,
+                "cached_evictable_peak_tokens": _as_int(
+                    baseline["kv"].get("cached_evictable_kv_tokens")
+                ),
                 "req": None,
             }
 
@@ -237,10 +270,18 @@ class _PaperTelemetry:
         active = self._active
         if active is None:
             return
+        active["cached_evictable_peak_tokens"] = max(
+            active.get("cached_evictable_peak_tokens", 0),
+            _as_int(snapshot["kv"].get("cached_evictable_kv_tokens")),
+        )
         peak = active["peak"]
+        # Strict comparison keeps the FIRST sample that reaches the peak. With
+        # a prefix cache the resident total does not drop when the request
+        # finishes (its slots move from protected to evictable), so a later
+        # equal sample would misreport the whole peak as evictable cache.
         if (
             snapshot["kv"]["request_resident_kv_bytes"]
-            >= peak["kv"]["request_resident_kv_bytes"]
+            > peak["kv"]["request_resident_kv_bytes"]
         ):
             peak["kv"] = dict(snapshot["kv"])
             peak["event"] = snapshot["event"]
@@ -248,7 +289,7 @@ class _PaperTelemetry:
         pooled_peak = active["pooled_peak"]
         if (
             snapshot["kv"]["resident_kv_bytes"]
-            >= pooled_peak["kv"]["resident_kv_bytes"]
+            > pooled_peak["kv"]["resident_kv_bytes"]
         ):
             pooled_peak["kv"] = dict(snapshot["kv"])
             pooled_peak["event"] = snapshot["event"]
@@ -465,6 +506,8 @@ class _PaperTelemetry:
         baseline_nvml = active["baseline"].get("nvml_process_bytes")
         peak_nvml = active["peak"].get("nvml_process_bytes")
         final_nvml = final.get("nvml_process_bytes")
+        peak_kv = active["peak"]["kv"]
+        evictable_peak_tokens = _as_int(active.get("cached_evictable_peak_tokens"))
         metrics = {
             "request_peak_resident_kv_tokens": active["peak"]["kv"][
                 "request_resident_kv_tokens"
@@ -478,6 +521,22 @@ class _PaperTelemetry:
             "request_peak_pooled_resident_kv_bytes": active["pooled_peak"][
                 "kv"
             ]["resident_kv_bytes"],
+            # Evictable prefix-cache slots that were part of the resident peak
+            # above (same sample), and the request's own baseline/maximum.
+            "request_peak_cached_evictable_kv_tokens": _as_int(
+                peak_kv.get("cached_evictable_kv_tokens")
+            ),
+            "request_peak_cached_evictable_kv_bytes": _as_int(
+                peak_kv.get("cached_evictable_kv_bytes")
+            ),
+            "baseline_cached_evictable_kv_tokens": _as_int(
+                active["baseline"]["kv"].get("cached_evictable_kv_tokens")
+            ),
+            "baseline_cached_evictable_kv_bytes": _as_int(
+                active["baseline"]["kv"].get("cached_evictable_kv_bytes")
+            ),
+            "cached_evictable_kv_peak_tokens": evictable_peak_tokens,
+            "cached_evictable_kv_peak_bytes": evictable_peak_tokens * bpt,
             "generation_active_kv_tokens": whole_active,
             "generation_active_kv_bytes": whole_active * bpt,
             "whole_full_kv_tokens": whole_full,
