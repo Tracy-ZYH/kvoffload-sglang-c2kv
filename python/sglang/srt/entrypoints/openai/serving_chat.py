@@ -194,6 +194,17 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         delta = full_prompt_ids[len(previous) :]
+        if not delta and isinstance(config, dict):
+            from sglang.srt.mem_cache.history_kv_lifecycle import (
+                ATTENTION_SELECTION_METHODS,
+            )
+
+            method = str(config.get("method") or "").strip().lower()
+            if method in ATTENTION_SELECTION_METHODS:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SELECTION_REQUIRES_NEW_QUERY: "
+                    f"method={method}, session_id={session_id}"
+                )
         # Session.create_req must not append last_req.output_ids. Those raw
         # decode tokens are not necessarily the canonical serialization of an
         # OpenAI tool call; the delta above contains that serialization.
@@ -217,6 +228,11 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_delta_history_tokens"] = max(0, history_end - len(previous))
             config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
+            canonical_scopes = config.get("semantic_scopes")
+            if isinstance(canonical_scopes, list):
+                config["persistent_canonical_scopes"] = [
+                    dict(scope) for scope in canonical_scopes
+                ]
         return delta, session_id, full_prompt_ids
 
     def _commit_persistent_history_session(
@@ -527,6 +543,101 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         return 0
 
+    def _c2kv_tool_definition_span(
+        self,
+        request: "ChatCompletionRequest",
+        messages: List[ChatMessage],
+        tools: List[Dict],
+        prompt_ids: List[int],
+    ) -> tuple[int, int]:
+        """Locate only the serialized tool schemas in the native prompt.
+
+        Comparing a prompt with tools to one without tools is not a valid
+        boundary operation for Qwen: enabling tools changes the surrounding
+        system-message scaffold as well.  Render a sentinel tool through the
+        *same tools branch* instead.  The common prefix/suffix then protects
+        the system scaffold, tool instructions, messages, and current turn;
+        only the request-specific serialized definitions remain variable.
+        """
+
+        sentinel_tools = [{
+            "type": "function",
+            "function": {
+                "name": "__c2kv_tool_span_sentinel__",
+                "description": "__c2kv_tool_span_sentinel_description__",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "__c2kv_tool_span_sentinel_argument__": {
+                            "type": "string"
+                        }
+                    },
+                },
+            },
+        }]
+        sentinel_ids = self._c2kv_chat_template_input_ids(
+            request, messages, sentinel_tools)
+
+        left = 0
+        common = min(len(prompt_ids), len(sentinel_ids))
+        while left < common and prompt_ids[left] == sentinel_ids[left]:
+            left += 1
+        right = 0
+        while (right < len(prompt_ids) - left
+               and right < len(sentinel_ids) - left
+               and prompt_ids[-1 - right] == sentinel_ids[-1 - right]):
+            right += 1
+        tool_end = len(prompt_ids) - right
+        if not left < tool_end:
+            raise ValueError("JOINT_KV_TOOL_SCOPE_EMPTY_AFTER_SENTINEL_DIFF")
+
+        # Qwen encloses the complete serialized definitions in native
+        # <tools>...</tools> markers.  Expand the variable core found above to
+        # those renderer-owned boundaries so common JSON keys/braces are also
+        # compressed.  Keep the sentinel interval as a template-agnostic
+        # fallback for other native templates.
+        tokenizer = self.tokenizer_manager.tokenizer
+        try:
+            # Exclude the closing '>' because Qwen's tokenizer merges it with
+            # the following newline in-context (``'>\\n'`` / ``'>\\n\\n'``).
+            # The marker stems remain exact token subsequences.
+            open_marker = list(tokenizer.encode(
+                "<tools", add_special_tokens=False))
+            close_marker = list(tokenizer.encode(
+                "</tools", add_special_tokens=False))
+        except (AttributeError, TypeError):
+            open_marker = close_marker = []
+
+        def occurrences(needle: List[int]) -> List[int]:
+            if not needle:
+                return []
+            return [
+                start for start in range(len(prompt_ids) - len(needle) + 1)
+                if prompt_ids[start:start + len(needle)] == needle
+            ]
+
+        opening_ends = [
+            start + len(open_marker) for start in occurrences(open_marker)
+            if start + len(open_marker) <= left
+        ]
+        # prompt_ids is the final generation prompt, while the auxiliary
+        # renderer above deliberately uses add_generation_prompt=False.  A
+        # reverse common-suffix diff can therefore end at the very end of the
+        # final prompt.  Pair the selected native opening marker with the
+        # first native closing marker after it; do not use that provisional
+        # diff end to search for </tools>.
+        bracketed_start = max(opening_ends) if opening_ends else None
+        closing_starts = (
+            [start for start in occurrences(close_marker)
+             if start >= bracketed_start]
+            if bracketed_start is not None else []
+        )
+        if bracketed_start is not None and closing_starts:
+            bracketed_end = min(closing_starts)
+            if bracketed_start < bracketed_end:
+                left, tool_end = bracketed_start, bracketed_end
+        return left, tool_end
+
     def _compute_c2kv_segments(self, request: "ChatCompletionRequest"):
         """
         Detect messages annotated with c2kv_key_hash or repair-only KV keys,
@@ -636,8 +747,49 @@ class OpenAIServingChat(OpenAIServingBase):
         config = hint.get("history_kv_eviction")
         if not isinstance(config, dict):
             return
+        compress_tools = bool(config.get("compress_tools", False))
+        compress_history = bool(
+            config.get("compress_completed_history", True))
+        scopes = []
+        tools = self._chat_template_tools(request)
+
+        # Tool boundaries come from the same server-owned Qwen renderer as
+        # the final request.  Keep the renderer in its tools branch and vary
+        # only the definitions; a with-tools/without-tools diff also includes
+        # Qwen's changed system scaffold and is therefore invalid here.
+        if compress_tools:
+            if not tools:
+                raise ValueError("JOINT_KV_TOOL_SCOPE_REQUIRES_REQUEST_TOOLS")
+            left, tool_end = self._c2kv_tool_definition_span(
+                request, list(request.messages), tools, prompt_ids)
+            tool_ratio = float(config.get("tool_retention_ratio") or 0.0)
+            if not 0.0 < tool_ratio <= 1.0:
+                raise ValueError(
+                    f"Invalid Tool KV retention ratio: {tool_ratio!r}")
+            scopes.append({
+                "kind": "tool", "start": left, "end": tool_end,
+                "target_tokens": max(
+                    1, int(math.ceil((tool_end - left) * tool_ratio))),
+                "retention_ratio": tool_ratio,
+                "boundary_source": "native_chat_template_tool_sentinel_bracketed",
+            })
+
         count = config.get("history_message_count")
+        if not compress_history:
+            count = None
         if count is None:
+            if not scopes:
+                return
+            config["semantic_scopes"] = scopes
+            config["history_start"] = min(s["start"] for s in scopes)
+            config["history_end"] = max(s["end"] for s in scopes)
+            config["joint_canonical_prompt_tokens"] = len(prompt_ids)
+            config["joint_current_full_tokens"] = max(
+                0, len(prompt_ids) - int(config["history_end"]))
+            config["target_tokens"] = sum(s["target_tokens"] for s in scopes)
+            hint["full_equivalent_tool_tokens"] = sum(
+                s["end"] - s["start"] for s in scopes if s["kind"] == "tool")
+            hint["full_equivalent_history_tokens"] = 0
             return
         try:
             count = int(count)
@@ -662,7 +814,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"history_message_count={count}"
             )
 
-        tools = self._chat_template_tools(request)
         completed = list(request.messages[:count])
         protected = list(request.messages[:start_count])
         completed_ids = self._c2kv_chat_template_input_ids(
@@ -701,9 +852,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"prompt: start={history_start}, end={history_end}, "
                 f"prompt={len(prompt_ids)}"
             )
-        config["history_start"] = history_start
-        config["history_end"] = history_end
-        config["server_tokenized"] = True
         span_tokens = history_end - history_start
         if config.get("target_tokens") is None:
             ratio = config.get("retention_ratio")
@@ -718,18 +866,44 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise ValueError(
                     f"Invalid physical history retention_ratio: {ratio!r}"
                 )
-            config["target_tokens"] = max(
+            history_target = max(
                 1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
             )
-            config["target_tokens_source"] = "server_tokenized_retention_ratio"
+            target_source = "server_tokenized_retention_ratio"
         else:
-            config["target_tokens"] = max(
+            history_target = max(
                 1, min(span_tokens, int(config["target_tokens"]))
             )
-            config["target_tokens_source"] = "absolute_request_budget"
+            target_source = "absolute_request_budget"
+        scopes.append({
+            "kind": "history", "start": history_start, "end": history_end,
+            "target_tokens": history_target,
+            "retention_ratio": config.get("retention_ratio"),
+            "boundary_source": "native_chat_template_message_prefix",
+        })
+        ordered_scopes = sorted(scopes, key=lambda scope: int(scope["start"]))
+        for previous, current in zip(ordered_scopes, ordered_scopes[1:]):
+            if int(previous["end"]) > int(current["start"]):
+                raise ValueError(
+                    "JOINT_KV_OVERLAPPING_CANONICAL_SCOPES: "
+                    f"{previous['kind']}=[{previous['start']},{previous['end']}), "
+                    f"{current['kind']}=[{current['start']},{current['end']})"
+                )
+        scopes = ordered_scopes
+        config["semantic_scopes"] = scopes
+        config["history_start"] = min(s["start"] for s in scopes)
+        config["history_end"] = max(s["end"] for s in scopes)
+        config["joint_canonical_prompt_tokens"] = len(prompt_ids)
+        config["joint_current_full_tokens"] = max(
+            0, len(prompt_ids) - int(config["history_end"]))
+        config["target_tokens"] = sum(s["target_tokens"] for s in scopes)
+        config["target_tokens_source"] = target_source
+        config["server_tokenized"] = True
         # The server owns the final chat template, so this is the only exact
         # full-history token count used by persistent physical accounting.
         hint["full_equivalent_history_tokens"] = span_tokens
+        hint["full_equivalent_tool_tokens"] = sum(
+            s["end"] - s["start"] for s in scopes if s["kind"] == "tool")
 
     def _convert_to_internal_request(
         self,

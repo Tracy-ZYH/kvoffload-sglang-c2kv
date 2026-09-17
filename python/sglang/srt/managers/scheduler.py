@@ -200,6 +200,9 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache, release_kv_cache
+from sglang.srt.mem_cache.history_kv_selection import (
+    pool_snapkv_scores_by_position,
+)
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -264,6 +267,17 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 ENABLE_C2KV_LOGGING = get_bool_env_var("SGLANG_ENABLE_C2KV_LOGGING")
 
 _is_npu = is_npu()
+
+
+def _c2kv_pending_result_requires_early_process(req) -> bool:
+    """Whether overlap scheduling must apply this prefill result first."""
+    rounds = getattr(req, "c2kv_rounds", None)
+    round_idx = int(getattr(req, "c2kv_round_idx", 0) or 0)
+    if rounds is None or not 0 <= round_idx < len(rounds):
+        return False
+    return round_idx < len(rounds) - 1 or bool(
+        getattr(rounds[round_idx], "post_history_kv_eviction", False)
+    )
 
 
 @dataclass
@@ -1468,10 +1482,19 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        def pop_and_process(*, sync_c2kv_early_batch=False):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if sync_c2kv_early_batch and self.last_batch is not None:
+                # result_queue owns a lightweight ScheduleBatch.copy(). A
+                # final-round physical eviction mutates its sequence lengths
+                # before get_next_batch_to_run merges the real last_batch.
+                # Synchronize only on this early path; later processing may
+                # run after last_batch has already been filtered.
+                self.last_batch.seq_lens = tmp_batch.seq_lens
+                self.last_batch.seq_lens_cpu = tmp_batch.seq_lens_cpu
+                self.last_batch.seq_lens_sum = tmp_batch.seq_lens_sum
 
         while True:
             # Receive requests
@@ -1487,14 +1510,12 @@ class Scheduler(
                 self.last_batch
                 and len(self.result_queue) > 0
                 and any(
-                    getattr(r, "c2kv_rounds", None) is not None
-                    and getattr(r, "c2kv_round_idx", 0)
-                    < len(r.c2kv_rounds) - 1
+                    _c2kv_pending_result_requires_early_process(r)
                     for r in self.last_batch.reqs
                 )
             )
             if c2kv_early_process:
-                pop_and_process()
+                pop_and_process(sync_c2kv_early_batch=True)
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -3033,15 +3054,61 @@ class Scheduler(
             )
             return None
 
-        rounds = [
-            C2KVPrefillRound(
-                original_input_ids[:history_end],
-                [],
-                post_history_kv_eviction=True,
+        from sglang.srt.mem_cache.history_kv_lifecycle import (
+            selection_query_window,
+        )
+
+        query_window = selection_query_window(
+            method,
+            0,
+            history_end,
+            original_len,
+            config.get("history_kv_recent_window"),
+        )
+        if query_window is None:
+            rounds = [
+                C2KVPrefillRound(
+                    original_input_ids[:history_end],
+                    [],
+                    post_history_kv_eviction=True,
+                )
+            ]
+            if history_end < original_len:
+                rounds.append(
+                    C2KVPrefillRound(original_input_ids[history_end:], [])
+                )
+        else:
+            query_start, query_end = query_window
+            rounds = []
+            if query_start > 0:
+                rounds.append(C2KVPrefillRound(original_input_ids[:query_start], []))
+            rounds.append(
+                C2KVPrefillRound(
+                    original_input_ids[query_start:query_end],
+                    [],
+                    post_history_kv_eviction=True,
+                )
             )
-        ]
-        if history_end < original_len:
-            rounds.append(C2KVPrefillRound(original_input_ids[history_end:], []))
+            config.update(
+                {
+                    "selection_query_start": query_start,
+                    "selection_query_end": query_end,
+                    "selection_query_tokens": query_end - query_start,
+                    "selection_query_phase": "new_tail_prefill_before_eviction",
+                }
+            )
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                report.update(
+                    {
+                        "selection_query_start": query_start,
+                        "selection_query_end": query_end,
+                        "selection_query_tokens": query_end - query_start,
+                        "selection_query_phase": (
+                            "new_tail_prefill_before_eviction"
+                        ),
+                    }
+                )
 
         req.c2kv_rounds = rounds
         req.c2kv_round_idx = 0
@@ -3058,6 +3125,9 @@ class Scheduler(
             history_start=history_start,
             history_end=history_end,
             target_tokens=config.get("target_tokens"),
+            selection_query_start=config.get("selection_query_start"),
+            selection_query_end=config.get("selection_query_end"),
+            selection_query_tokens=config.get("selection_query_tokens"),
             round_lens=[len(round_info.tokens) for round_info in rounds],
         )
         return None
@@ -3068,9 +3138,28 @@ class Scheduler(
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
+        score_info = getattr(req, "history_kv_selection_scores", None)
+        selection_query_tokens_observed = (
+            int(score_info.get("query_tokens") or 0)
+            if isinstance(score_info, dict)
+            else 0
+        )
         try:
             from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
 
+            method = str(config.get("method") or "").strip().lower()
+            if method in {"snapkv", "snapkv_persistent", "h2o", "pyramid", "pyramidkv"}:
+                selection_query_tokens = config.get("selection_query_tokens")
+                if (
+                    selection_query_tokens is not None
+                    and selection_query_tokens_observed
+                    != int(selection_query_tokens)
+                ):
+                    raise RuntimeError(
+                        "HISTORY_KV_SELECTION_QUERY_COVERAGE_MISMATCH: "
+                        f"expected={int(selection_query_tokens)}, "
+                        f"observed={selection_query_tokens_observed}"
+                    )
             evictor = PhysicalHistoryKVEvictor(
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
@@ -3098,6 +3187,9 @@ class Scheduler(
 
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
+            report["selection_query_tokens_observed"] = (
+                selection_query_tokens_observed
+            )
             report["history_kv_physical_eviction"] = (
                 result.as_dict() if result is not None else {"success": False, "error": error}
             )
@@ -3116,6 +3208,38 @@ class Scheduler(
                 report["physical_kv_len"] = result.new_physical_kv_slots
                 report["next_rope_position"] = result.next_rope_position_after
                 report["selected_history_indices"] = result.selected_history_indices or []
+                scope_results = config.get("semantic_scope_results")
+                if isinstance(scope_results, list):
+                    report["joint_kv_scopes"] = scope_results
+                    report["joint_protected_kv"] = int(
+                        config.get("joint_protected_kv") or 0)
+                    # Physical eviction runs after the semantic prefix round;
+                    # Current Turn KV is prefetched in the following round and
+                    # is therefore absent from result.current_tokens here.
+                    # Report its canonical full size resolved by serving_chat.
+                    current_full_tokens = int(
+                        config.get("joint_current_full_tokens") or 0)
+                    report["joint_current_full_kv"] = current_full_tokens
+                    report["joint_system_current_full"] = bool(
+                        int(config.get("joint_protected_prefix_kv") or 0) >= 0
+                        and current_full_tokens > 0
+                    )
+                    report["joint_current_prefill_phase"] = (
+                        "post_eviction_uncompressed_round")
+                    for scope in scope_results:
+                        kind = str(scope.get("kind") or "")
+                        if kind in {"tool", "history"}:
+                            report[f"full_{kind}_kv"] = int(
+                                scope.get("full_tokens") or 0)
+                            report[f"active_{kind}_kv"] = int(
+                                scope.get("active_tokens") or 0)
+                    full_joint = sum(int(s.get("full_tokens") or 0)
+                                     for s in scope_results)
+                    active_joint = sum(int(s.get("active_tokens") or 0)
+                                       for s in scope_results)
+                    report["joint_active_kv"] = active_joint
+                    report["joint_compression_ratio"] = (
+                        full_joint / active_joint if active_joint else None)
                 for key in (
                     "selection_reason",
                     "h2o_heavy_kept",
@@ -3132,6 +3256,11 @@ class Scheduler(
                 )
 
         if result is None or not result.success:
+            # release_kv_cache() still visits SessionAwareCache for a failed
+            # request.  Mark this path so it rolls back to the previously
+            # committed session prefix instead of attempting to save a
+            # partially-prefilled canonical prompt.
+            req.persistent_history_eviction_failed = True
             req.to_finish = _FA(error or "Physical history KV eviction failed")
             req.check_finished()
             return False
@@ -3216,6 +3345,78 @@ class Scheduler(
             method = "snapkv_persistent"
         if method == "pyramid":
             method = "pyramidkv"
+        semantic_scopes = config.get("semantic_scopes")
+        if isinstance(semantic_scopes, list) and semantic_scopes:
+            broad_start = int(config.get("history_start") or 0)
+            broad_end = int(config.get("history_end") or 0)
+            score_info = getattr(req, "history_kv_selection_scores", None)
+            layers = (score_info or {}).get("layers") if isinstance(score_info, dict) else None
+            if method != "streamingllm" and not layers:
+                return None
+            covered = set()
+            selected_broad = []
+            diagnostics = []
+            original_scores = score_info
+            original_config = req.history_kv_eviction
+            try:
+                for scope in semantic_scopes:
+                    start, end = int(scope["start"]), int(scope["end"])
+                    if not (broad_start <= start < end <= broad_end):
+                        raise ValueError("JOINT_KV_SCOPE_OUTSIDE_COMPACTION_RANGE")
+                    absolute = set(range(start, end))
+                    if covered & absolute:
+                        raise ValueError("JOINT_KV_OVERLAPPING_SEMANTIC_SCOPES")
+                    covered.update(absolute)
+                    budget = min(end - start, max(
+                        1, int(scope.get("target_tokens") or end - start)))
+                    if method == "streamingllm":
+                        chosen = list(range(end - start - budget, end - start))
+                        scope_config = dict(scope)
+                    else:
+                        rel_start = start - broad_start
+                        rel_end = end - broad_start
+                        sliced = [item[rel_start:rel_end] for item in layers]
+                        req.history_kv_selection_scores = {"layers": sliced}
+                        scope_config = {
+                            **{k: v for k, v in config.items()
+                               if k != "semantic_scopes"},
+                            "history_start": start,
+                            "history_end": end,
+                            "target_tokens": budget,
+                        }
+                        req.history_kv_eviction = scope_config
+                        chosen = self._select_history_kv_eviction_indices(
+                            req, scope_config)
+                        if chosen is None:
+                            return None
+                    selected_broad.extend(
+                        start - broad_start + int(index) for index in chosen)
+                    diagnostics.append({
+                        **dict(scope),
+                        "full_tokens": int(scope.get("canonical_end", end))
+                        - int(scope.get("canonical_start", start)),
+                        "resident_candidate_tokens": end - start,
+                        "active_tokens": len(chosen),
+                        "selected_relative_indices": list(chosen),
+                        "selection_reason": scope_config.get("selection_reason"),
+                    })
+            finally:
+                req.history_kv_selection_scores = original_scores
+                req.history_kv_eviction = original_config
+
+            # Tokens between semantic scopes are System/template scaffold and
+            # therefore protected.  Include them in the one broad compaction.
+            protected = [
+                position - broad_start
+                for position in range(broad_start, broad_end)
+                if position not in covered
+            ]
+            selected_broad.extend(protected)
+            config["semantic_scope_results"] = diagnostics
+            config["joint_protected_prefix_kv"] = broad_start
+            config["joint_protected_kv"] = broad_start + len(protected)
+            config["selection_reason"] = "joint_independent_scope_union"
+            return sorted(set(selected_broad))
         if method == "streamingllm":
             return None
 
@@ -3262,12 +3463,19 @@ class Scheduler(
             ledger = getattr(req, "history_kv_resident_positions", None)
             if config.get("persistent_session") and ledger is not None:
                 state = dict(getattr(req, "history_kv_score_state", {}) or {})
+                resident_positions = set(ledger)
                 for layer, scores in enumerate(layer_scores):
                     prior = state.get(layer, {})
                     positions = ledger[history_start:history_end]
                     updated = scores + torch.tensor([prior.get(p, 0.0) for p in positions])
                     layer_scores[layer] = updated
-                    state[layer] = dict(zip(positions, updated.tolist()))
+                    merged = {
+                        position: score
+                        for position, score in prior.items()
+                        if position in resident_positions
+                    }
+                    merged.update(zip(positions, updated.tolist()))
+                    state[layer] = merged
                 req.history_kv_score_state = state
                 config["h2o_score_state_mode"] = "cumulative_resident_recent_query_attention"
             recent_budget = max(
@@ -3299,14 +3507,19 @@ class Scheduler(
                 kernel = max(1, int(config.get("history_kv_kernel_size") or 1))
                 pooling = str(config.get("history_kv_pooling") or "avgpool").lower()
                 if kernel > 1 and past_scores.numel() > 1:
-                    fn = torch.nn.functional.max_pool1d if pooling == "maxpool" else torch.nn.functional.avg_pool1d
-                    pooled = fn(
-                        past_scores.view(1, 1, -1),
-                        kernel_size=kernel,
-                        stride=1,
-                        padding=kernel // 2,
-                    ).view(-1)
-                    past_scores = pooled[: past_scores.numel()]
+                    ledger = getattr(req, "history_kv_resident_positions", None)
+                    if ledger is None:
+                        canonical_positions = range(past_limit)
+                    else:
+                        canonical_positions = ledger[
+                            history_start : history_start + past_limit
+                        ]
+                    past_scores = pool_snapkv_scores_by_position(
+                        past_scores,
+                        canonical_positions,
+                        kernel,
+                        pooling,
+                    )
                 selected = _unique_sorted(_topk(past_scores, past_budget) + recent)
             else:
                 selected = recent

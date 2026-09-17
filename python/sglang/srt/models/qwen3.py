@@ -461,7 +461,18 @@ class Qwen3Attention(nn.Module):
             ).view(1, -1, 1)
             ledger = config.get("resident_logical_positions")
             if ledger is not None:
-                key_positions = torch.tensor(ledger[:key_end], device=logits.device)
+                # The persistent ledger describes only the already-resident
+                # physical prefix.  Keys appended by this extend round use
+                # the model's actual logical positions and must be included
+                # in the same causal mask frame.
+                prefix_positions = list(ledger[:prefix_len])
+                extend_positions = flat_positions[
+                    token_start : token_start + q_end
+                ].tolist()
+                key_positions = torch.tensor(
+                    prefix_positions + extend_positions,
+                    device=logits.device,
+                )
             elif prefix_len:
                 # First-request chunked prefill has not evicted anything yet.
                 key_positions = torch.arange(key_end, device=logits.device)
@@ -480,6 +491,14 @@ class Qwen3Attention(nn.Module):
                     "history_start": history_start,
                     "history_end": history_end,
                     "history_len": history_end - history_start,
+                    "query_tokens": q_end - q_start,
+                    "selection_query_start": config.get(
+                        "selection_query_start"
+                    ),
+                    "selection_query_end": config.get("selection_query_end"),
+                    "selection_query_phase": config.get(
+                        "selection_query_phase"
+                    ),
                     "layers": [],
                 },
             )
