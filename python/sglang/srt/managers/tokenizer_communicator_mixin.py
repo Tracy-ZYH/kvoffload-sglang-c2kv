@@ -411,6 +411,7 @@ class TokenizerCommunicatorMixin:
         input_text: str,
         compression_ratio: int = 4,
         rid: Optional[str] = None,
+        allow_cache_miss: bool = True,
         outer_request_id: Optional[str] = None,
         measurement_phase: Optional[str] = None,
     ) -> C2KVExtractReqOutput:
@@ -423,6 +424,7 @@ class TokenizerCommunicatorMixin:
             input_ids=input_ids,
             input_text=input_text,
             compression_ratio=compression_ratio,
+            allow_cache_miss=allow_cache_miss,
             c2kv_outer_request_id=outer_request_id,
             c2kv_measurement_phase=measurement_phase,
         )

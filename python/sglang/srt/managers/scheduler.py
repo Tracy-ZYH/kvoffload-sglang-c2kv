@@ -1939,6 +1939,7 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                c2kv_prompt_last_hidden_only=recv_req.c2kv_prompt_last_hidden_only,
                 return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2305,6 +2306,18 @@ class Scheduler(
                 key_hash=key_hash,
                 gist_len=existing.gist_len,
                 original_seq_len=existing.original_seq_len,
+                cache_hit=True,
+                gist_generation_duration_ns=0,
+            )
+
+        if not recv_req.allow_cache_miss:
+            return C2KVExtractReqOutput(
+                key_hash=key_hash,
+                error=(
+                    "C2KV_EXTRACTION_BUDGET_EXHAUSTED: the exact chunk is not "
+                    "cached and this request may not schedule another encoder pass"
+                ),
+                success=False,
             )
 
         expected_gist_len = (
@@ -2360,6 +2373,7 @@ class Scheduler(
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         error_msg = None
         gist_key_values = gist_mask = gist_position_ids = None
+        gist_generation_duration_ns = None
 
         def _release_npu_extract_temps():
             if not _is_npu:
@@ -2370,6 +2384,19 @@ class Scheduler(
             except Exception:
                 logger.warning("C2KV NPU extract cleanup failed", exc_info=True)
 
+        measure_gist_generation = paper_telemetry.enabled()
+        if measure_gist_generation:
+            try:
+                self.schedule_stream.synchronize()
+            except Exception:
+                logger.warning(
+                    "C2KV gist timing start synchronization failed",
+                    exc_info=True,
+                )
+                measure_gist_generation = False
+        gist_generation_started_ns = (
+            time.perf_counter_ns() if measure_gist_generation else None
+        )
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
@@ -2379,6 +2406,18 @@ class Scheduler(
         except Exception as e:
             logger.error(f"C2KV extract failed: {e}", exc_info=True)
             error_msg = str(e)
+        finally:
+            if gist_generation_started_ns is not None:
+                try:
+                    self.schedule_stream.synchronize()
+                    gist_generation_duration_ns = max(
+                        0, time.perf_counter_ns() - gist_generation_started_ns
+                    )
+                except Exception:
+                    logger.warning(
+                        "C2KV gist timing end synchronization failed",
+                        exc_info=True,
+                    )
 
         # TP pool-state guard: if forward_c2kv_extract raises on one rank but
         # not another, that rank skips c2kv_pool.store().  On the next extract
@@ -2401,7 +2440,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
 
         original_seq_len = len(recv_req.input_ids)
         gist_len = gist_mask.shape[1]
@@ -2428,7 +2471,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
         has_space = self.c2kv_pool.can_allocate(gist_len, existing_key=key_hash)
         if self.tp_size > 1 and torch.distributed.is_initialized():
             all_ranks_have_space = torch.tensor([int(has_space)], dtype=torch.long)
@@ -2447,7 +2494,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
 
         try:
             entry = self.c2kv_pool.store(
@@ -2462,7 +2513,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=str(e), success=False)
+            return C2KVExtractReqOutput(
+                error=str(e),
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
         self._log_c2kv_token_usage(
             "extract_store",
             key_hash=key_hash[:16],
@@ -2476,6 +2531,7 @@ class Scheduler(
             key_hash=key_hash,
             gist_len=entry.gist_len,
             original_seq_len=original_seq_len,
+            gist_generation_duration_ns=gist_generation_duration_ns,
         )
 
     @paper_telemetry.measure_synchronous_request("c2kv_repair_extract", "recovery")

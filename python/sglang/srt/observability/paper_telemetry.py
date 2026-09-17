@@ -509,6 +509,13 @@ class _PaperTelemetry:
         peak_kv = active["peak"]["kv"]
         evictable_peak_tokens = _as_int(active.get("cached_evictable_peak_tokens"))
         metrics = {
+            # Gist encoding is a separate synchronous scheduler request.  A
+            # normal generation row contributes zero to the additive decision
+            # total; c2kv_extract rows overwrite this with their measured
+            # cache-miss-only duration in measure_synchronous_request().
+            "gist_generation_duration_ns": (
+                0 if active["kind"] == "generation" else None
+            ),
             "request_peak_resident_kv_tokens": active["peak"]["kv"][
                 "request_resident_kv_tokens"
             ],
@@ -673,6 +680,21 @@ def measure_synchronous_request(kind: str, default_phase: str):
                 error=getattr(output, "error", None) or None,
             )
             if result is not None:
+                if kind == "c2kv_extract":
+                    extraction_duration_ns = result.get("duration_ns")
+                    gist_generation_duration_ns = getattr(
+                        output, "gist_generation_duration_ns", None
+                    )
+                    output.extraction_duration_ns = extraction_duration_ns
+                    result["metrics"]["extraction_duration_ns"] = (
+                        extraction_duration_ns
+                    )
+                    result["metrics"]["gist_generation_duration_ns"] = (
+                        gist_generation_duration_ns
+                    )
+                    result["metrics"]["cache_hit"] = bool(
+                        getattr(output, "cache_hit", False)
+                    )
                 output.paper_measurement = result
             return output
 

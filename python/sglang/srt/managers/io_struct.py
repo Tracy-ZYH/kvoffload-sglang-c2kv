@@ -259,6 +259,9 @@ class GenerateReqInput(BaseReq):
     # Tri-state: True/False = explicit per-request override taken from a chat
     # message field; None = unset -> ServerArgs.c2kv_query_proj decides.
     c2kv_use_gist_projection: Optional[bool] = None
+    # Internal native-serving mode: retain the final prompt row from the
+    # configured auxiliary layer and suppress per-token decode hidden states.
+    c2kv_prompt_last_hidden_only: bool = False
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
@@ -395,6 +398,7 @@ class GenerateReqInput(BaseReq):
             self.c2kv_segments is not None
             or self.c2kv_kv_memory_hint is not None
             or self.c2kv_use_gist_projection is not None
+            or self.c2kv_prompt_last_hidden_only
         ):
             raise ValueError("C2KV fields are not supported on batched requests")
 
@@ -800,6 +804,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # Tri-state: True/False = explicit per-request override taken from a chat
     # message field; None = unset -> ServerArgs.c2kv_query_proj decides.
     c2kv_use_gist_projection: Optional[bool] = None
+    c2kv_prompt_last_hidden_only: bool = False
 
 
 @dataclass
@@ -2090,6 +2095,9 @@ class TokenizedExtractReqInput(BaseReq):
     input_ids: List[int] = field(default_factory=list)
     input_text: str = ""
     compression_ratio: int = 4
+    # A caller enforcing an extraction budget can still reuse an existing
+    # entry while forbidding this request from launching a new encoder pass.
+    allow_cache_miss: bool = True
 
 
 @dataclass
@@ -2099,6 +2107,9 @@ class C2KVExtractReqOutput(BaseReq):
     key_hash: str = ""
     gist_len: int = 0
     original_seq_len: int = 0
+    cache_hit: bool = False
+    extraction_duration_ns: Optional[int] = None
+    gist_generation_duration_ns: Optional[int] = None
     error: str = ""
     success: bool = True
     paper_measurement: Optional[Dict[str, Any]] = None

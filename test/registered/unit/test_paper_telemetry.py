@@ -74,6 +74,7 @@ def test_request_scoped_metrics_include_generation_and_history(monkeypatch, tmp_
     assert result["peak"] is not result["baseline"]
     metrics = result["metrics"]
     assert metrics["generation_active_kv_tokens"] == 42
+    assert metrics["gist_generation_duration_ns"] == 0
     assert metrics["generation_active_kv_bytes"] == 168
     assert metrics["whole_full_kv_tokens"] == 100
     assert metrics["whole_active_kv_tokens"] == 42
@@ -297,3 +298,60 @@ def test_chunk_cache_without_radix_reports_zero_evictable(monkeypatch):
     assert result["metrics"]["cached_evictable_kv_peak_tokens"] == 0
     assert result["metrics"]["request_peak_cached_evictable_kv_bytes"] == 0
     assert result["metrics"]["request_peak_resident_kv_tokens"] == 35
+
+
+def test_extract_wrapper_reports_cache_miss_only_gist_duration(monkeypatch):
+    reports = [
+        {"duration_ns": 101, "metrics": {}},
+        {"duration_ns": 202, "metrics": {}},
+    ]
+    monkeypatch.setattr(paper_telemetry, "start_request", lambda **kwargs: None)
+    monkeypatch.setattr(
+        paper_telemetry,
+        "finish_request",
+        lambda **kwargs: reports.pop(0),
+    )
+
+    class Handler:
+        @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
+        def extract(self, recv_req, output):
+            return output
+
+    request = SimpleNamespace(
+        rid="extract-1",
+        c2kv_outer_request_id="outer-1",
+        c2kv_measurement_phase="native:extraction",
+        input_ids=[1, 2, 3],
+    )
+    miss = SimpleNamespace(
+        success=True,
+        error=None,
+        cache_hit=False,
+        gist_generation_duration_ns=77,
+        extraction_duration_ns=None,
+        paper_measurement=None,
+    )
+    hit = SimpleNamespace(
+        success=True,
+        error=None,
+        cache_hit=True,
+        gist_generation_duration_ns=0,
+        extraction_duration_ns=None,
+        paper_measurement=None,
+    )
+
+    miss_result = Handler().extract(request, miss)
+    hit_result = Handler().extract(request, hit)
+
+    assert miss_result.extraction_duration_ns == 101
+    assert miss_result.paper_measurement["metrics"] == {
+        "extraction_duration_ns": 101,
+        "gist_generation_duration_ns": 77,
+        "cache_hit": False,
+    }
+    assert hit_result.extraction_duration_ns == 202
+    assert hit_result.paper_measurement["metrics"] == {
+        "extraction_duration_ns": 202,
+        "gist_generation_duration_ns": 0,
+        "cache_hit": True,
+    }
