@@ -208,6 +208,25 @@ class SessionAwareCache(BasePrefixCache):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING")
             return self.inner.match_prefix(params)
 
+        # A persistent arm can follow a legacy streaming turn that did not
+        # carry the persistent hint (the first turn has no history to evict).
+        # That turn may have left decode KV in the session slot. Adopt only
+        # the canonical prompt prefix before restoring the slot, otherwise the
+        # old decode suffix becomes allocator-owned but unaccounted after the
+        # next persistent request overwrites the slot metadata.
+        config = getattr(req, "history_kv_eviction", None)
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        if (
+            isinstance(config, dict)
+            and config.get("persistent_continuation_pending")
+            and not slot.history_kv_resident_positions
+        ):
+            logical_prefix = int(
+                hint.get("persistent_session_logical_prefix_tokens") or 0
+            )
+            if logical_prefix > 0:
+                self._adopt_legacy_persistent_prefix(slot, logical_prefix)
+
         slot.restore_to_req(req)
 
         report = getattr(req, "kv_memory_report", None)
@@ -489,6 +508,51 @@ class SessionAwareCache(BasePrefixCache):
             )
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+
+    def _adopt_legacy_persistent_prefix(
+        self, slot: SessionSlot, logical_prefix: int
+    ) -> None:
+        """Trim a pre-marker streaming slot before persistent continuation.
+
+        Older callers omitted ``persistent_history_session`` on the first
+        turn. The slot then contains the canonical prompt plus raw decode KV,
+        but has no resident-position ledger. The continuation request carries
+        the canonical prefix length, so reclaim the suffix by physical page
+        ownership before the slot is reused.
+        """
+
+        old_len = int(slot.kv_allocated_len)
+        keep_len = max(int(logical_prefix), int(slot.cache_protected_len))
+        if keep_len > old_len:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_LEGACY_PREFIX_EXCEEDS_SESSION: "
+                f"{keep_len=}, {old_len=}"
+            )
+        row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+        keep_slots = row[:keep_len].long()
+        keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+        tail_slots = row[keep_len:old_len].long()
+        tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+        free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+        if free_pages.numel():
+            self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+        row[keep_len:old_len] = 0
+
+        slot.kv_committed_len = keep_len
+        slot.kv_allocated_len = keep_len
+        slot.history_kv_resident_positions = list(range(keep_len))
+        slot.history_kv_score_state = {}
+        logging.getLogger(__name__).info(
+            "PERSISTENT_HISTORY_LEGACY_SLOT_ADOPTED %s",
+            json.dumps(
+                {
+                    "kept_prompt_tokens": keep_len,
+                    "discarded_decode_tokens": old_len - keep_len,
+                    "freed_pages": int(free_pages.numel()),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):

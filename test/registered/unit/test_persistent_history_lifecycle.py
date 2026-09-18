@@ -179,6 +179,39 @@ def test_decode_cleanup_never_frees_prompt_pages_at_nonzero_allocator_offset():
     assert req.kv_committed_len == req.kv_allocated_len == 5
 
 
+def test_legacy_streaming_slot_is_reconciled_before_persistent_continuation():
+    adopt = method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "_adopt_legacy_persistent_prefix",
+        {"torch": torch, "SessionSlot": SimpleNamespace, "json": __import__("json"),
+         "logging": __import__("logging")},
+    )
+    row = torch.arange(100, 112).reshape(1, 12)
+    freed = []
+    slot = SimpleNamespace(
+        req_pool_idx=0,
+        kv_committed_len=12,
+        kv_allocated_len=12,
+        cache_protected_len=0,
+        history_kv_resident_positions=[],
+        history_kv_score_state={"stale": {1: 2.0}},
+    )
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda indices: freed.extend(indices.tolist())
+        ),
+    )
+    adopt(owner, slot, 8)
+    assert slot.kv_committed_len == slot.kv_allocated_len == 8
+    assert slot.history_kv_resident_positions == list(range(8))
+    assert slot.history_kv_score_state == {}
+    assert row[0, 8:].tolist() == [0] * 4
+    assert freed == [108, 109, 110, 111]
+
+
 def test_persistent_history_unfinished_kv_stays_out_of_radix_tree():
     cache_unfinished = method(
         CACHE / "session_aware_cache.py",
