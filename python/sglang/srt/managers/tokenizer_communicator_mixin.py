@@ -5,12 +5,10 @@ import copy
 import logging
 import time
 import uuid
-from collections import deque
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
-    Deque,
     Dict,
     Generic,
     List,
@@ -114,31 +112,41 @@ class _Communicator(Generic[T]):
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Future] = deque()
+        self._queue_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+        # Keep the slot reserved until all replies arrive; the lock also keeps
+        # callers that are already waiting ahead of newcomers.
+        await self._queue_lock.acquire()
+        release_lock = True
+        try:
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            if obj:
+                self._sender.send_pyobj(obj)
 
-        if obj:
-            self._sender.send_pyobj(obj)
+            try:
+                await self._result_event.wait()
+            except asyncio.CancelledError:
+                # The scheduler still owes this request its replies. Keep the slot
+                # until they arrive so the next caller cannot receive them.
+                asyncio.create_task(
+                    self._drain_cancelled_queueing_call(self._result_event)
+                )
+                release_lock = False
+                raise
+            return self._result_values
+        finally:
+            if release_lock:
+                self._result_event = self._result_values = None
+                self._queue_lock.release()
 
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
+    async def _drain_cancelled_queueing_call(self, result_event: asyncio.Event):
+        await result_event.wait()
         self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+        self._queue_lock.release()
 
     async def watching_call(self, obj):
         if self._result_event is None:
