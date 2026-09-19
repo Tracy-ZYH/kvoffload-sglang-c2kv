@@ -806,10 +806,53 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "gist_parameter_dtype": "float32",
         "gist_compute_dtype": dtype_name,
         "base_query_enforced": True,
+        "sampling_profiles": ["greedy-v1", "acebench-agent-v1"],
         "server_default_query_projection": getattr(
             server_args, "c2kv_query_proj", "base"
         ),
     }
+
+
+def _c2kv_native_sampling_params(
+    request: C2KVNativePackedGenerateRequest,
+) -> Dict[str, Any]:
+    """Validate the named native sampler without changing accepted parameters."""
+
+    sampling_params = dict(request.sampling_params)
+    if sampling_params.get("n", 1) != 1:
+        raise ValueError("C2KV native packed generation supports only n=1")
+    if sampling_params.get("max_new_tokens", 0) <= 0:
+        raise ValueError("sampling_params.max_new_tokens must be positive")
+
+    if request.sampling_profile == "acebench-agent-v1":
+        allowed = {"max_new_tokens", "temperature", "top_p", "stop_token_ids", "n"}
+        unexpected = set(sampling_params) - allowed
+        if unexpected:
+            raise ValueError(
+                "ACEBench Agent native sampling profile disallows: "
+                + ", ".join(sorted(unexpected))
+            )
+        if (
+            type(sampling_params.get("temperature")) not in (int, float)
+            or float(sampling_params["temperature"]) != 0.001
+            or type(sampling_params.get("top_p")) not in (int, float)
+            or float(sampling_params["top_p"]) != 1.0
+        ):
+            raise ValueError(
+                "ACEBench Agent native sampling profile requires "
+                "temperature=0.001 and top_p=1"
+            )
+        if request.shadow_features is not None:
+            raise ValueError(
+                "ACEBench Agent native sampling profile disallows shadow_features"
+            )
+    elif request.sampling_profile == "greedy-v1":
+        sampling_params.setdefault("temperature", 0.0)
+        if float(sampling_params["temperature"]) != 0.0:
+            raise ValueError("C2KV native packed generation requires greedy decoding")
+    else:
+        raise ValueError("Unknown C2KV native sampling profile")
+    return sampling_params
 
 
 @app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
@@ -829,14 +872,7 @@ async def v1_c2kv_native_generate(
             )
         if request.max_extraction_calls < 0:
             raise ValueError("max_extraction_calls must be nonnegative")
-        sampling_params = dict(request.sampling_params)
-        if sampling_params.get("n", 1) != 1:
-            raise ValueError("C2KV native packed generation supports only n=1")
-        if sampling_params.get("max_new_tokens", 0) <= 0:
-            raise ValueError("sampling_params.max_new_tokens must be positive")
-        sampling_params.setdefault("temperature", 0.0)
-        if float(sampling_params["temperature"]) != 0.0:
-            raise ValueError("C2KV native packed generation requires greedy decoding")
+        sampling_params = _c2kv_native_sampling_params(request)
 
         shadow_request = request.shadow_features
         shadow_enabled = bool(
@@ -1096,6 +1132,7 @@ async def v1_c2kv_native_generate(
                 },
                 "session_id": request.session_id,
                 "generation_id": request.generation_id,
+                "sampling_profile": request.sampling_profile,
                 "output_ids": output_ids,
                 "text": generated.get("text", ""),
                 "token_logprobs": token_logprobs,

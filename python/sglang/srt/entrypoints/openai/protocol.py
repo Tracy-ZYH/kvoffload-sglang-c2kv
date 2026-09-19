@@ -1624,6 +1624,7 @@ class C2KVNativePackedGenerateRequest(BaseModel):
     workspace_input_ids: List[int]
     encoder_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
     compression_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
+    sampling_profile: Literal["greedy-v1", "acebench-agent-v1"] = "greedy-v1"
     sampling_params: Dict[str, Any]
     shadow_features: Optional[Dict[str, Any]] = None
 
