@@ -132,6 +132,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_generation_bases: Dict[str, List[int]] = {}
         self._persistent_history_computed_prefixes: Dict[str, int] = {}
         self._persistent_history_exact_output: Dict[str, bool] = {}
+        self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
 
     def release_persistent_history_session(self, session_id: str) -> None:
         self._persistent_history_sessions.pop(session_id, None)
@@ -139,6 +140,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_generation_bases.pop(session_id, None)
         self._persistent_history_computed_prefixes.pop(session_id, None)
         self._persistent_history_exact_output.pop(session_id, None)
+        self._persistent_history_tool_segments.pop(session_id, None)
 
     @staticmethod
     def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
@@ -149,10 +151,100 @@ class OpenAIServingChat(OpenAIServingBase):
             and hint["persistent_history_session"].get("enabled")
         )
 
+    def _reconcile_exact_generated_prefix(
+        self,
+        previous: List[int],
+        full_prompt_ids: List[int],
+        mismatch_at: int,
+        hint: Dict[str, Any],
+        c2kv_segments: Optional[List] = None,
+    ) -> List[int]:
+        """Keep generated token IDs when chat re-tokenization changes their BPE.
+
+        The prior output is already resident in KV. Its decoded text must be
+        precisely the prefix of the new rendered prompt, and that text must end
+        on a canonical token boundary. Message boundaries are then translated
+        into the actual, generated-token frame before the scheduler sees them.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+
+        def decode(ids: List[int]) -> str:
+            return tokenizer.decode(
+                ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+
+        previous_text = decode(previous)
+        if not decode(full_prompt_ids).startswith(previous_text):
+            raise ValueError("exact generated prefix text changed")
+        canonical_previous = tokenizer.encode(
+            previous_text, add_special_tokens=False
+        )
+        canonical_prefix_len = len(canonical_previous)
+        if (
+            full_prompt_ids[:canonical_prefix_len] != canonical_previous
+            or decode(canonical_previous) != previous_text
+        ):
+            raise ValueError("exact generated prefix has no canonical token boundary")
+
+        delta = full_prompt_ids[canonical_prefix_len:]
+        actual_prompt_ids = previous + delta
+        shift = len(previous) - canonical_prefix_len
+
+        def remap(index: int) -> int:
+            if not 0 <= index <= len(full_prompt_ids):
+                raise ValueError("history boundary is outside the rendered prompt")
+            if index <= mismatch_at:
+                return index
+            if index >= canonical_prefix_len:
+                return index + shift
+            # Earlier generated actions can have different BPE lengths too.
+            # Match their completed-message boundaries by decoded text, not by
+            # a single shift from the most recent action.
+            target = decode(full_prompt_ids[:index])
+            low, high = 0, len(previous)
+            while low < high:
+                middle = (low + high) // 2
+                if len(decode(previous[:middle])) < len(target):
+                    low = middle + 1
+                else:
+                    high = middle
+            if decode(previous[:low]) != target:
+                raise ValueError("history boundary bisects changed tokenization")
+            return low
+
+        updates = []
+        for config_name in ("history_kv_eviction", "paper_measurement"):
+            config = hint.get(config_name)
+            if isinstance(config, dict):
+                for key in ("history_start", "history_end"):
+                    if key in config:
+                        updates.append((config, key, remap(int(config[key]))))
+        for span in hint.get("history_kv_event_token_spans") or []:
+            for key in ("start", "end"):
+                updates.append((span, key, remap(int(span[key]))))
+        for segment in hint.get("tool_memory_segments") or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(segment[key]))))
+        for segment in c2kv_segments or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(getattr(segment, key)))))
+        suffix_key = "history_kv_event_generation_suffix_start"
+        if suffix_key in hint:
+            updates.append((hint, suffix_key, remap(int(hint[suffix_key]))))
+        for config, key, value in updates:
+            if isinstance(config, dict):
+                config[key] = value
+            else:
+                setattr(config, key, value)
+        hint["persistent_session_retokenization_reconciled"] = True
+        hint["persistent_session_retokenization_token_shift"] = shift
+        return actual_prompt_ids
+
     def _prepare_persistent_history_delta(
         self,
         request: ChatCompletionRequest,
         full_prompt_ids: List[int],
+        c2kv_segments: Optional[List] = None,
     ) -> tuple[List[int], Optional[str], Optional[List[int]]]:
         """Return the exact append delta for a streaming history session."""
         if not self._is_persistent_history_request(request):
@@ -226,11 +318,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 common,
             )
-            raise ValueError(
-                "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
-                f"session_id={session_id}, previous_tokens={len(previous)}, "
-                f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
-            )
+            if exact_output and not recovery_append:
+                try:
+                    full_prompt_ids = self._reconcile_exact_generated_prefix(
+                        previous, full_prompt_ids, mismatch, hint, c2kv_segments
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                        f"session_id={session_id}, previous_tokens={len(previous)}, "
+                        f"full_prompt_tokens={len(full_prompt_ids)}, "
+                        f"mismatch_at={mismatch}, reason={exc}"
+                    ) from exc
+            else:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                    f"session_id={session_id}, previous_tokens={len(previous)}, "
+                    f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
+                )
 
         delta = full_prompt_ids[logical_prefix :]
         if not delta and isinstance(config, dict):
@@ -323,8 +428,6 @@ class OpenAIServingChat(OpenAIServingBase):
             raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
         hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
         if hint.get("tool_memory_segments"):
-            if not hasattr(self, "_persistent_history_tool_segments"):
-                self._persistent_history_tool_segments = {}
             self._persistent_history_tool_segments[session_id] = [
                 dict(item) for item in hint["tool_memory_segments"]
             ]
@@ -373,6 +476,12 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
             "generated_text": str(ret[0].get("text") or ""),
             "generated_token_ids": list(output_ids),
+            "retokenization_reconciled": bool(
+                hint.get("persistent_session_retokenization_reconciled", False)
+            ),
+            "retokenization_token_shift": int(
+                hint.get("persistent_session_retokenization_token_shift", 0)
+            ),
             "generation_prefix_tokens": len(generation_prefix_ids or []),
             "recovery_append_supported": not exact_output,
         }
@@ -1150,7 +1259,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             input_ids, persistent_session_id, canonical_prompt_ids = (
                 self._prepare_persistent_history_delta(
-                    request, list(processed_messages.prompt_ids)
+                    request, list(processed_messages.prompt_ids), c2kv_segments
                 )
             )
             if persistent_session_id is not None and c2kv_segments:

@@ -853,22 +853,31 @@ class Qwen3Attention(nn.Module):
         ledger = list(ledgers[batch_idx]) if ledgers and batch_idx < len(ledgers) else []
         if len(ledger) >= seq_len:
             return torch.tensor(ledger[:seq_len], dtype=torch.long, device=device)
-        q_positions = [int(item) for item in query_positions.reshape(-1).tolist()]
-        prefix_len = seq_len - len(q_positions)
+        q_positions = query_positions.reshape(-1).to(dtype=torch.long)
+        prefix_len = seq_len - q_positions.numel()
         known = ledger[:prefix_len]
         missing = prefix_len - len(known)
         if missing:
-            if q_positions:
-                start = q_positions[0] - missing
-            elif known:
-                start = known[-1] + 1
+            if q_positions.numel():
+                start = q_positions[:1] - missing
             else:
-                start = 0
-            known.extend(range(start, start + missing))
-        positions = known + q_positions
-        if len(positions) != seq_len:
+                start = torch.tensor(
+                    [known[-1] + 1 if known else 0],
+                    dtype=torch.long,
+                    device=device,
+                )
+            missing_positions = start + torch.arange(
+                missing, dtype=torch.long, device=device
+            )
+        else:
+            missing_positions = q_positions.new_empty(0)
+        positions = torch.cat(
+            [torch.tensor(known, dtype=torch.long, device=device),
+             missing_positions, q_positions]
+        )
+        if positions.numel() != seq_len:
             raise RuntimeError("REFERENCE_HISTORY_POSITION_LENGTH_MISMATCH")
-        return torch.tensor(positions, dtype=torch.long, device=device)
+        return positions
 
     def _reference_history_attention(
         self,
@@ -958,6 +967,7 @@ class Qwen3Attention(nn.Module):
                     normal_positions,
                     query_pos,
                     scale=self.scaling,
+                    validate_history=False,
                 ).reshape(query_len, -1)
             )
         if offset != q.shape[0]:

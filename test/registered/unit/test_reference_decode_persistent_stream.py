@@ -224,6 +224,7 @@ def test_checkpoint_finish_and_next_turn_append_reuse_only_exact_resident_stream
         _persistent_history_computed_prefixes={},
         _persistent_history_exact_output={},
         _is_persistent_history_request=lambda _: True,
+        _translate_tool_session_coordinates=lambda *_: None,
     )
     canonical_prompt = [10, 11, 12, 13, 14]
     adapted = SimpleNamespace(

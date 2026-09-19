@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.history_kv_reference import (  # noqa: E402
     gather_reference_layer,
     reference_sdpa,
 )
+import sglang.srt.mem_cache.history_kv_reference as reference_module  # noqa: E402
 
 
 def test_reference_attention_masks_each_kv_heads_own_absolute_positions():
@@ -40,6 +41,27 @@ def test_reference_attention_masks_each_kv_heads_own_absolute_positions():
     # Head 0 must exclude its future key at position 10.  Head 1 sees both of
     # its keys at positions 0 and 1 and averages their values.
     torch.testing.assert_close(output, torch.tensor([[[1.0], [4.0]]]))
+
+
+def test_reference_attention_uses_four_dimensional_sdpa(monkeypatch):
+    observed = []
+    original = reference_module.F.scaled_dot_product_attention
+
+    def checked(q, k, v, **kwargs):
+        observed.append((q.ndim, k.ndim, v.ndim, kwargs["attn_mask"].ndim))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
+    history = ReferenceLayerKV(
+        key=torch.zeros(1, 2, 2), value=torch.ones(1, 2, 2),
+        positions=torch.tensor([[0, 1]], dtype=torch.long),
+    )
+    reference_sdpa(
+        torch.zeros(1, 2, 2), history,
+        torch.empty(0, 1, 2), torch.empty(0, 1, 2),
+        torch.empty(0, dtype=torch.long), torch.tensor([1]), scale=1.0,
+    )
+    assert observed == [(4, 4, 4, 4)]
 
 
 def test_two_turn_append_only_uses_previous_resident_kv_and_new_delta():

@@ -419,7 +419,8 @@ def test_serving_delta_prefix_mismatch_fails_without_full_prefill_fallback():
     prepare = method(path, "OpenAIServingChat", "_prepare_persistent_history_delta",
                      {"ChatCompletionRequest": object, "List": list, "Optional": __import__('typing').Optional})
     self = SimpleNamespace(_is_persistent_history_request=lambda _: True,
-                           _persistent_history_sessions={"s": [0, 1, 2, 3]})
+                           _persistent_history_sessions={"s": [0, 1, 2, 3]},
+                           _translate_tool_session_coordinates=lambda *_: None)
     req = SimpleNamespace(stream=False, session_params={"id": "s"},
         c2kv_kv_memory_hint={"persistent_history_session": {"enabled": True, "session_id": "s"},
                            "history_kv_eviction": {"history_start": 1, "history_end": 2}})
@@ -447,6 +448,7 @@ def test_recovery_append_replaces_only_server_verified_generation_prefix():
         _is_persistent_history_request=lambda _: True,
         _persistent_history_sessions={"s": previous},
         _persistent_history_generation_prefixes={"s": [90, 91]},
+        _translate_tool_session_coordinates=lambda *_: None,
     )
     req = SimpleNamespace(
         stream=False,
@@ -721,7 +723,7 @@ def test_session_match_restores_prefix_and_builds_only_new_history_round(monkeyp
                             'persistent_delta_history_tokens': 2},
         c2kv_kv_memory_hint={'persistent_session_logical_prefix_tokens': 8,
                             'persistent_session_canonical_prompt_tokens': 12},
-        origin_input_ids=prior+[8,9,10,11])
+        origin_input_ids=prior+[8,9,10,11], c2kv_tool_source_spans=[])
     def restore(req):
         req.req_pool_idx=0; req.kv_committed_len=5; req.c2kv_position_correction=3
     slot=SimpleNamespace(req_pool_idx=0, history_kv_resident_positions=prior,

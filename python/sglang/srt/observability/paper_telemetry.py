@@ -179,6 +179,23 @@ class _PaperTelemetry:
             c2kv_tokens = _as_int(c2kv_pool.current_tokens()) if c2kv_pool else 0
         except Exception:
             c2kv_tokens = 0
+        # The C2KV pool is an LRU of live KV entries. Its occupied slots are
+        # resident, but unpinned entries can be evicted and must appear in the
+        # cache line item even when the radix cache is disabled.
+        c2kv_cache = getattr(c2kv_pool, "_cache", None)
+        c2kv_pins = getattr(c2kv_pool, "_pin_counts", {})
+        c2kv_evictable = c2kv_pinned = 0
+        if c2kv_cache is not None:
+            for key, entry in c2kv_cache.items():
+                if c2kv_pins.get(key, 0) > 0:
+                    c2kv_pinned += _as_int(entry.gist_len)
+                else:
+                    c2kv_evictable += _as_int(entry.gist_len)
+        c2kv_cache_accounting_available = (
+            c2kv_evictable + c2kv_pinned == c2kv_tokens
+            if c2kv_cache is not None
+            else c2kv_tokens == 0
+        )
         resident_tokens = main_tokens + c2kv_tokens
         bpt = self._bytes_per_kv_token
         cache = self._tree_cache_sizes()
@@ -195,13 +212,18 @@ class _PaperTelemetry:
             "resident_kv_tokens": resident_tokens,
             "resident_kv_bytes": resident_tokens * bpt,
             # Line items of the resident total, never subtracted from it:
-            # evictable prefix-cache slots are real occupancy that the server
-            # keeps for reuse (e.g. left by an auxiliary call), protected ones
-            # are locked by a running request.
-            "cached_evictable_kv_tokens": cache["evictable"],
-            "cached_evictable_kv_bytes": cache["evictable"] * bpt,
-            "cached_protected_kv_tokens": cache["protected"],
-            "cached_protected_kv_bytes": cache["protected"] * bpt,
+            # Evictable radix-cache and C2KV LRU slots are real occupancy that
+            # the server keeps for reuse; protected/pinned slots are held by a
+            # running request.
+            "cached_evictable_kv_tokens": cache["evictable"] + c2kv_evictable,
+            "cached_evictable_kv_bytes": (cache["evictable"] + c2kv_evictable) * bpt,
+            "cached_protected_kv_tokens": cache["protected"] + c2kv_pinned,
+            "cached_protected_kv_bytes": (cache["protected"] + c2kv_pinned) * bpt,
+            "c2kv_cached_evictable_kv_tokens": c2kv_evictable,
+            "c2kv_cached_evictable_kv_bytes": c2kv_evictable * bpt,
+            "c2kv_cached_pinned_kv_tokens": c2kv_pinned,
+            "c2kv_cached_pinned_kv_bytes": c2kv_pinned * bpt,
+            "c2kv_cache_accounting_available": c2kv_cache_accounting_available,
             # Canonical request peak includes temporary K/V payload that is
             # alive at this exact sample.  With no temporary tensors, it is
             # identical to the pooled live payload.
@@ -601,6 +623,15 @@ class _PaperTelemetry:
             ),
             "request_peak_cached_evictable_kv_bytes": _as_int(
                 peak_kv.get("cached_evictable_kv_bytes")
+            ),
+            "request_peak_c2kv_cached_evictable_kv_tokens": _as_int(
+                peak_kv.get("c2kv_cached_evictable_kv_tokens")
+            ),
+            "request_peak_c2kv_cached_evictable_kv_bytes": _as_int(
+                peak_kv.get("c2kv_cached_evictable_kv_bytes")
+            ),
+            "request_peak_c2kv_cache_accounting_available": bool(
+                peak_kv.get("c2kv_cache_accounting_available")
             ),
             "baseline_cached_evictable_kv_tokens": _as_int(
                 active["baseline"]["kv"].get("cached_evictable_kv_tokens")
