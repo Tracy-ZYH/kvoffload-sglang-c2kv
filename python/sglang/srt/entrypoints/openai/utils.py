@@ -70,6 +70,8 @@ def process_hidden_states_from_ret(
 
     hidden_states = ret_item["meta_info"].get("hidden_states", None)
     if hidden_states is not None:
+        if getattr(request, "c2kv_return_full_hidden_states", False):
+            return hidden_states
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
 
