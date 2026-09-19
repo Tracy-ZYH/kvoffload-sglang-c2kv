@@ -347,7 +347,7 @@ def test_peak_keeps_first_sample_so_released_kv_is_not_reported_as_cache(monkeyp
     assert metrics["cached_evictable_kv_peak_tokens"] == 30
 
 
-def test_chunk_cache_without_radix_reports_zero_evictable(monkeypatch):
+def test_uninspectable_c2kv_pool_marks_cache_breakdown_unavailable(monkeypatch):
     monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
     monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
     telemetry = _PaperTelemetry()
@@ -357,6 +357,37 @@ def test_chunk_cache_without_radix_reports_zero_evictable(monkeypatch):
     assert result["metrics"]["cached_evictable_kv_peak_tokens"] == 0
     assert result["metrics"]["request_peak_cached_evictable_kv_bytes"] == 0
     assert result["metrics"]["request_peak_resident_kv_tokens"] == 35
+    assert result["metrics"]["request_peak_c2kv_cache_accounting_available"] is False
+
+
+def test_c2kv_lru_entries_count_as_evictable_without_radix_cache(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+
+    class _InspectableC2KVPool(_C2KVPool):
+        _cache = {
+            "old": SimpleNamespace(gist_len=3),
+            "active": SimpleNamespace(gist_len=2),
+        }
+        _pin_counts = {"active": 1}
+
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _InspectableC2KVPool(), bytes_per_kv_token=4)
+    snapshot = telemetry._kv_snapshot()
+    assert snapshot["resident_kv_tokens"] == 35
+    assert snapshot["c2kv_live_kv_tokens"] == 5
+    assert snapshot["c2kv_cached_evictable_kv_tokens"] == 3
+    assert snapshot["c2kv_cached_pinned_kv_tokens"] == 2
+    assert snapshot["cached_evictable_kv_tokens"] == 3
+    assert snapshot["c2kv_cache_accounting_available"] is True
+
+    telemetry.start(server_request_id="s", outer_request_id="o", phase="chat", kind="generation")
+    result = telemetry.finish(req=SimpleNamespace(rid="s", kv_committed_len=1), success=True)
+    metrics = result["metrics"]
+    assert metrics["request_peak_resident_kv_tokens"] == 35
+    assert metrics["request_peak_cached_evictable_kv_tokens"] == 3
+    assert metrics["request_peak_c2kv_cached_evictable_kv_bytes"] == 12
+    assert metrics["request_peak_c2kv_cache_accounting_available"] is True
 
 
 def test_extract_wrapper_persists_cache_miss_only_gist_duration(
