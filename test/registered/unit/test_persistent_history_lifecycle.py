@@ -220,7 +220,7 @@ def test_persistent_decode_cleanup_preserves_measured_physical_history(
     report = {
         "active_history_kv_tokens": 0,
         "active_full_raw_tokens": 0,
-        "active_history_kv_tokens_source": "physical_eviction_measured",
+        "active_history_kv_tokens_source": "scheduler_runtime",
     }
     if receipt is not None:
         report["history_kv_physical_eviction"] = receipt
@@ -237,6 +237,10 @@ def test_persistent_decode_cleanup_preserves_measured_physical_history(
 
     assert report["active_history_kv_tokens"] == expected_active
     assert report["active_full_raw_tokens"] == expected_active
+    assert report["active_history_kv_tokens_source"] == (
+        "physical_eviction_measured" if receipt and receipt["success"]
+        else "scheduler_runtime"
+    )
     assert report["reference_history_token_slots"] == 0
     assert req.kv_committed_len == req.kv_allocated_len == 5
 
