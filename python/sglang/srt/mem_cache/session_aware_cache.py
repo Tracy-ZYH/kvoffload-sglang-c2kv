@@ -448,12 +448,16 @@ class SessionAwareCache(BasePrefixCache):
                 and len(positions) != len(req.origin_input_ids)
             ):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
-            protected_prompt_len = int(
-                getattr(req, "reference_decode_protected_len", len(positions))
-                or 0
-            )
             self._discard_persistent_decode_suffix(req)
             positions = list(req.history_kv_resident_positions or [])
+            # Ordinary persistent methods discard every decode KV token before
+            # saving the session. The validated resident ledger is therefore
+            # all prompt, even if overlap advanced the mutable decode length.
+            protected_prompt_len = (
+                int(getattr(req, "reference_decode_protected_len", len(positions)) or 0)
+                if exact_generated_prefix
+                else len(positions)
+            )
             if not 0 <= protected_prompt_len <= len(positions):
                 raise RuntimeError(
                     "PERSISTENT_HISTORY_SESSION_PROTECTED_PROMPT_LENGTH_MISMATCH"

@@ -663,9 +663,11 @@ class SchedulerOutputProcessorMixin:
                     # protected system/tool/current-input context. Periodic
                     # reference checkpoints may compress only the subsequently
                     # decoded suffix.
-                    req.reference_decode_protected_len = int(
-                        req.kv_committed_len
-                    )
+                    # In overlap mode the next decode batch can reserve its KV
+                    # slot before this prefill result is processed. The prompt
+                    # IDs already reflect any physical history compaction, while
+                    # kv_committed_len may include that speculative decode slot.
+                    req.reference_decode_protected_len = len(req.origin_input_ids)
                     reference_config = getattr(
                         req, "history_kv_reference_config", None
                     )
@@ -680,7 +682,7 @@ class SchedulerOutputProcessorMixin:
                         else getattr(req, "history_kv_reference_state", None)
                     )
                     req.reference_decode_logical_start = int(
-                        req.kv_committed_len
+                        req.reference_decode_protected_len
                     ) + int(getattr(req, "c2kv_position_correction", 0) or 0)
                     if isinstance(reference_config, dict) and str(
                         reference_config.get("method") or ""
