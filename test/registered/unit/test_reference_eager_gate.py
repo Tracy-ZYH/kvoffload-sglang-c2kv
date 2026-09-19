@@ -40,7 +40,20 @@ def test_reference_runtime_forces_explicit_qkv_before_state_exists():
     gate = namespace[helper.name]
     assert not gate(SimpleNamespace())
     assert not gate(SimpleNamespace(history_kv_reference_configs=[None]))
+    assert not gate(SimpleNamespace(history_kv_reference_states=[None]))
+    assert not gate(SimpleNamespace(
+        history_kv_reference_configs=[None],
+        history_kv_reference_states=[None],
+    ))
     assert gate(SimpleNamespace(history_kv_reference_configs=[{"method": "commitkv"}]))
+    assert gate(SimpleNamespace(
+        history_kv_reference_configs=[{"method": "agentkv"}],
+        history_kv_reference_states=[None],
+    ))
+    assert gate(SimpleNamespace(
+        history_kv_reference_configs=[None],
+        history_kv_reference_states=[object()],
+    ))
     assert gate(SimpleNamespace(history_kv_reference_states=[None, object()]))
 
     attention = next(node for node in tree.body if isinstance(node, ast.ClassDef)
@@ -61,10 +74,11 @@ def test_reference_runtime_forces_explicit_qkv_before_state_exists():
     native_branch = next(
         node for node in ast.walk(forward)
         if isinstance(node, ast.If)
-        and any(isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "forward_prepare_native"
-                for call in ast.walk(node))
+        and any(isinstance(statement, ast.Assign)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "forward_prepare_native"
+                for statement in node.body)
     )
     assert any(isinstance(node, ast.Name) and node.id == "use_reference_runtime"
                for node in ast.walk(native_branch.test))
