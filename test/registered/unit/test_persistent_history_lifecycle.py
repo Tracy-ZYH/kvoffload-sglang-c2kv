@@ -42,6 +42,15 @@ def method(path, cls, name, namespace):
     return namespace[name]
 
 
+def function(path, name, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[name]
+
+
 @pytest.mark.parametrize("method_name", ["streamingllm", "h2o", "snapkv_persistent", "pyramidkv"])
 @pytest.mark.parametrize("layout", ["token", "ascend_page", "ascend_fia"])
 def test_two_turns_reuse_only_resident_kv_and_new_tokens(method_name, layout):
@@ -697,7 +706,10 @@ def test_first_request_selection_round_ends_with_tail_queries(monkeypatch):
     build = method(
         ROOT/'python/sglang/srt/managers/scheduler.py',
         'Scheduler', '_build_history_kv_eviction_rounds',
-        {'Optional': Optional},
+        {
+            'Optional': Optional,
+            '_persistent_history_session_error': lambda *_: None,
+        },
     )
     owner = SimpleNamespace(_log_c2kv_token_usage=lambda *args, **kwargs: None)
     config = {
@@ -716,6 +728,160 @@ def test_first_request_selection_round_ends_with_tail_queries(monkeypatch):
         False, True
     ]
     assert req.kv_memory_report['selection_query_tokens'] == 3
+
+
+def test_persistent_history_session_binding_validation():
+    scheduler = ROOT / "python/sglang/srt/managers/scheduler.py"
+    validate = function(scheduler, "_persistent_history_session_error", {
+        "Optional": Optional,
+    })
+    marker = {
+        "persistent_history_session": {
+            "enabled": True,
+            "session_id": "expected",
+        }
+    }
+    persistent = {"persistent_session": True}
+
+    assert validate(SimpleNamespace(session=None), {}) is None
+    assert validate(SimpleNamespace(
+        session=None, c2kv_kv_memory_hint=marker,
+    ), persistent) == "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    assert validate(SimpleNamespace(
+        session=SimpleNamespace(streaming=False, session_id="expected"),
+        c2kv_kv_memory_hint=marker,
+    ), persistent) == "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION"
+    assert validate(SimpleNamespace(
+        session=SimpleNamespace(streaming=True, session_id="different"),
+        c2kv_kv_memory_hint=marker,
+    ), persistent) == "PERSISTENT_HISTORY_SESSION_ID_MISMATCH"
+    assert validate(SimpleNamespace(
+        session=SimpleNamespace(streaming=True, session_id="expected"),
+        c2kv_kv_memory_hint=marker,
+    ), persistent) is None
+
+
+def test_persistent_first_turn_without_session_fails_before_round_construction():
+    scheduler = ROOT / "python/sglang/srt/managers/scheduler.py"
+    validate = function(scheduler, "_persistent_history_session_error", {
+        "Optional": Optional,
+    })
+    build = method(
+        scheduler,
+        "Scheduler",
+        "_build_history_kv_eviction_rounds",
+        {
+            "Optional": Optional,
+            "_persistent_history_session_error": validate,
+        },
+    )
+    req = SimpleNamespace(
+        session=None,
+        prefix_indices=[],
+        origin_input_ids=list(range(6)),
+        history_kv_eviction={
+            "method": "agentkv",
+            "persistent_session": True,
+            "history_start": 0,
+            "history_end": 0,
+        },
+        c2kv_kv_memory_hint={
+            "persistent_history_session": {"enabled": True, "session_id": "s"}
+        },
+    )
+    assert build(SimpleNamespace(), req) == "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    assert not hasattr(req, "c2kv_rounds")
+
+
+def test_closed_persistent_session_aborts_before_physical_eviction(monkeypatch):
+    scheduler = ROOT / "python/sglang/srt/managers/scheduler.py"
+    validate = function(scheduler, "_persistent_history_session_error", {
+        "Optional": Optional,
+    })
+
+    class Abort:
+        def __init__(self, message):
+            self.message = message
+
+    schedule_batch = types.ModuleType("sglang.srt.managers.schedule_batch")
+    schedule_batch.FINISH_ABORT = Abort
+    monkeypatch.setitem(sys.modules, schedule_batch.__name__, schedule_batch)
+    events = []
+    telemetry = SimpleNamespace(
+        set_phase=lambda phase: events.append(("phase", phase)),
+        sample=lambda event: events.append(("sample", event)),
+    )
+    apply_eviction = method(
+        scheduler,
+        "Scheduler",
+        "_apply_history_kv_eviction",
+        {
+            "_persistent_history_session_error": validate,
+            "paper_telemetry": telemetry,
+        },
+    )
+    checked = []
+    req = SimpleNamespace(
+        session=None,
+        history_kv_eviction={"method": "agentkv", "persistent_session": True},
+        c2kv_kv_memory_hint={
+            "persistent_history_session": {"enabled": True, "session_id": "closed"}
+        },
+        kv_memory_report={},
+        check_finished=lambda: checked.append(True),
+    )
+    assert not apply_eviction(SimpleNamespace(), req)
+    assert isinstance(req.to_finish, Abort)
+    assert req.to_finish.message == "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    assert req.persistent_history_eviction_failed
+    assert checked == [True]
+    assert req.kv_memory_report["history_kv_physical_eviction"] == {
+        "success": False,
+        "error": "PERSISTENT_HISTORY_SESSION_UNAVAILABLE",
+    }
+    assert req.kv_memory_report["history_kv_runtime_status"] == (
+        "persistent_session_unavailable"
+    )
+    assert req.kv_memory_report["persistent_history_session_error"] == (
+        "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    )
+    assert events == [
+        ("phase", "selection"),
+        ("sample", "history_kv_eviction_failed"),
+        ("phase", "prefill"),
+    ]
+
+
+def test_closed_persistent_request_uses_ordinary_cache_cleanup():
+    finished, unfinished = [], []
+    inner = SimpleNamespace(
+        cache_finished_req=lambda req, **kwargs: finished.append((req, kwargs)),
+        cache_unfinished_req=lambda req, **kwargs: unfinished.append((req, kwargs)),
+    )
+    cache_finished = method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "cache_finished_req",
+        {"Req": SimpleNamespace, "_is_streaming": lambda req: False},
+    )
+    cache_unfinished = method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "cache_unfinished_req",
+        {"Req": SimpleNamespace, "_is_streaming": lambda req: False},
+    )
+    owner = SimpleNamespace(inner=inner)
+    req = SimpleNamespace(
+        session=None,
+        persistent_history_eviction_failed=True,
+        c2kv_kv_memory_hint={
+            "persistent_history_session": {"enabled": True, "session_id": "closed"}
+        },
+    )
+    cache_unfinished(owner, req, chunked=True)
+    cache_finished(owner, req, is_insert=False, reason="abort")
+    assert unfinished == [(req, {"chunked": True})]
+    assert finished == [(req, {"is_insert": False, "reason": "abort"})]
 
 
 def test_chunked_selection_scores_accumulate_before_single_eviction():

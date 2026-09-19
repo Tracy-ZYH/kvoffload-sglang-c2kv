@@ -281,6 +281,39 @@ def _c2kv_pending_result_requires_early_process(req) -> bool:
     )
 
 
+def _persistent_history_session_error(req, config=None) -> Optional[str]:
+    """Validate the live streaming-session binding required by persistence."""
+    hint = getattr(req, "c2kv_kv_memory_hint", None)
+    hint = hint if isinstance(hint, dict) else {}
+    marker = hint.get("persistent_history_session")
+    marker = marker if isinstance(marker, dict) else {}
+    config = config if isinstance(config, dict) else getattr(
+        req, "history_kv_eviction", None
+    )
+    config = config if isinstance(config, dict) else {}
+    persistent = bool(
+        marker.get("enabled")
+        or config.get("persistent_session")
+        or config.get("persistent_continuation")
+    )
+    if not persistent:
+        return None
+
+    session = getattr(req, "session", None)
+    if session is None:
+        return "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    if not bool(getattr(session, "streaming", False)):
+        return "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION"
+
+    expected_session_id = marker.get("session_id")
+    if (
+        expected_session_id is not None
+        and expected_session_id != getattr(session, "session_id", None)
+    ):
+        return "PERSISTENT_HISTORY_SESSION_ID_MISMATCH"
+    return None
+
+
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
@@ -3123,6 +3156,9 @@ class Scheduler(
 
     def _build_history_kv_eviction_rounds(self, req: "Req") -> Optional[str]:
         config = getattr(req, "history_kv_eviction", None)
+        session_error = _persistent_history_session_error(req, config)
+        if session_error is not None:
+            return session_error
         if not isinstance(config, dict):
             return None
 
@@ -3164,13 +3200,7 @@ class Scheduler(
             return None
 
         persistent_session = bool(config.get("persistent_session"))
-        persistent_continuation = bool(config.get("persistent_continuation"))
         if persistent_continuation:
-            if not (
-                getattr(req, "session", None) is not None
-                and bool(getattr(req.session, "streaming", False))
-            ):
-                return "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION"
             # SessionAwareCache restores the physical prefix inside
             # match_prefix(). Defer exact round construction until then.
             req.c2kv_rounds = [
@@ -3640,6 +3670,32 @@ class Scheduler(
         if not isinstance(config, dict):
             return True
         paper_telemetry.set_phase("selection")
+        session_error = _persistent_history_session_error(req, config)
+        if session_error is not None:
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                report["history_kv_runtime_status"] = {
+                    "PERSISTENT_HISTORY_SESSION_UNAVAILABLE": (
+                        "persistent_session_unavailable"
+                    ),
+                    "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION": (
+                        "persistent_session_not_streaming"
+                    ),
+                    "PERSISTENT_HISTORY_SESSION_ID_MISMATCH": (
+                        "persistent_session_id_mismatch"
+                    ),
+                }.get(session_error, "persistent_session_error")
+                report["persistent_history_session_error"] = session_error
+                report["history_kv_physical_eviction"] = {
+                    "success": False,
+                    "error": session_error,
+                }
+            req.persistent_history_eviction_failed = True
+            req.to_finish = _FA(session_error)
+            req.check_finished()
+            paper_telemetry.sample("history_kv_eviction_failed")
+            paper_telemetry.set_phase("prefill")
+            return False
         score_info = getattr(req, "history_kv_selection_scores", None)
         selection_query_tokens_observed = (
             int(score_info.get("query_tokens") or 0)
