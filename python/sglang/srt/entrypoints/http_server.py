@@ -877,10 +877,6 @@ def _c2kv_native_sampling_params(
                 "ACEBench Agent native sampling profile requires "
                 "temperature=0.001 and top_p=1"
             )
-        if request.shadow_features is not None:
-            raise ValueError(
-                "ACEBench Agent native sampling profile disallows shadow_features"
-            )
     elif request.sampling_profile == "greedy-v1":
         sampling_params.setdefault("temperature", 0.0)
         if float(sampling_params["temperature"]) != 0.0:
@@ -888,6 +884,23 @@ def _c2kv_native_sampling_params(
     else:
         raise ValueError("Unknown C2KV native sampling profile")
     return sampling_params
+
+
+def _c2kv_native_whole_full_measurement(request, plan):
+    """Use the raw Full renderer count when tool KV changes the prompt frame."""
+    supplied = request.paper_whole_full_kv_tokens
+    if supplied is not None:
+        if type(supplied) is not int or supplied <= 0:
+            raise ValueError("paper_whole_full_kv_tokens must be a positive integer")
+        return supplied, "client_native_full_renderer"
+    has_tool_memory = bool(request.raw_tool_segments or request.tool_gist_segments)
+    has_tool_memory |= any(
+        chunk.projection_set == "tool"
+        for chunk in (*request.encoder_chunks, *request.compression_chunks)
+    )
+    if has_tool_memory:
+        return None, "unknown_missing_client_native_full_renderer"
+    return len(plan.logical_input_ids), "native_logical_input_ids"
 
 
 @app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
@@ -954,6 +967,9 @@ async def v1_c2kv_native_generate(
             tool_binding=capability.get("tool_gist"),
             raw_tool_segments=[item.model_dump() for item in request.raw_tool_segments],
             tool_gist_segments=[item.model_dump() for item in request.tool_gist_segments],
+        )
+        paper_whole_full, paper_whole_full_source = (
+            _c2kv_native_whole_full_measurement(request, plan)
         )
 
         resolved: Dict[str, Dict[str, Any]] = {}
@@ -1095,7 +1111,8 @@ async def v1_c2kv_native_generate(
             c2kv_use_gist_projection=False,
             c2kv_outer_request_id=outer_request_id,
             c2kv_measurement_phase=generation_phase,
-            c2kv_paper_whole_full_kv_tokens=len(plan.logical_input_ids),
+            c2kv_paper_whole_full_kv_tokens=paper_whole_full,
+            c2kv_paper_whole_full_source=paper_whole_full_source,
             c2kv_paper_history_full_kv_tokens=history_source_tokens,
             c2kv_paper_history_active_kv_tokens=history_gist_tokens,
             c2kv_paper_canonical_full_source=True,

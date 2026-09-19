@@ -967,6 +967,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 c2kv_outer_request_id=obj.c2kv_outer_request_id,
                 c2kv_measurement_phase=obj.c2kv_measurement_phase,
                 c2kv_paper_whole_full_kv_tokens=obj.c2kv_paper_whole_full_kv_tokens,
+                c2kv_paper_whole_full_source=obj.c2kv_paper_whole_full_source,
                 c2kv_paper_history_full_kv_tokens=(
                     obj.c2kv_paper_history_full_kv_tokens
                 ),

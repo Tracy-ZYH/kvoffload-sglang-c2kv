@@ -55,6 +55,7 @@ class BaseReq(ABC):
     c2kv_outer_request_id: Optional[str] = field(default=None, kw_only=True)
     c2kv_measurement_phase: Optional[str] = field(default=None, kw_only=True)
     c2kv_paper_whole_full_kv_tokens: Optional[int] = field(default=None, kw_only=True)
+    c2kv_paper_whole_full_source: Optional[str] = field(default=None, kw_only=True)
     c2kv_paper_history_full_kv_tokens: Optional[int] = field(default=None, kw_only=True)
     c2kv_paper_history_active_kv_tokens: Optional[int] = field(default=None, kw_only=True)
     c2kv_paper_canonical_full_source: bool = field(default=False, kw_only=True)

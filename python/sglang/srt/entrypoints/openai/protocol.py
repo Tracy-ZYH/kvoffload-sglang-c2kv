@@ -1668,6 +1668,7 @@ class C2KVNativePackedGenerateRequest(BaseModel):
     compression_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
     raw_tool_segments: List[C2KVNativeRawToolSegment] = Field(default_factory=list)
     tool_gist_segments: List[C2KVNativeToolGistSegment] = Field(default_factory=list)
+    paper_whole_full_kv_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
     sampling_profile: Literal["greedy-v1", "acebench-agent-v1"] = "greedy-v1"
     sampling_params: Dict[str, Any]
     shadow_features: Optional[Dict[str, Any]] = None

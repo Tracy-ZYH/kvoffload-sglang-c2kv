@@ -583,8 +583,13 @@ class _PaperTelemetry:
         history_full = _as_int(semantics.get("history_full_kv_tokens"))
         history_active = _as_int(semantics.get("history_active_kv_tokens"))
         explicit_whole_full = active.get("whole_full_kv_tokens")
+        whole_full_source = getattr(req, "c2kv_paper_whole_full_source", None)
         if explicit_whole_full is not None:
             whole_full = _as_int(explicit_whole_full)
+        elif whole_full_source == "unknown_missing_client_native_full_renderer":
+            # The native tool prompt omits or replaces its raw tool source.
+            # History-only reconstruction cannot recover the Full denominator.
+            whole_full = None
         elif history_full:
             whole_full = whole_active - history_active + history_full
         else:
@@ -647,6 +652,7 @@ class _PaperTelemetry:
             "reference_history_resident_bytes": generation.get(
                 "reference_history_resident_bytes", 0),
             "whole_full_kv_tokens": whole_full,
+            "whole_full_kv_tokens_source": whole_full_source,
             "whole_active_kv_tokens": whole_active,
             "history_full_kv_tokens": semantics.get("history_full_kv_tokens", 0),
             "history_active_kv_tokens": semantics.get("history_active_kv_tokens", 0),

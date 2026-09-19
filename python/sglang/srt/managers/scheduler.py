@@ -2069,6 +2069,7 @@ class Scheduler(
         req.c2kv_paper_whole_full_kv_tokens = (
             recv_req.c2kv_paper_whole_full_kv_tokens
         )
+        req.c2kv_paper_whole_full_source = recv_req.c2kv_paper_whole_full_source
         req.c2kv_paper_history_full_kv_tokens = (
             recv_req.c2kv_paper_history_full_kv_tokens
         )

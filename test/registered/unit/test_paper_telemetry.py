@@ -207,12 +207,40 @@ def test_canonical_request_boundary_overrides_runtime_placeholders(monkeypatch):
         c2kv_paper_history_full_kv_tokens=384,
         c2kv_paper_history_active_kv_tokens=None,
         c2kv_paper_canonical_full_source=True,
+        c2kv_paper_whole_full_source="client_native_full_renderer",
     )
     telemetry.mark_generation_start(req)
     metrics = telemetry.finish(req=req, success=True)["metrics"]
     assert metrics["whole_full_kv_tokens"] == 422
+    assert metrics["whole_full_kv_tokens_source"] == "client_native_full_renderer"
     assert metrics["history_full_kv_tokens"] == 384
     assert metrics["history_active_kv_tokens"] == 96
+
+
+def test_native_tool_without_full_count_keeps_history_but_unknown_whole(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4)
+    telemetry.start(
+        server_request_id="native-tool", outer_request_id="outer-native-tool",
+        phase="c2kv_native:generation", kind="generation",
+    )
+    req = SimpleNamespace(
+        rid="native-tool", kv_committed_len=30, kv_memory_report={},
+        c2kv_paper_whole_full_kv_tokens=None,
+        c2kv_paper_whole_full_source="unknown_missing_client_native_full_renderer",
+        c2kv_paper_history_full_kv_tokens=100,
+        c2kv_paper_history_active_kv_tokens=12,
+        c2kv_paper_canonical_full_source=True,
+    )
+    telemetry.mark_generation_start(req)
+    metrics = telemetry.finish(req=req, success=True)["metrics"]
+    assert metrics["whole_full_kv_tokens"] is None
+    assert metrics["whole_full_kv_tokens_source"] == (
+        "unknown_missing_client_native_full_renderer"
+    )
+    assert metrics["history_full_kv_tokens"] == 100
+    assert metrics["history_active_kv_tokens"] == 12
 
 
 def test_request_peak_uses_simultaneous_pool_plus_temporary_kv(monkeypatch):

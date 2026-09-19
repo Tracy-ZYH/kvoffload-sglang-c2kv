@@ -89,11 +89,6 @@ def test_acebench_profile_passes_exact_sampler_without_seed_or_shadow():
             "sampling_seed",
         ),
         ({"temperature": 0.001, "top_p": 1, "top_k": 5}, None, "top_k"),
-        (
-            {"temperature": 0.001, "top_p": 1},
-            {"enabled": False},
-            "shadow_features",
-        ),
     ],
 )
 def test_acebench_profile_rejects_other_sampler_or_detector_settings(
@@ -139,15 +134,43 @@ def test_capability_advertises_both_named_profiles():
     assert capability["sampling_profiles"] == ["greedy-v1", "acebench-agent-v1"]
 
 
-def test_endpoint_forwards_acebench_sampling_to_generation_request():
+@pytest.mark.parametrize("tool_layout", ["prefix_chunk", "anchored_segment", "raw_segment"])
+def test_tool_native_full_denominator_needs_client_renderer_count(tool_layout):
+    measure = _load_functions("_c2kv_native_whole_full_measurement")[
+        "_c2kv_native_whole_full_measurement"
+    ]
+    tool_chunk = SimpleNamespace(projection_set="tool")
+    request = SimpleNamespace(
+        paper_whole_full_kv_tokens=None,
+        encoder_chunks=[tool_chunk] if tool_layout == "prefix_chunk" else [],
+        compression_chunks=[],
+        tool_gist_segments=[object()] if tool_layout == "anchored_segment" else [],
+        raw_tool_segments=[object()] if tool_layout == "raw_segment" else [],
+    )
+    plan = SimpleNamespace(logical_input_ids=[1, 2, 3])
+    assert measure(request, plan) == (
+        None, "unknown_missing_client_native_full_renderer"
+    )
+    request.paper_whole_full_kv_tokens = 13
+    assert measure(request, plan) == (13, "client_native_full_renderer")
+
+
+@pytest.mark.parametrize("shadow_enabled", [False, True])
+def test_endpoint_forwards_acebench_sampling_to_generation_request(shadow_enabled):
     captured = {}
 
     async def generate_request(request, raw_request):
         captured["sampling_params"] = request.sampling_params
+        captured["whole_full"] = request.c2kv_paper_whole_full_kv_tokens
+        captured["whole_full_source"] = request.c2kv_paper_whole_full_source
+        captured["return_hidden_states"] = request.return_hidden_states
         yield {
             "output_ids": [42],
             "text": "answer",
-            "meta_info": {"output_token_logprobs": [(-0.5, 42)]},
+            "meta_info": {
+                "output_token_logprobs": [(-0.5, 42)],
+                **({"hidden_states": [[1.0, 2.0]]} if shadow_enabled else {}),
+            },
         }
 
     manager = SimpleNamespace(generate_request=generate_request)
@@ -168,12 +191,14 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request():
     )
     namespace = _load_functions(
         "_c2kv_native_sampling_params",
+        "_c2kv_native_whole_full_measurement",
         "v1_c2kv_native_generate",
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         _c2kv_native_capability=lambda: {
             "enabled": True,
             "model_binding": {"pic_enabled": False},
-            "shadow_feature_layer": None,
+            "shadow_feature_layer": 3,
+            "num_hidden_layers": 4,
             "kv_bytes_per_token": 4,
         },
         plan_native_packed_request=lambda **kwargs: plan,
@@ -182,6 +207,7 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request():
         NATIVE_PACKED_RESPONSE_SCHEMA="c2kv-native-packed-response-v1",
         logger=SimpleNamespace(error=lambda *args, **kwargs: None),
         _create_error_response=lambda error: {"error": str(error)},
+        float16_roundtrip=lambda values: list(values),
     )
     sampling = {
         "max_new_tokens": 1000,
@@ -192,10 +218,14 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request():
     request = SimpleNamespace(
         sampling_profile="acebench-agent-v1",
         sampling_params=sampling,
-        shadow_features=None,
+        shadow_features={"enabled": True, "prefill_layer": -1} if shadow_enabled else None,
         max_extraction_calls=0,
+        max_tool_extraction_calls=None,
         encoder_chunks=[],
         compression_chunks=[],
+        raw_tool_segments=[],
+        tool_gist_segments=[],
+        paper_whole_full_kv_tokens=17,
         system_input_ids=[1],
         workspace_input_ids=[2],
         packing_version="history-event-v1",
@@ -212,5 +242,11 @@ def test_endpoint_forwards_acebench_sampling_to_generation_request():
         )
     )
     assert captured["sampling_params"] == sampling
+    assert captured["whole_full"] == 17
+    assert captured["whole_full_source"] == "client_native_full_renderer"
+    assert captured["return_hidden_states"] is shadow_enabled
     assert response["sampling_profile"] == "acebench-agent-v1"
     assert response["output_ids"] == [42]
+    assert (response["shadow_features"] is not None) is shadow_enabled
+    if shadow_enabled:
+        assert response["shadow_features"]["prefill"]["hidden"] == [1.0, 2.0]
