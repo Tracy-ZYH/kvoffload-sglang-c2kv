@@ -331,6 +331,28 @@ def test_runtime_state_pairs_windows_retires_jointly_and_builds_checkpoint():
     assert metadata["retired_page_count"] == 1
     assert metadata["completed_transitions"] == 1
 
+    # A later commit re-scans every message page, including the one already
+    # retired; it must be skipped, not protected as pending (first AppWorld run
+    # failed the checkpoint with "a token cannot be both retired and pending").
+    pre2 = _EffectWindow({
+        frozenset({0}): 0.30,
+        frozenset({1}): 0.001,
+        frozenset({2}): 0.20,
+        frozenset({3}): 0.02,
+    })
+    receipt2 = state.record_pre("commit-2", pages, pre2, range(6), total_budget=4)
+    assert ("completed", 0) not in receipt2["protected_page_ids"]
+    assert receipt2["scanned_pages"] == 3
+    selected2, metadata2 = state.checkpoint(
+        reversed(range(6)),
+        range(6),
+        target_tokens=4,
+        num_layers=2,
+        num_kv_heads=2,
+    )
+    assert all(0 not in row.tolist() for layer in selected2 for row in layer)
+    assert metadata2["retired_page_count"] == 1
+
 
 def test_runtime_state_requires_explicit_layer_and_preserves_pending_page():
     with pytest.raises(ValueError, match="measurement_layer_id"):

@@ -2014,12 +2014,31 @@ class Scheduler(
         elif session_id in self.session_controller:
             # Session exists: create request from session
             session = self.session_controller.get(session_id)
-            req = session.create_req(
-                recv_req,
-                self.tokenizer,
-                self.model_config.vocab_size,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-            )
+            try:
+                req = session.create_req(
+                    recv_req,
+                    self.tokenizer,
+                    self.model_config.vocab_size,
+                    eos_token_ids=self.model_config.hf_eos_token_id,
+                )
+            except ValueError as exc:
+                # A persistent-history session left in an unusable state by an
+                # earlier aborted turn (e.g. no active output after a finish_abort)
+                # must fail this request, not the scheduler process.
+                error_msg = f"Invalid request: session {session_id}: {exc}"
+                logger.error(error_msg)
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
             # TODO: set trace context
             if self.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
