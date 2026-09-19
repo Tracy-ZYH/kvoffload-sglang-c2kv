@@ -493,6 +493,7 @@ def reference_sdpa(
     query_positions: torch.Tensor,
     *,
     scale: float,
+    validate_history: bool = True,
 ) -> torch.Tensor:
     """Attend over headwise history plus ordinary paged KV.
 
@@ -500,7 +501,11 @@ def reference_sdpa(
     output is ``[Q,Hq,D]``. Keys in both inputs are already RoPE-rotated.
     """
 
-    history.validate()
+    # Materialized serving states are validated at construction. Rechecking
+    # their monotonic GPU positions on every decode token synchronizes CUDA on
+    # every model layer; direct callers retain the validating default.
+    if validate_history:
+        history.validate()
     if query.ndim != 3 or normal_key.ndim != 3 or normal_value.shape != normal_key.shape:
         raise ValueError("invalid reference attention tensor ranks")
     q_len, q_heads, dim = query.shape
@@ -522,9 +527,12 @@ def reference_sdpa(
     key = key.repeat_interleave(groups, dim=0)
     value = value.repeat_interleave(groups, dim=0)
     key_pos = key_pos.repeat_interleave(groups, dim=0)
-    q = query.transpose(0, 1)
-    mask = key_pos.unsqueeze(1) <= query_positions.view(1, -1, 1)
+    # SDPA's fused CUDA implementations expect [B,H,Q,D]. A rank-3 tensor
+    # sends this reference route through a slower fallback on every layer.
+    q = query.transpose(0, 1).unsqueeze(0)
+    mask = (key_pos.unsqueeze(1) <= query_positions.view(1, -1, 1)).unsqueeze(0)
     output = F.scaled_dot_product_attention(
-        q, key, value, attn_mask=mask, dropout_p=0.0, scale=float(scale)
+        q, key.unsqueeze(0), value.unsqueeze(0),
+        attn_mask=mask, dropout_p=0.0, scale=float(scale)
     )
-    return output.transpose(0, 1).contiguous()
+    return output.squeeze(0).transpose(0, 1).contiguous()

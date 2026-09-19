@@ -330,10 +330,12 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
+        active_req = None
         if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
+                active_req = req
                 req.session = None
 
         # Release multimodal features held by session requests.
@@ -348,7 +350,7 @@ class SessionController:
             node.req.multimodal_inputs = None
 
         if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(session_id)
+            self.tree_cache.release_session(session_id, active_req=active_req)
         del self.sessions[session_id]
 
     def maybe_reap(self, now: float, interval: float = 1.0):
@@ -356,7 +358,13 @@ class SessionController:
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
             timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
+                sid
+                for sid, session in self.sessions.items()
+                if session.is_timed_out()
+                and not (
+                    session.streaming
+                    and any(not node.req.finished() for node in session.req_nodes.values())
+                )
             ]
             for sid in timed_out:
                 logger.info(f"Session {sid} timed out, closing.")

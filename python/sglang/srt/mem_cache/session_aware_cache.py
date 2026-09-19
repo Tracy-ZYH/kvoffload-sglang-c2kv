@@ -176,7 +176,9 @@ class SessionAwareCache(BasePrefixCache):
     @staticmethod
     def owns_finished_request(req: Req) -> bool:
         """Streaming KV belongs to the session, even without radix insertion."""
-        return _is_streaming(req)
+        return _is_streaming(req) or bool(
+            getattr(req, "session_cache_closed_during_request", False)
+        )
 
     @property
     def req_to_token_pool(self):
@@ -226,6 +228,21 @@ class SessionAwareCache(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
+        if getattr(req, "session_cache_closed_during_request", False):
+            # A retry after explicit close still owns the restored KV row. Do
+            # not match its possibly compacted physical indices as a radix key.
+            prefix_len = min(
+                req.kv_committed_len, max(len(params.key.token_ids) - 1, 0)
+            )
+            device_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :prefix_len
+            ].to(dtype=torch.int64)
+            return MatchResult(
+                device_indices=device_indices,
+                last_device_node=req.last_node,
+                last_host_node=req.last_node,
+                cache_protected_len=req.cache_protected_len,
+            )
         if not _is_streaming(req):
             return self.inner.match_prefix(params)
 
@@ -420,6 +437,10 @@ class SessionAwareCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        if getattr(req, "session_cache_closed_during_request", False):
+            # The orphaned request owns the row transferred by release_session.
+            # Its physical KV can no longer be inserted under canonical tokens.
+            return self.inner.cache_finished_req(req, is_insert=False, **kwargs)
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
@@ -905,6 +926,12 @@ class SessionAwareCache(BasePrefixCache):
         )
 
     def cache_unfinished_req(self, req: Req, **kwargs):
+        if getattr(req, "session_cache_closed_during_request", False):
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return
         if _is_streaming(req):
             if self._is_persistent_history_req(req):
                 # Physical history eviction rewrites and frees request-owned
@@ -953,13 +980,30 @@ class SessionAwareCache(BasePrefixCache):
 
     # -- Session lifecycle --
 
-    def release_session(self, session_id: str):
+    def release_session(self, session_id: str, active_req: Optional[Req] = None):
         """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
 
-        if slot.last_node is not None:
+        # restore_to_req leaves the slot's pool index intact for retry. While
+        # that request is running, however, the slot and request point to the
+        # same KV. An explicit close transfers ownership to the request, whose
+        # normal completion path releases it after req.session is cleared.
+        borrowed_by_active_req = (
+            active_req is not None
+            and active_req.req_pool_idx is not None
+            and active_req.req_pool_idx == slot.req_pool_idx
+        )
+
+        if borrowed_by_active_req:
+            # The running request now owns both its KV row and the slot's
+            # radix lock. Its regular completion path releases the lock once.
+            active_req.session_cache_closed_during_request = True
+            active_req.last_node = slot.last_node
+            active_req.swa_uuid_for_lock = slot.swa_uuid_for_lock
+            active_req.cache_protected_len = slot.cache_protected_len
+        elif slot.last_node is not None:
             if slot.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
                     slot.last_node,
@@ -968,7 +1012,7 @@ class SessionAwareCache(BasePrefixCache):
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
-        if slot.is_holding_kv:
+        if slot.is_holding_kv and not borrowed_by_active_req:
             start = slot.cache_protected_len
             end = slot.kv_allocated_len
             if start < end:
@@ -978,7 +1022,13 @@ class SessionAwareCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
         logging.getLogger(__name__).info("HISTORY_KV_SESSION_CLOSED %s", json.dumps({
-            "session_id": session_id, "resident_tokens_released": slot.kv_allocated_len,
+            "session_id": session_id,
+            "resident_tokens_released": (
+                0 if borrowed_by_active_req else slot.kv_allocated_len
+            ),
+            "resident_tokens_transferred_to_active_req": (
+                slot.kv_allocated_len if borrowed_by_active_req else 0
+            ),
             "remaining_session_slots": len(self.slots)}))
 
     def session_held_tokens(self) -> int:
