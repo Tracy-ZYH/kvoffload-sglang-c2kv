@@ -81,10 +81,23 @@ def canonical_chunk_payload(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     token_ids = _token_ids(
         chunk.get("token_ids") or (), field="chunk.token_ids", allow_empty=False
     )
+    projection_set = chunk.get("projection_set")
+    if projection_set in (None, "", "history"):
+        projection_set = None
+    elif projection_set != "tool":
+        raise ValueError(
+            f"chunk.projection_set must be 'history' or 'tool', got {projection_set!r}"
+        )
+    elif not tool_binding or not tool_binding.get("enabled") or not tool_binding.get("identity"):
+        raise ValueError(
+            "C2KV_TOOL_GIST_UNAVAILABLE: a chunk requests projection_set='tool' "
+            "but the server has no --c2kv-tool-gist-weights set"
+        )
     source_indices = tuple(chunk.get("source_indices") or ())
     if any(type(index) is not int or index < 0 for index in source_indices):
         raise ValueError("chunk.source_indices must contain nonnegative integers")
@@ -107,7 +120,7 @@ def canonical_chunk_payload(
         raise ValueError(
             "chunk source token bounds must be nonnegative and match token_ids length"
         )
-    return {
+    payload = {
         "schema": NATIVE_CHUNK_HANDLE_SCHEMA,
         "model_binding": dict(model_binding),
         "packing_version": str(packing_version),
@@ -123,6 +136,12 @@ def canonical_chunk_payload(
             "token_ids": list(token_ids),
         },
     }
+    if projection_set is not None:
+        # Only tool-set chunks carry these keys, so every existing history
+        # handle stays byte-identical.
+        payload["chunk"]["projection_set"] = projection_set
+        payload["projection_identity"] = str(tool_binding["identity"])
+    return payload
 
 
 def canonical_chunk_handle(
@@ -132,6 +151,7 @@ def canonical_chunk_handle(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> str:
     payload = canonical_chunk_payload(
         chunk,
@@ -139,6 +159,7 @@ def canonical_chunk_handle(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -153,6 +174,7 @@ def _normalize_chunk(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = canonical_chunk_payload(
         chunk,
@@ -160,6 +182,7 @@ def _normalize_chunk(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     normalized = dict(payload["chunk"])
     handle = canonical_chunk_handle(
@@ -168,6 +191,7 @@ def _normalize_chunk(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     supplied_handle = chunk.get("handle")
     if supplied_handle is not None and supplied_handle != handle:
@@ -194,8 +218,14 @@ def plan_native_packed_request(
     raw_layout_profile: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> NativePackedPlan:
-    """Validate the native token frame and build existing C2KV segment spans."""
+    """Validate the native token frame and build existing C2KV segment spans.
+
+    ``tool_binding`` is the server's ``tool_gist`` capability; chunks that name
+    ``projection_set="tool"`` (compressed tool definitions, laid out before the
+    history chunks) bind their handles to it.
+    """
 
     if packing_version != PACKING_VERSION:
         raise ValueError(
@@ -224,6 +254,7 @@ def plan_native_packed_request(
             packing_version=packing_version,
             encoding_scope=encoding_scope,
             compression_ratio=compression_ratio,
+            tool_binding=tool_binding,
         )
         for chunk in encoder_chunks
     ]
@@ -234,6 +265,7 @@ def plan_native_packed_request(
             packing_version=packing_version,
             encoding_scope=encoding_scope,
             compression_ratio=compression_ratio,
+            tool_binding=tool_binding,
         )
         for chunk in compression_chunks
     ]

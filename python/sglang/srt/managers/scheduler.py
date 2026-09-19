@@ -2300,24 +2300,44 @@ class Scheduler(
             return C2KVExtractReqOutput(error=str(e), success=False)
 
         hf_config = getattr(self.model_config, "hf_config", None)
+        extractor_config = {
+            "gist_type": getattr(
+                self.server_args, "c2kv_gist_type", "dynamic-interleave"
+            ),
+            "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
+            "gist_extra_embed_num": getattr(
+                hf_config, "gist_extra_embed_num", 1
+            ),
+            "gist_residual_type": getattr(
+                hf_config, "gist_residual_type", "none"
+            ),
+            "gist_overlap": getattr(hf_config, "gist_overlap", 0),
+            "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
+            "pic_param": getattr(hf_config, "pic_param", "qkv"),
+        }
+        projection_set = getattr(recv_req, "projection_set", "history") or "history"
+        if projection_set != "history":
+            # A second encoder's entries must never alias the history set's:
+            # the set name and the tool checkpoint identity join the key.  The
+            # "history" key is byte-identical to the pre-tool-set schema.
+            tool_identity = getattr(
+                model_runner.model, "c2kv_tool_gist_identity", None
+            )
+            if projection_set != "tool" or not tool_identity:
+                return C2KVExtractReqOutput(
+                    error=(
+                        "C2KV_TOOL_GIST_UNAVAILABLE: projection_set "
+                        f"{projection_set!r} is not loaded on this server "
+                        "(start it with --c2kv-tool-gist-weights)"
+                    ),
+                    success=False,
+                )
+            extractor_config["projection_set"] = "tool"
+            extractor_config["projection_identity"] = tool_identity
         key_hash = self.c2kv_pool.compute_hash(
             recv_req.input_ids,
             compression_ratio=compression_ratio,
-            extractor_config={
-                "gist_type": getattr(
-                    self.server_args, "c2kv_gist_type", "dynamic-interleave"
-                ),
-                "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
-                "gist_extra_embed_num": getattr(
-                    hf_config, "gist_extra_embed_num", 1
-                ),
-                "gist_residual_type": getattr(
-                    hf_config, "gist_residual_type", "none"
-                ),
-                "gist_overlap": getattr(hf_config, "gist_overlap", 0),
-                "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
-                "pic_param": getattr(hf_config, "pic_param", "qkv"),
-            },
+            extractor_config=extractor_config,
         )
         self._log_c2kv_token_usage(
             "extract_request",
@@ -2433,7 +2453,10 @@ class Scheduler(
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
-                    input_ids, attention_mask, compression_ratio
+                    input_ids,
+                    attention_mask,
+                    compression_ratio,
+                    projection_set=projection_set,
                 )
             )
         except Exception as e:

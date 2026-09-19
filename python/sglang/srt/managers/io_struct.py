@@ -2098,6 +2098,9 @@ class TokenizedExtractReqInput(BaseReq):
     # A caller enforcing an extraction budget can still reuse an existing
     # entry while forbidding this request from launching a new encoder pass.
     allow_cache_miss: bool = True
+    # Gist encoder: "history" (served checkpoint) or "tool"
+    # (--c2kv-tool-gist-weights).  Part of the cache key when not "history".
+    projection_set: str = "history"
 
 
 @dataclass

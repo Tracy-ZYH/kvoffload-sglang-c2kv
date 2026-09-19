@@ -477,6 +477,13 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Optional[List[Dict]]:
         if not request.tools or request.tool_choice == "none":
             return None
+        if getattr(request, "c2kv_tools_in_prompt", None) is False:
+            # C2KV tool memory: the client renders its own explicit tool
+            # protocol and supplies the schemas as gist segments; the served
+            # prompt must not carry a second copy.  Every token frame this
+            # class measures (segments, history span, repair offsets) goes
+            # through this one accessor, so all of them agree.
+            return None
         exclude_unset = self._c2kv_tools_dump_exclude_unset()
         if not isinstance(request.tool_choice, str):
             return chat_template_tools_dump(
@@ -1177,7 +1184,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = self._chat_template_tools(request)
-        if tools is not None:
+        # Tool-call parsing follows request.tools even when the schemas are
+        # kept out of the prompt (c2kv_tools_in_prompt=False).
+        parse_tool_calls = tools is not None or bool(
+            request.tools
+            and request.tool_choice != "none"
+            and getattr(request, "c2kv_tools_in_prompt", None) is False
+        )
+        if parse_tool_calls:
             request.skip_special_tokens = False
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
@@ -1253,7 +1267,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tools and tools is not None:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
             real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)

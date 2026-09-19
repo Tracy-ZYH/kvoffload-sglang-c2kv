@@ -238,6 +238,27 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
+            # Optional second ("tool") gist projection set.  It exists only for
+            # extraction requests that name projection_set="tool"; ordinary
+            # tokens never select it, so the per-token base/gist mask and the
+            # CUDA-graph buffers stay exactly as before.
+            self.c2kv_tool_gist_enabled = False
+            if not pic_enabled and getattr(
+                get_global_server_args(), "c2kv_tool_gist_weights", None
+            ):
+                self.tool_gist_qkv_proj = QKVParallelLinear(
+                    hidden_size,
+                    self.head_dim,
+                    self.total_num_heads,
+                    self.total_num_kv_heads,
+                    bias=attention_bias,
+                    params_dtype=torch.float32,
+                    quant_config=None,
+                    tp_rank=attn_tp_rank,
+                    tp_size=attn_tp_size,
+                    prefix=add_prefix("tool_gist_qkv_proj", prefix),
+                )
+                self.c2kv_tool_gist_enabled = True
             if not pic_enabled:
                 # PIC/residual_qkv_proj is excluded by construction: there is no
                 # gist_qkv_proj to switch to.
@@ -345,10 +366,30 @@ class Qwen3Attention(nn.Module):
         ]
         return torch.cat(merged, dim=-1)
 
-    def _c2kv_project_gist_qkv(self, hidden_states):
+    def _c2kv_gist_projection(self, projection_set: str = "history"):
+        """The fused gist QKV linear of one projection set.
+
+        ``history`` is the served checkpoint's own set (``gist_qkv_proj``);
+        ``tool`` is the optional --c2kv-tool-gist-weights set.  Requesting a
+        set that was not loaded is a hard error, never a silent fallback to the
+        other set (the two encoders are trained on different corpora).
+        """
+        if projection_set == "history":
+            return self.gist_qkv_proj
+        if projection_set == "tool":
+            projection = getattr(self, "tool_gist_qkv_proj", None)
+            if projection is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNAVAILABLE: projection_set='tool' needs "
+                    "a server started with --c2kv-tool-gist-weights"
+                )
+            return projection
+        raise ValueError(f"Unknown C2KV projection set {projection_set!r}")
+
+    def _c2kv_project_gist_qkv(self, hidden_states, projection_set: str = "history"):
         """Apply FP32-stored gist weights in the base compute dtype."""
 
-        projection = self.gist_qkv_proj
+        projection = self._c2kv_gist_projection(projection_set)
         if projection.weight.dtype == hidden_states.dtype:
             return projection(hidden_states)
         with torch.autocast(
@@ -1309,6 +1350,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,        # (1, total_len) int64
         attention_mask,                 # BlockMask or None
         apply_gist_residual,
+        projection_set: str = "history",
         **kwargs,
     ):
 
@@ -1326,7 +1368,7 @@ class Qwen3Attention(nn.Module):
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
 
-        qkv_gist, _ = self._c2kv_project_gist_qkv(gist_hidden)
+        qkv_gist, _ = self._c2kv_project_gist_qkv(gist_hidden, projection_set)
         q_gist, k_gist, v_gist = qkv_gist.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
@@ -1655,6 +1697,100 @@ class Qwen3Model(Qwen2Model):
         self.prepare_gist_input = get_prepare_gist_input_func(gist_cfg)
         return gist_cfg
 
+    def _init_c2kv_tool_set(self, config, tool_config, server_args) -> GistConfig:
+        """Gist embedding and mask/position builder of the second ("tool") set.
+
+        The layout constants come from the tool checkpoint's own config.json;
+        the projection weights are loaded afterwards by
+        ``Qwen3ForCausalLM.load_c2kv_tool_gist_weights``.  Nothing here is
+        consulted by the ordinary decode path.
+        """
+        gist_cfg = GistConfig(
+            gist_type=server_args.c2kv_gist_type,
+            gist_param=server_args.c2kv_gist_param,
+            gist_extra_embed_num=int(tool_config.get("gist_extra_embed_num", 1)),
+            gist_token_id=tool_config.get("gist_token_id"),
+            gist_residual_type=tool_config.get("gist_residual_type", "none"),
+            gist_overlap=int(tool_config.get("gist_overlap", 0)),
+            hidden_size=config.hidden_size,
+            attention_bias=bool(tool_config.get("attention_bias", False)),
+        )
+        self.tool_gist_embed_tokens = nn.Embedding(
+            gist_cfg.gist_extra_embed_num,
+            config.hidden_size,
+            dtype=torch.float32,
+        )
+        self.prepare_tool_gist_input = get_prepare_gist_input_func(gist_cfg)
+        return gist_cfg
+
+
+# Architecture fields the tool gist checkpoint must share with the served
+# model: its gist projections are applied to the served model's hidden states.
+_C2KV_TOOL_GIST_SHAPE_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+)
+
+
+def _load_c2kv_tool_gist_config(source: str, config, server_args) -> Dict[str, Any]:
+    """Read and validate ``<source>/config.json`` of the tool gist set."""
+    import json
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        tool_config = json.load(handle)
+    if tool_config.get("pic_enabled"):
+        raise ValueError("--c2kv-tool-gist-weights must be a gist checkpoint, not PIC")
+    gist_type = tool_config.get("gist_type")
+    if gist_type is not None and gist_type != server_args.c2kv_gist_type:
+        raise ValueError(
+            "C2KV tool gist set declares gist_type "
+            f"{gist_type!r} but the server runs {server_args.c2kv_gist_type!r}"
+        )
+    gist_param = tool_config.get("gist_param")
+    if gist_param is not None and str(gist_param) != str(server_args.c2kv_gist_param):
+        raise ValueError(
+            "C2KV tool gist set declares gist_param "
+            f"{gist_param!r} but the server runs {server_args.c2kv_gist_param!r}"
+        )
+    for field in _C2KV_TOOL_GIST_SHAPE_FIELDS:
+        expected = getattr(config, field, None)
+        actual = tool_config.get(field)
+        if expected is not None and actual is not None and int(actual) != int(expected):
+            raise ValueError(
+                f"C2KV tool gist set {field}={actual} does not match the served "
+                f"model ({expected})"
+            )
+    return tool_config
+
+
+def _c2kv_gist_weight_files(source: str) -> List[str]:
+    """Safetensors files of ``source`` that can hold gist tensors."""
+    import json
+
+    package = os.path.join(source, "c2kv-gist.safetensors")
+    if os.path.isfile(package):
+        return [package]
+    index = os.path.join(source, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index, "r", encoding="utf-8") as handle:
+            weight_map = json.load(handle).get("weight_map") or {}
+        files = sorted(
+            {name for key, name in weight_map.items() if "gist_" in key}
+        )
+        if not files:
+            raise ValueError(f"No gist tensors listed in {index}")
+        return [os.path.join(source, name) for name in files]
+    single = os.path.join(source, "model.safetensors")
+    if os.path.isfile(single):
+        return [single]
+    raise ValueError(
+        "--c2kv-tool-gist-weights needs c2kv-gist.safetensors, "
+        f"model.safetensors or model.safetensors.index.json under {source}"
+    )
+
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -1725,6 +1861,31 @@ class Qwen3ForCausalLM(nn.Module):
                 )
             else:
                 self.gist_cfg = self.model._init_c2kv(config, _server_args)
+            # Optional second gist projection set for tool-definition
+            # compression (T0).  Weights are loaded by the model runner right
+            # after the served checkpoint, see load_c2kv_tool_gist_weights.
+            self.tool_gist_cfg = None
+            self.c2kv_tool_gist_source = getattr(
+                _server_args, "c2kv_tool_gist_weights", None
+            )
+            self.c2kv_tool_gist_identity = None
+            self.c2kv_tool_gist_metadata = None
+            if self.c2kv_tool_gist_source:
+                if self.full_length_pic:
+                    raise ValueError(
+                        "--c2kv-tool-gist-weights is not supported with PIC"
+                    )
+                tool_config = _load_c2kv_tool_gist_config(
+                    self.c2kv_tool_gist_source, config, _server_args
+                )
+                self.tool_gist_cfg = self.model._init_c2kv_tool_set(
+                    config, tool_config, _server_args
+                )
+                self.c2kv_tool_gist_metadata = {
+                    key: value
+                    for key, value in tool_config.items()
+                    if key.startswith("history_memory_") or key.startswith("gist_")
+                }
             shadow_layer = getattr(_server_args, "c2kv_shadow_feature_layer", None)
             if shadow_layer is not None:
                 num_layers = int(config.num_hidden_layers)
@@ -1837,7 +1998,35 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     @torch.no_grad()
-    def generate_gist(self, input_ids, attention_mask, ratio=4, **kwargs):
+    def _c2kv_gist_set(self, projection_set: str):
+        """(gist_cfg, gist embedding, prepare_gist_input) of one projection set."""
+        if projection_set == "history":
+            return (
+                self.gist_cfg,
+                self.model.gist_embed_tokens,
+                self.model.prepare_gist_input,
+            )
+        if projection_set == "tool":
+            if getattr(self, "tool_gist_cfg", None) is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNAVAILABLE: projection_set='tool' needs "
+                    "a server started with --c2kv-tool-gist-weights"
+                )
+            if self.c2kv_tool_gist_identity is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNLOADED: the tool gist weights were not "
+                    "loaded before extraction"
+                )
+            return (
+                self.tool_gist_cfg,
+                self.model.tool_gist_embed_tokens,
+                self.model.prepare_tool_gist_input,
+            )
+        raise ValueError(f"Unknown C2KV projection set {projection_set!r}")
+
+    def generate_gist(
+        self, input_ids, attention_mask, ratio=4, projection_set="history", **kwargs
+    ):
         """
         Run the gist extraction pass for one document.
 
@@ -1845,6 +2034,8 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids:       (1, seq_len) int64 on GPU
             attention_mask:  (1, seq_len) bool on GPU
             ratio:           compression ratio; gist_len = ceil(seq_len / ratio)
+            projection_set:  "history" (the served checkpoint's gist set) or
+                             "tool" (--c2kv-tool-gist-weights)
 
         Returns:
             gist_key_values: List[(K, V)] per layer, each (gist_len, kv_size) float,
@@ -1853,8 +2044,11 @@ class Qwen3ForCausalLM(nn.Module):
             gist_position_ids: (1, gist_len) int64
         """
         autocast_active = bool(kwargs.pop("_c2kv_fp32_autocast_active", False))
+        gist_cfg, gist_embed_tokens, prepare_gist_input = self._c2kv_gist_set(
+            projection_set
+        )
         base_dtype = self.model.embed_tokens.weight.dtype
-        gist_dtype = self.model.gist_embed_tokens.weight.dtype
+        gist_dtype = gist_embed_tokens.weight.dtype
         if gist_dtype != base_dtype and not autocast_active:
             with torch.autocast(
                 device_type=input_ids.device.type,
@@ -1864,17 +2058,18 @@ class Qwen3ForCausalLM(nn.Module):
                     input_ids,
                     attention_mask,
                     ratio=ratio,
+                    projection_set=projection_set,
                     _c2kv_fp32_autocast_active=True,
                     **kwargs,
                 )
 
-        block_mask, gist_mask, position_ids = self.model.prepare_gist_input(
+        block_mask, gist_mask, position_ids = prepare_gist_input(
             input_ids, attention_mask, ratio=ratio
         )
         gist_len = gist_mask.shape[1]
         device = input_ids.device
 
-        gist_embed = self.model.gist_embed_tokens(
+        gist_embed = gist_embed_tokens(
             torch.zeros((1, gist_len), dtype=torch.long, device=device)
         ).to(dtype=self.model.embed_tokens.weight.dtype)
         inputs_embeds = torch.cat(
@@ -1884,13 +2079,14 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = inputs_embeds
         gist_key_values = []
         for layer_idx, layer in enumerate(self.model.layers):
-            layer_residual = get_apply_gist_residual_func(self.gist_cfg, layer_idx)
+            layer_residual = get_apply_gist_residual_func(gist_cfg, layer_idx)
             hidden_states, layer_kv = layer.forward_with_gist(
                 hidden_states,
                 gist_mask,
                 positions=position_ids.squeeze(0),
                 attention_mask=block_mask,
                 apply_gist_residual=layer_residual,
+                projection_set=projection_set,
                 ratio=ratio,
             )
             gist_key_values.append(layer_kv)
@@ -2786,6 +2982,94 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def load_c2kv_tool_gist_weights(self) -> Dict[str, Any]:
+        """Load the second ("tool") gist set from --c2kv-tool-gist-weights.
+
+        Reads only the ``gist_*`` tensors of the source (a full checkpoint or a
+        ``c2kv-gist.safetensors`` export package) and maps them onto
+        ``tool_gist_qkv_proj`` / ``tool_gist_embed_tokens``.  Every fused
+        projection must receive all three shards, otherwise loading fails
+        instead of serving a partially initialised encoder.
+        """
+        from safetensors import safe_open
+
+        from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
+
+        source = getattr(self, "c2kv_tool_gist_source", None)
+        if not source or getattr(self, "tool_gist_cfg", None) is None:
+            raise RuntimeError("No C2KV tool gist set is configured on this model")
+        params_dict = dict(self.named_parameters())
+        stacked = [
+            ("tool_gist_qkv_proj", "gist_q_proj", "q"),
+            ("tool_gist_qkv_proj", "gist_k_proj", "k"),
+            ("tool_gist_qkv_proj", "gist_v_proj", "v"),
+        ]
+        expected = {("model.tool_gist_embed_tokens.weight", None)}
+        for name in params_dict:
+            if ".tool_gist_qkv_proj." in name:
+                expected.update((name, shard) for shard in "qkv")
+        loaded = set()
+        files = _c2kv_gist_weight_files(source)
+        for path in files:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    if "gist_" not in name:
+                        continue
+                    target = name if name.startswith("model.") else add_prefix(name, "model")
+                    if target.startswith("model.gist_embed_tokens."):
+                        target = target.replace(
+                            "model.gist_embed_tokens.", "model.tool_gist_embed_tokens."
+                        )
+                        param = params_dict[target]
+                        default_weight_loader(param, handle.get_tensor(name))
+                        loaded.add((target, None))
+                        continue
+                    layer_id = get_layer_id(target)
+                    if (
+                        layer_id is not None
+                        and hasattr(self.model, "start_layer")
+                        and (
+                            layer_id < self.model.start_layer
+                            or layer_id >= self.model.end_layer
+                        )
+                    ):
+                        continue
+                    for param_name, weight_name, shard_id in stacked:
+                        if weight_name not in target:
+                            continue
+                        target = target.replace(weight_name, param_name)
+                        if target not in params_dict:
+                            raise ValueError(
+                                f"C2KV tool gist tensor {name} has no parameter {target}"
+                            )
+                        param = params_dict[target]
+                        param.weight_loader(param, handle.get_tensor(name), shard_id)
+                        loaded.add((target, shard_id))
+                        break
+                    else:
+                        raise ValueError(
+                            f"Unexpected gist tensor {name} in C2KV tool gist source {source}"
+                        )
+        missing = sorted(f"{name}[{shard}]" for name, shard in expected - loaded)
+        if missing:
+            raise ValueError(
+                "C2KV tool gist source is incomplete; missing "
+                f"{len(missing)} shards, e.g. {missing[:3]}"
+            )
+        self.c2kv_tool_gist_identity = c2kv_tool_gist_identity(source)
+        summary = {
+            "source": source,
+            "files": [os.path.basename(path) for path in files],
+            "shards": len(loaded),
+            "identity": self.c2kv_tool_gist_identity,
+            "variant": (self.c2kv_tool_gist_metadata or {}).get("history_memory_variant"),
+            "compression_domain": (self.c2kv_tool_gist_metadata or {}).get(
+                "history_memory_compression_domain"
+            ),
+        }
+        logger.info("C2KV tool gist set loaded: %s", summary)
+        return summary
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

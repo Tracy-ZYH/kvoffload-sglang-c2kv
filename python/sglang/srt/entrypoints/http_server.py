@@ -738,6 +738,36 @@ def _c2kv_dtype_nbytes(dtype_name: str) -> int:
     raise ValueError(f"Unsupported C2KV KV dtype for accounting: {dtype_name!r}")
 
 
+def _c2kv_tool_gist_capability(server_args) -> Dict[str, Any]:
+    """The optional second ("tool") gist set, as clients must bind to it.
+
+    ``identity`` is the same string the model process attaches to every
+    extraction key of that set (``c2kv_tool_gist_identity``), derived from
+    the checkpoint's on-disk metadata, so no model RPC is needed here.
+    """
+    source = getattr(server_args, "c2kv_tool_gist_weights", None)
+    if not source:
+        return {"enabled": False, "source": None, "identity": None, "metadata": None}
+    import json as _json
+
+    from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        config = _json.load(handle)
+    metadata = {
+        key: value
+        for key, value in config.items()
+        if key.startswith("history_memory_") or key.startswith("gist_")
+    }
+    return {
+        "enabled": True,
+        "source": str(source),
+        "identity": c2kv_tool_gist_identity(source),
+        "metadata": metadata,
+        "extract_projection_set": "tool",
+    }
+
+
 def _c2kv_native_capability() -> Dict[str, Any]:
     tokenizer_manager = _global_state.tokenizer_manager
     server_args = tokenizer_manager.server_args
@@ -794,6 +824,7 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "packing_version": C2KV_NATIVE_PACKING_VERSION,
         "raw_layout_profile": C2KV_NATIVE_RAW_LAYOUT_PROFILE,
         "model_binding": model_binding,
+        "tool_gist": _c2kv_tool_gist_capability(server_args),
         "parameter_version": model_binding["weight_version"],
         "kv_bytes_per_token": kv_bytes_per_token,
         "num_hidden_layers": num_layers,
@@ -912,6 +943,9 @@ async def v1_c2kv_native_generate(
             raw_layout_profile=request.raw_layout_profile,
             encoding_scope=request.encoding_scope,
             compression_ratio=request.compression_ratio,
+            # Absent on capability dicts built before the tool set existed:
+            # then only history chunks can be planned.
+            tool_binding=capability.get("tool_gist"),
         )
 
         resolved: Dict[str, Dict[str, Any]] = {}
@@ -941,6 +975,7 @@ async def v1_c2kv_native_generate(
                 allow_cache_miss=cache_misses < request.max_extraction_calls,
                 outer_request_id=outer_request_id,
                 measurement_phase=extraction_phase,
+                projection_set=chunk.get("projection_set") or "history",
             )
             if not result.success:
                 raise ValueError(result.error)
@@ -1969,7 +2004,22 @@ async def v1_c2kv_extract(
     try:
         tokenizer_manager = _global_state.tokenizer_manager
         tokenizer = tokenizer_manager.tokenizer
-        if request.role:
+        if request.projection_set not in ("history", "tool"):
+            raise ValueError(
+                f"projection_set must be 'history' or 'tool', got {request.projection_set!r}"
+            )
+        if request.token_ids is not None:
+            # Exact encoder input: the caller owns tokenization and chunking.
+            input_ids = [int(token_id) for token_id in request.token_ids]
+            if not input_ids or any(token_id < 0 for token_id in input_ids):
+                return C2KVExtractResponse(
+                    key_hash="",
+                    gist_len=0,
+                    original_seq_len=0,
+                    success=False,
+                    error="token_ids must be a non-empty list of token ids",
+                )
+        elif request.role:
             input_ids = _c2kv_template_ids(
                 tokenizer,
                 [{"role": request.role, "content": request.text}],
@@ -1999,6 +2049,7 @@ async def v1_c2kv_extract(
                 "X-C2KV-Measurement-Request-Id"
             ),
             measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
+            projection_set=request.projection_set,
         )
         return C2KVExtractResponse(
             key_hash=result.key_hash,

@@ -124,6 +124,7 @@ def test_capability_advertises_both_named_profiles():
     )
     namespace = _load_functions(
         "_c2kv_native_capability",
+        "_c2kv_tool_gist_capability",
         _global_state=SimpleNamespace(tokenizer_manager=manager),
         canonical_model_binding=lambda **kwargs: {
             **kwargs,

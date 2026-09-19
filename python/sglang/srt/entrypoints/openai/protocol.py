@@ -646,6 +646,11 @@ class ChatCompletionRequest(BaseModel):
     # Request-wide projection override. This takes precedence over message-level
     # values; None leaves resolution to the messages and --c2kv-query-proj.
     c2kv_use_gist_projection: Optional[bool] = None
+    # False = keep ``tools`` for tool-call parsing and validation but do NOT
+    # render them into the chat template: the client supplies the tool
+    # definitions itself (C2KV tool memory: gist segments after an explicit
+    # protocol block in the system message).  None/True = ordinary rendering.
+    c2kv_tools_in_prompt: Optional[bool] = None
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1563,7 +1568,7 @@ class TranscriptionStreamResponse(BaseModel):
 class C2KVExtractRequest(BaseModel):
     """Request to extract and store gist KV for a document."""
 
-    text: str
+    text: str = ""
     compression_ratio: int = Field(default=4)
     role: Optional[str] = None
     chat_template_kwargs: Optional[Dict] = None
@@ -1572,6 +1577,13 @@ class C2KVExtractRequest(BaseModel):
     # block), so original_seq_len measures the TRUE system-block length —
     # required for callers computing repair position offsets
     tools: Optional[List[Dict]] = None
+    # Exact encoder input.  When given, ``text``/``role``/``tools`` are not
+    # rendered: the caller already tokenized the document (e.g. a T0
+    # tool-definition chunk cut at the training chunk boundary).
+    token_ids: Optional[List[int]] = None
+    # "history" (served checkpoint's gist set, default) or "tool"
+    # (--c2kv-tool-gist-weights).  The set is part of the cache key.
+    projection_set: str = "history"
 
 
 class C2KVTokenizeRequest(BaseModel):
@@ -1603,6 +1615,10 @@ class C2KVNativePackedChunk(BaseModel):
     # Required only when the chunk is selected for injection.
     source_position_start: Optional[int] = None
     gist_position_ids: Optional[List[int]] = None
+    # None/"history" = the served checkpoint's gist set; "tool" = the
+    # --c2kv-tool-gist-weights set (tool-definition chunks).  Part of the
+    # chunk handle when set.
+    projection_set: Optional[str] = None
 
 
 class C2KVNativePackedGenerateRequest(BaseModel):

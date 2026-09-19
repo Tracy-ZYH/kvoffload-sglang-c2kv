@@ -1170,6 +1170,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            if getattr(self.server_args, "c2kv_tool_gist_weights", None):
+                # Second gist projection set (tool-definition compression).
+                # Loaded inside the weights region so it is accounted as model
+                # memory before the KV pool is sized.
+                if not hasattr(self.model, "load_c2kv_tool_gist_weights"):
+                    raise ValueError(
+                        "--c2kv-tool-gist-weights is only supported by C2KV "
+                        f"models with a tool gist loader, not {type(self.model).__name__}"
+                    )
+                self.model.load_c2kv_tool_gist_weights()
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -2767,9 +2777,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         compression_ratio: int,
+        projection_set: str = "history",
     ):
         """
         Run C2KV extraction for one document.
+
+        ``projection_set`` selects the gist encoder: "history" is the served
+        checkpoint's own set, "tool" the optional --c2kv-tool-gist-weights set.
 
         Returns:
             key_values: List[(K, V)] per layer
@@ -2778,11 +2792,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         compression_ratio = self.get_c2kv_compression_ratio(compression_ratio)
         if getattr(self.model, "full_length_pic", False):
+            if projection_set != "history":
+                raise ValueError(
+                    "C2KV PIC extraction has no alternative projection set"
+                )
             return self.model.generate_pic(
                 input_ids, attention_mask, ratio=compression_ratio
             )
         return self.model.generate_gist(
-            input_ids, attention_mask, ratio=compression_ratio
+            input_ids,
+            attention_mask,
+            ratio=compression_ratio,
+            projection_set=projection_set,
         )
 
     def forward_c2kv_repair_extract(

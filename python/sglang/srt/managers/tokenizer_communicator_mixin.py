@@ -414,6 +414,7 @@ class TokenizerCommunicatorMixin:
         allow_cache_miss: bool = True,
         outer_request_id: Optional[str] = None,
         measurement_phase: Optional[str] = None,
+        projection_set: str = "history",
     ) -> C2KVExtractReqOutput:
         """Run C2KV gist extraction via the scheduler."""
         import uuid
@@ -427,6 +428,7 @@ class TokenizerCommunicatorMixin:
             allow_cache_miss=allow_cache_miss,
             c2kv_outer_request_id=outer_request_id,
             c2kv_measurement_phase=measurement_phase,
+            projection_set=projection_set or "history",
         )
         return (await self.c2kv_extract_communicator(req))[0]
 

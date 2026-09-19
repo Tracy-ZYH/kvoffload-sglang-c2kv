@@ -66,6 +66,50 @@ def compute_gist_cache_key(
     ).hexdigest()
 
 
+def c2kv_tool_gist_identity(source: str) -> str:
+    """Stable identity of a tool gist set, computed from its on-disk metadata.
+
+    Both the model process (after loading the tensors) and the HTTP process
+    (for the native capability report) derive the same string, so cache keys
+    and native chunk handles bind to one checkpoint without an RPC.
+    """
+    import os
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    metadata = {
+        key: value
+        for key, value in config.items()
+        if key.startswith("history_memory_") or key.startswith("gist_")
+    }
+    trainer_state = {}
+    state_path = os.path.join(source, "trainer_state.json")
+    if os.path.isfile(state_path):
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        trainer_state = {
+            key: state.get(key) for key in ("global_step", "parameter_version")
+        }
+    manifest = {}
+    manifest_path = os.path.join(source, "manifest.json")
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            package = json.load(handle)
+        manifest = {"files": package.get("files"), "schema": package.get("schema")}
+    payload = {
+        "schema": "c2kv-tool-gist-identity-v1",
+        "source": os.path.basename(os.path.normpath(source)),
+        "config": metadata,
+        "trainer_state": trainer_state,
+        "manifest": manifest,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
 def validate_rope_position_range(
     min_position: int, max_position: int, table_size: int
 ) -> None:
