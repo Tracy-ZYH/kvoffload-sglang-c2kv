@@ -639,6 +639,7 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
+    c2kv_return_full_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
