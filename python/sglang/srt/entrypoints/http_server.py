@@ -749,11 +749,14 @@ def _c2kv_tool_gist_capability(server_args) -> Dict[str, Any]:
     if not source:
         return {"enabled": False, "source": None, "identity": None, "metadata": None}
     import json as _json
+    import hashlib as _hashlib
 
     from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
 
     with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
         config = _json.load(handle)
+    with open(os.path.join(source, "config.json"), "rb") as handle:
+        config_sha256 = _hashlib.sha256(handle.read()).hexdigest()
     metadata = {
         key: value
         for key, value in config.items()
@@ -764,6 +767,7 @@ def _c2kv_tool_gist_capability(server_args) -> Dict[str, Any]:
         "source": str(source),
         "identity": c2kv_tool_gist_identity(source),
         "metadata": metadata,
+        "config_sha256": config_sha256,
         "extract_projection_set": "tool",
     }
 
@@ -903,6 +907,8 @@ async def v1_c2kv_native_generate(
             )
         if request.max_extraction_calls < 0:
             raise ValueError("max_extraction_calls must be nonnegative")
+        if request.max_tool_extraction_calls is not None and request.max_tool_extraction_calls < 0:
+            raise ValueError("max_tool_extraction_calls must be nonnegative")
         sampling_params = _c2kv_native_sampling_params(request)
 
         shadow_request = request.shadow_features
@@ -946,11 +952,14 @@ async def v1_c2kv_native_generate(
             # Absent on capability dicts built before the tool set existed:
             # then only history chunks can be planned.
             tool_binding=capability.get("tool_gist"),
+            raw_tool_segments=[item.model_dump() for item in request.raw_tool_segments],
+            tool_gist_segments=[item.model_dump() for item in request.tool_gist_segments],
         )
 
         resolved: Dict[str, Dict[str, Any]] = {}
         cache_hits = 0
         cache_misses = 0
+        projection_misses = {"tool": 0, "history": 0}
         materialized_encoder_tokens = 0
         scope_reused_encoder_tokens = 0
         base_rid = request.rid or f"c2kv-native-{time.time_ns()}"
@@ -967,12 +976,18 @@ async def v1_c2kv_native_generate(
         extraction_telemetry = []
         for index, chunk in enumerate(plan.unique_chunks):
             extraction_rid = f"{base_rid}:extract:{index}"
+            projection = chunk.get("projection_set") or "history"
+            if request.max_tool_extraction_calls is None:
+                allow_cache_miss = cache_misses < request.max_extraction_calls
+            else:
+                projection_budget = request.max_tool_extraction_calls if projection == "tool" else request.max_extraction_calls
+                allow_cache_miss = projection_misses[projection] < projection_budget
             result = await tokenizer_manager.c2kv_extract(
                 input_ids=list(chunk["token_ids"]),
                 input_text="",
-                compression_ratio=request.compression_ratio,
+                compression_ratio=chunk.get("compression_ratio") or request.compression_ratio,
                 rid=extraction_rid,
-                allow_cache_miss=cache_misses < request.max_extraction_calls,
+                allow_cache_miss=allow_cache_miss,
                 outer_request_id=outer_request_id,
                 measurement_phase=extraction_phase,
                 projection_set=chunk.get("projection_set") or "history",
@@ -984,12 +999,18 @@ async def v1_c2kv_native_generate(
                     "C2KV native extraction returned an inconsistent source length: "
                     f"{result.original_seq_len} != {len(chunk['token_ids'])}"
                 )
+            if projection == "tool":
+                ratio = chunk.get("compression_ratio") or request.compression_ratio
+                expected_gist_len = (len(chunk["token_ids"]) + ratio - 1) // ratio
+                if result.gist_len != expected_gist_len:
+                    raise ValueError("C2KV_NATIVE_TOOL_GIST_LENGTH_MISMATCH")
             cache_hit = bool(result.cache_hit)
             if cache_hit:
                 cache_hits += 1
                 scope_reused_encoder_tokens += len(chunk["token_ids"])
             else:
                 cache_misses += 1
+                projection_misses[projection] += 1
                 materialized_encoder_tokens += len(chunk["token_ids"])
             resolved[chunk["handle"]] = {
                 "chunk_id": chunk["chunk_id"],
@@ -1021,6 +1042,7 @@ async def v1_c2kv_native_generate(
             )
 
         segments = []
+        chunks_by_handle = {item["handle"]: item for item in plan.unique_chunks}
         for handle, (token_start, token_end) in zip(
             plan.selected_handles, plan.segment_boundaries
         ):
@@ -1030,8 +1052,30 @@ async def v1_c2kv_native_generate(
                     token_start=token_start,
                     token_end=token_end,
                     use_gist_projection=False,
+                    region="tool" if chunks_by_handle[handle].get("projection_set") == "tool" else None,
+                    source_token_count=len(chunks_by_handle[handle]["token_ids"]) if chunks_by_handle[handle].get("projection_set") == "tool" else None,
                 )
             )
+
+        for item in request.raw_tool_segments:
+            segments.append(C2KVSegmentInfo(
+                token_start=item.token_start,
+                token_end=item.token_end,
+                repair_key_hashes=list(item.repair_key_hashes),
+                repair_placement=item.repair_placement,
+                use_gist_projection=False,
+                region="tool",
+                source_token_count=item.token_end - item.token_start,
+                source_token_end=item.token_end,
+                expected_token_len=item.token_len,
+            ))
+        if request.tool_gist_segments or request.raw_tool_segments:
+            segments.sort(key=lambda segment: (segment.token_start, segment.token_end != segment.token_start))
+
+        history_chunks = [chunk for chunk in encoder_chunks if chunk.get("projection_set") != "tool"]
+        history_source_tokens = sum(len(chunk["token_ids"]) for chunk in history_chunks)
+        history_gist_tokens = sum((len(chunk["token_ids"]) + (chunk.get("compression_ratio") or request.compression_ratio) - 1)
+                                 // (chunk.get("compression_ratio") or request.compression_ratio) for chunk in history_chunks)
 
         generation_request = GenerateReqInput(
             rid=base_rid,
@@ -1052,10 +1096,8 @@ async def v1_c2kv_native_generate(
             c2kv_outer_request_id=outer_request_id,
             c2kv_measurement_phase=generation_phase,
             c2kv_paper_whole_full_kv_tokens=len(plan.logical_input_ids),
-            c2kv_paper_history_full_kv_tokens=plan.costs[
-                "presented_encoder_tokens"
-            ],
-            c2kv_paper_history_active_kv_tokens=plan.costs["gist_tokens"],
+            c2kv_paper_history_full_kv_tokens=history_source_tokens,
+            c2kv_paper_history_active_kv_tokens=history_gist_tokens,
             c2kv_paper_canonical_full_source=True,
         )
         generated = await tokenizer_manager.generate_request(
@@ -1085,12 +1127,11 @@ async def v1_c2kv_native_generate(
                 prefill_state = prefill_state[-1]
             if not isinstance(prefill_state, list) or not prefill_state:
                 raise ValueError("C2KV native prompt_last hidden state is malformed")
-            logical_position = (
+            logical_position = plan.costs.get("canonical_position_tokens", (
                 len(request.system_input_ids)
                 + sum(len(chunk.token_ids) for chunk in request.encoder_chunks)
                 + len(request.workspace_input_ids)
-                - 1
-            )
+            )) - 1
             shadow_features = {
                 "schema": "event-native-shadow-features-v1",
                 "status": "captured",
@@ -1125,13 +1166,13 @@ async def v1_c2kv_native_generate(
                 "materialized_encoder_tokens": materialized_encoder_tokens,
                 "scope_reused_encoder_tokens": scope_reused_encoder_tokens,
                 "system_prefix_kv_logical_bytes": (
-                    costs["system_tokens"] * kv_bytes_per_token
+                    costs.get("system_prefix_kv_tokens", costs["system_tokens"]) * kv_bytes_per_token
                 ),
                 "gist_prefix_kv_logical_bytes": (
                     costs["gist_prefix_kv_tokens"] * kv_bytes_per_token
                 ),
                 "raw_workspace_kv_logical_bytes": (
-                    costs["raw_workspace_kv_tokens"] * kv_bytes_per_token
+                    costs.get("workspace_resident_kv_tokens", costs["raw_workspace_kv_tokens"]) * kv_bytes_per_token
                 ),
                 "resident_kv_logical_bytes": (
                     costs["resident_kv_tokens"] * kv_bytes_per_token
@@ -1181,12 +1222,17 @@ async def v1_c2kv_native_generate(
                 ],
                 "extraction": {
                     "requested_chunks": len(request.encoder_chunks)
-                    + len(request.compression_chunks),
+                    + len(request.compression_chunks)
+                    + sum(len(item.chunks) if item.chunks else 1 for item in request.tool_gist_segments),
                     "unique_chunks": len(plan.unique_chunks),
                     "cache_hits": cache_hits,
                     "cache_misses": cache_misses,
                     "model_calls": cache_misses,
                     "max_extraction_calls": request.max_extraction_calls,
+                    **({"history_model_calls": projection_misses["history"],
+                        "tool_model_calls": projection_misses["tool"],
+                        "max_tool_extraction_calls": request.max_tool_extraction_calls}
+                       if request.max_tool_extraction_calls is not None else {}),
                 },
                 "costs": costs,
                 "shadow_features": shadow_features,

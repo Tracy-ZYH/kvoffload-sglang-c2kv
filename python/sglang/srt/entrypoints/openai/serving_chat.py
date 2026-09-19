@@ -191,6 +191,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
                 hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
             params["drop_previous_output"] = True
+            self._translate_tool_session_coordinates(request, 0, len(full_prompt_ids))
             return full_prompt_ids, session_id, full_prompt_ids
 
         logical_prefix = len(previous)
@@ -274,7 +275,37 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_delta_history_tokens"] = max(0, history_end - logical_prefix)
             config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
+        self._translate_tool_session_coordinates(request, logical_prefix, len(full_prompt_ids))
         return delta, session_id, full_prompt_ids
+
+    def _translate_tool_session_coordinates(self, request, input_prefix, input_len):
+        """Keep token-prefix matching separate from the expanded source ledger."""
+        from sglang.srt.mem_cache.c2kv_composition import source_boundary
+
+        hint = request.c2kv_kv_memory_hint
+        segments = hint.get("tool_memory_segments") or []
+        session_id = (request.session_params or {}).get("id")
+        previous = getattr(self, "_persistent_history_tool_segments", {}).get(session_id, [])
+        if not segments and not previous:
+            return
+        old_prefix = [segment for segment in segments if segment["token_start"] < input_prefix]
+        if previous != old_prefix and input_prefix:
+            raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+        hint["tool_memory_input_prefix_tokens"] = input_prefix
+        for key in ("persistent_session_logical_prefix_tokens",
+                    "persistent_session_computed_prefix_tokens",
+                    "persistent_session_canonical_prompt_tokens"):
+            if key in hint:
+                applicable = segments if key == "persistent_session_canonical_prompt_tokens" else old_prefix
+                hint[key] = source_boundary(hint[key], applicable)
+        config = hint.get("history_kv_eviction")
+        if isinstance(config, dict):
+            for key in ("persistent_protected_prefix_tokens",
+                        "persistent_canonical_history_end",
+                        "persistent_canonical_prompt_tokens"):
+                if key in config:
+                    config[key] = source_boundary(config[key], segments)
+        hint["tool_memory_canonical_prompt_tokens"] = source_boundary(input_len, segments)
 
     def _commit_persistent_history_session(
         self,
@@ -291,6 +322,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(output_ids, list):
             raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
         hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+        if hint.get("tool_memory_segments"):
+            if not hasattr(self, "_persistent_history_tool_segments"):
+                self._persistent_history_tool_segments = {}
+            self._persistent_history_tool_segments[session_id] = [
+                dict(item) for item in hint["tool_memory_segments"]
+            ]
         reference_config = hint.get("history_kv_reference_config") or {}
         method = str(reference_config.get("method") or "").lower()
         exact_output = method in {"agentkv", "commitkv"}
@@ -698,8 +735,30 @@ class OpenAIServingChat(OpenAIServingBase):
                         msg, "c2kv_use_gist_projection", None
                     ),
                     repair_placement=getattr(msg, "c2kv_repair_placement", None),
+                    region=getattr(msg, "c2kv_region", None),
+                    source_token_count=getattr(msg, "c2kv_source_token_count", None),
+                    source_token_end=getattr(msg, "c2kv_source_token_end", None),
                 )
             )
+
+        tool_segments = [segment for segment in segments if segment.region == "tool"]
+        if tool_segments:
+            from sglang.srt.mem_cache.c2kv_composition import remap_message_metadata
+
+            hint = request.c2kv_kv_memory_hint
+            if not isinstance(hint, dict):
+                hint = request.c2kv_kv_memory_hint = {}
+            remap_message_metadata(hint, annotated, len(request.messages))
+            for segment in tool_segments:
+                if segment.source_token_count is None or segment.source_token_count <= 0:
+                    raise ValueError("C2KV_TOOL_SOURCE_TOKEN_COUNT_REQUIRED")
+            hint["tool_memory_segments"] = [
+                {"token_start": segment.token_start, "token_end": segment.token_end,
+                 "source_tokens": segment.source_token_count,
+                 "key_hash": segment.key_hash,
+                 "repair_key_hashes": list(segment.repair_key_hashes)}
+                for segment in tool_segments
+            ]
 
         # Remove annotated messages so _process_messages omits their tokens from
         # origin_input_ids; the gist injection fills each insertion point at
@@ -974,6 +1033,35 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         return history_end - history_start
 
+    @staticmethod
+    def _paper_source_request(request, measurement_config):
+        """Validate the original source solely for denominator tokenization."""
+        messages = measurement_config.get("canonical_source_messages")
+        tools = measurement_config.get("canonical_source_tools")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_MESSAGES_AND_TOOLS_REQUIRED")
+        payload = request.model_dump()
+        payload.update(messages=copy.deepcopy(messages), tools=copy.deepcopy(tools))
+        return type(request).model_validate(payload)
+
+    @staticmethod
+    def _paper_history_request(request):
+        """Exclude transport carriers from the independent history denominator."""
+        result = copy.deepcopy(request)
+        removed = [index for index, message in enumerate(result.messages)
+                   if getattr(message, "c2kv_region", None) == "tool"
+                   and (getattr(message, "c2kv_key_hash", None)
+                        or getattr(message, "c2kv_repair_only_key_hashes", None)
+                        or getattr(message, "c2kv_repair_key_hashes", None))]
+        if removed:
+            measurement = result.c2kv_kv_memory_hint["paper_measurement"]
+            for key in ("history_start_message_count", "history_message_count"):
+                if key in measurement:
+                    count = int(measurement[key])
+                    measurement[key] = count - sum(index < count for index in removed)
+            result.messages = [message for index, message in enumerate(result.messages) if index not in removed]
+        return result
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1015,7 +1103,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 measurement_config.get("canonical_full_source", False)
             )
             denominator_start_ns = time.monotonic_ns()
-            canonical_request = copy.deepcopy(request)
+            canonical_request = self._paper_history_request(request)
             canonical_processed = self._process_messages(canonical_request, False)
             if isinstance(canonical_processed.prompt_ids, list):
                 resolved_history_tokens = self._resolve_paper_history_token_count(
@@ -1026,6 +1114,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     paper_history_full_kv_tokens = resolved_history_tokens
                 else:
                     paper_history_active_kv_tokens = resolved_history_tokens
+            source_messages = measurement_config.get("canonical_source_messages")
+            if source_messages is not None:
+                source_request = self._paper_source_request(request, measurement_config)
+                source_processed = self._process_messages(source_request, False)
+                if not isinstance(source_processed.prompt_ids, list):
+                    raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_TOKENIZATION_FAILED")
+                paper_whole_full_kv_tokens = len(source_processed.prompt_ids)
+                paper_canonical_full_source = True
+                measurement_config["canonical_source_whole_tokens"] = paper_whole_full_kv_tokens
+                measurement_config["canonical_source_server_tokenized"] = True
+                # Retain the token-count receipt, not a copy of the source
+                # conversation in scheduler logs and allocator responses.
+                measurement_config.pop("canonical_source_messages", None)
+                measurement_config.pop("canonical_source_tools", None)
             paper_denominator_tokenization_duration_ns = (
                 time.monotonic_ns() - denominator_start_ns
             )
@@ -1051,6 +1153,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     request, list(processed_messages.prompt_ids)
                 )
             )
+            if persistent_session_id is not None and c2kv_segments:
+                hint = request.c2kv_kv_memory_hint
+                input_prefix = int(hint.get("tool_memory_input_prefix_tokens") or 0)
+                if input_prefix:
+                    c2kv_segments = [segment for segment in c2kv_segments
+                                     if segment.token_start >= input_prefix]
+                    for segment in c2kv_segments:
+                        segment.token_start -= input_prefix
+                        segment.token_end -= input_prefix
         else:
             input_ids = processed_messages.prompt_ids
             persistent_session_id = None

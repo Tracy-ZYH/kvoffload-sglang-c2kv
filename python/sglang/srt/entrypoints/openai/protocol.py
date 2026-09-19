@@ -507,6 +507,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
     # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
     c2kv_repair_placement: Optional[str] = None
+    c2kv_region: Optional[Literal["tool", "history"]] = None
+    c2kv_source_token_count: Optional[int] = None
+    c2kv_source_token_end: Optional[int] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -535,6 +538,9 @@ class ChatCompletionMessageUserParam(BaseModel):
     # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
     # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
     c2kv_repair_placement: Optional[str] = None
+    c2kv_region: Optional[Literal["tool", "history"]] = None
+    c2kv_source_token_count: Optional[int] = None
+    c2kv_source_token_end: Optional[int] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -1619,6 +1625,24 @@ class C2KVNativePackedChunk(BaseModel):
     # --c2kv-tool-gist-weights set (tool-definition chunks).  Part of the
     # chunk handle when set.
     projection_set: Optional[str] = None
+    compression_ratio: Optional[int] = None
+
+
+class C2KVNativeRawToolSegment(BaseModel):
+    """A query-conditioned tool KV selection in the native source token frame."""
+
+    token_start: int
+    token_end: int
+    repair_key_hashes: List[str]
+    token_len: int
+    repair_placement: Literal["in_place"] = "in_place"
+
+
+class C2KVNativeToolGistSegment(BaseModel):
+    token_start: int
+    token_end: int
+    chunk: Optional[C2KVNativePackedChunk] = None
+    chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
 
 
 class C2KVNativePackedGenerateRequest(BaseModel):
@@ -1637,10 +1661,13 @@ class C2KVNativePackedGenerateRequest(BaseModel):
     encoding_scope: str
     compression_ratio: int = 8
     max_extraction_calls: int
+    max_tool_extraction_calls: Optional[int] = None
     system_input_ids: List[int] = Field(default_factory=list)
     workspace_input_ids: List[int]
     encoder_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
     compression_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
+    raw_tool_segments: List[C2KVNativeRawToolSegment] = Field(default_factory=list)
+    tool_gist_segments: List[C2KVNativeToolGistSegment] = Field(default_factory=list)
     sampling_profile: Literal["greedy-v1", "acebench-agent-v1"] = "greedy-v1"
     sampling_params: Dict[str, Any]
     shadow_features: Optional[Dict[str, Any]] = None

@@ -2072,6 +2072,10 @@ class C2KVSegmentInfo:
         repair_key_hashes: Optional[List[str]] = None,
         use_gist_projection: Optional[bool] = None,
         repair_placement: Optional[str] = None,
+        region: Optional[str] = None,
+        source_token_count: Optional[int] = None,
+        source_token_end: Optional[int] = None,
+        expected_token_len: Optional[int] = None,
     ):
         self.key_hash = key_hash
         self.token_start = token_start
@@ -2086,6 +2090,10 @@ class C2KVSegmentInfo:
         # (None = derive from the entry's repair_mode, legacy behaviour).
         # See c2kv/c2kv_serving_semantics.md, "Repair placement".
         self.repair_placement = repair_placement
+        self.region = region
+        self.source_token_count = source_token_count
+        self.source_token_end = source_token_end
+        self.expected_token_len = expected_token_len
 
 
 @dataclass

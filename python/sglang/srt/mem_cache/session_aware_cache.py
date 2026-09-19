@@ -62,6 +62,8 @@ class SessionSlot:
     history_kv_reference_state: Any = None
     history_kv_reference_config: Any = None
     history_kv_runtime_state: Any = None
+    c2kv_tool_source_spans: Any = None
+    c2kv_tool_kv_accounting: Any = None
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -97,6 +99,10 @@ class SessionSlot:
         self.history_kv_runtime_state = getattr(
             req, "history_kv_runtime_state", None
         )
+        self.c2kv_tool_source_spans = list(getattr(req, "c2kv_tool_source_spans", []) or [])
+        report = getattr(req, "kv_memory_report", None) or {}
+        self.c2kv_tool_kv_accounting = {key: int(report.get(key) or 0) for key in (
+            "active_tool_kv_tokens", "active_tool_gist_tokens", "active_tool_repair_tokens", "tool_encoder_source_tokens")}
 
         if is_first:
             self.last_node = req.last_node
@@ -140,6 +146,9 @@ class SessionSlot:
         ).lower():
             raise RuntimeError("PERSISTENT_HISTORY_REFERENCE_METHOD_CHANGED")
         req.history_kv_runtime_state = self.history_kv_runtime_state
+        req.c2kv_tool_source_spans = list(self.c2kv_tool_source_spans or [])
+        if self.c2kv_tool_source_spans and isinstance(getattr(req, "kv_memory_report", None), dict):
+            req.kv_memory_report.update(self.c2kv_tool_kv_accounting or {})
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -305,16 +314,31 @@ class SessionAwareCache(BasePrefixCache):
             prior_positions = list(slot.history_kv_resident_positions or [])
             if len(prior_positions) != int(req.kv_committed_len):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_LEDGER_LENGTH_MISMATCH")
-            positions = append_resident_positions(
-                prior_positions, computed_prefix, canonical_len
-            )
+            descriptors = getattr(req, "c2kv_composition_pending", None)
+            if descriptors:
+                from sglang.srt.mem_cache.c2kv_composition import resident_positions, split_rounds_at_query, raw_query_window
+                positions = resident_positions(len(req.origin_input_ids), descriptors, prior_positions, computed_prefix)
+                cursor = len(prior_positions)
+                source_cursor = computed_prefix
+                for descriptor in descriptors:
+                    source_cursor += descriptor["token_start"] - cursor
+                    if descriptor.get("region") == "tool":
+                        req.c2kv_tool_source_spans.append((source_cursor, source_cursor + descriptor["source_tokens"]))
+                    source_cursor += descriptor["source_tokens"]
+                    cursor = descriptor["token_end"]
+                if positions and positions[-1] >= canonical_len:
+                    raise RuntimeError("PERSISTENT_HISTORY_TOOL_CANONICAL_LENGTH_MISMATCH")
+            else:
+                positions = append_resident_positions(
+                    prior_positions, computed_prefix, canonical_len
+                )
             req.history_kv_resident_positions = positions
             protected, history_end = physical_history_range(positions,
                 int(config.get("persistent_protected_prefix_tokens") or 0),
                 int(config["persistent_canonical_history_end"]))
             delta_history = int(config.get("persistent_delta_history_tokens") or 0)
             prefix_len = int(req.kv_committed_len)
-            origin_len = len(req.origin_input_ids)
+            origin_len = len(req.c2kv_virtual_input_ids) if descriptors else len(req.origin_input_ids)
             if not (0 <= protected <= history_end <= origin_len and len(positions) == origin_len):
                 req.set_finish_with_abort(
                     "PERSISTENT_HISTORY_SESSION_RANGE_INVALID: "
@@ -329,7 +353,16 @@ class SessionAwareCache(BasePrefixCache):
                     origin_len,
                     config.get("history_kv_recent_window"),
                 )
-                if query_window is None:
+                if descriptors:
+                    if query_window is None:
+                        query_window = (max(prefix_len, history_end - 1), max(prefix_len + 1, history_end))
+                    query_start, query_end = raw_query_window(req.c2kv_rounds, descriptors, query_window)
+                    rounds = split_rounds_at_query(req.c2kv_rounds, descriptors, query_start, query_end, C2KVPrefillRound)
+                    config.update(selection_query_start=query_start, selection_query_end=query_end,
+                                  selection_query_tokens=query_end - query_start,
+                                  selection_query_phase="new_tail_prefill_before_eviction")
+                    req.c2kv_composition_pending = None
+                elif query_window is None:
                     rounds = [
                         C2KVPrefillRound(
                             list(
@@ -384,11 +417,15 @@ class SessionAwareCache(BasePrefixCache):
                 req.c2kv_rounds = rounds
                 req.c2kv_round_idx = 0
                 req.c2kv_round_start_len = 0
-                req.c2kv_virtual_input_ids = list(req.origin_input_ids)
+                if not descriptors:
+                    req.c2kv_virtual_input_ids = list(req.origin_input_ids)
                 config["history_start"] = protected
                 config["history_end"] = history_end
                 config["persistent_prior_physical_tokens"] = prefix_len
                 config["resident_logical_positions"] = positions
+                if req.c2kv_tool_source_spans:
+                    from sglang.srt.mem_cache.c2kv_composition import protected_history_indices
+                    config["protected_history_indices"] = protected_history_indices(positions, protected, history_end, req.c2kv_tool_source_spans)
                 config["previous_resident_position_summary"] = position_summary(prior_positions)
                 if isinstance(report, dict):
                     report["persistent_session_history_start"] = protected

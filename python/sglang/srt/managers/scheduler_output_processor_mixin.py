@@ -490,11 +490,11 @@ class SchedulerOutputProcessorMixin:
                 if (
                     req.c2kv_rounds is not None
                     and req.c2kv_round_idx < len(req.c2kv_rounds)
-                    and getattr(
+                    and (getattr(
                         req.c2kv_rounds[req.c2kv_round_idx],
                         "post_history_kv_eviction",
                         False,
-                    )
+                    ) or getattr(req.c2kv_rounds[req.c2kv_round_idx], "collect_history_kv_scores", False))
                 ):
                     self._accumulate_history_kv_selection_scores(req, result)
 

@@ -559,17 +559,19 @@ class MultimodalInputs:
 class C2KVPrefillRound:
     """One round of C2KV multi-round prefill."""
 
-    __slots__ = ("tokens", "post_inject_seg_indices", "post_history_kv_eviction")
+    __slots__ = ("tokens", "post_inject_seg_indices", "post_history_kv_eviction", "collect_history_kv_scores")
 
     def __init__(
         self,
         tokens: List[int],
         post_inject_seg_indices: List[int],
         post_history_kv_eviction: bool = False,
+        collect_history_kv_scores: bool = False,
     ):
         self.tokens = tokens
         self.post_inject_seg_indices = post_inject_seg_indices
         self.post_history_kv_eviction = post_history_kv_eviction
+        self.collect_history_kv_scores = collect_history_kv_scores
 
 
 class Req(ReqDllmMixin):
@@ -2591,11 +2593,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     isinstance(config, dict)
                     and getattr(r, "c2kv_rounds", None) is not None
                     and r.c2kv_round_idx < len(r.c2kv_rounds)
-                    and getattr(
+                    and (getattr(
                         r.c2kv_rounds[r.c2kv_round_idx],
                         "post_history_kv_eviction",
                         False,
-                    )
+                    ) or getattr(r.c2kv_rounds[r.c2kv_round_idx], "collect_history_kv_scores", False))
                 ):
                     c2kv_history_kv_eviction_configs.append(dict(config))
                 else:
