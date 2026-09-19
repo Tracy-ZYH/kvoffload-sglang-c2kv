@@ -194,6 +194,53 @@ def test_decode_cleanup_never_frees_prompt_pages_at_nonzero_allocator_offset():
     assert req.kv_committed_len == req.kv_allocated_len == 5
 
 
+@pytest.mark.parametrize(
+    ("receipt", "expected_active"),
+    [
+        ({"success": True, "kept_history_tokens": 3}, 3),
+        ({"success": False, "kept_history_tokens": 3}, 0),
+        (None, 0),
+    ],
+)
+def test_persistent_decode_cleanup_preserves_measured_physical_history(
+    receipt, expected_active
+):
+    discard = method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "_discard_persistent_decode_suffix",
+        {"torch": torch, "Req": SimpleNamespace},
+    )
+    row = torch.arange(40, 52).reshape(1, 12)
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        page_size=4,
+        token_to_kv_pool_allocator=SimpleNamespace(free=lambda _: None),
+    )
+    report = {
+        "active_history_kv_tokens": 0,
+        "active_full_raw_tokens": 0,
+        "active_history_kv_tokens_source": "physical_eviction_measured",
+    }
+    if receipt is not None:
+        report["history_kv_physical_eviction"] = receipt
+    req = SimpleNamespace(
+        origin_input_ids=list(range(5)),
+        kv_committed_len=8,
+        kv_allocated_len=10,
+        req_pool_idx=0,
+        persistent_decode_cache_locs=[],
+        kv_memory_report=report,
+    )
+
+    discard(owner, req)
+
+    assert report["active_history_kv_tokens"] == expected_active
+    assert report["active_full_raw_tokens"] == expected_active
+    assert report["reference_history_token_slots"] == 0
+    assert req.kv_committed_len == req.kv_allocated_len == 5
+
+
 def test_legacy_streaming_slot_is_reconciled_before_persistent_continuation():
     adopt = method(
         CACHE / "session_aware_cache.py",

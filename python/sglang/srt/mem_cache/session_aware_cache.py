@@ -735,13 +735,25 @@ class SessionAwareCache(BasePrefixCache):
                     ),
                 )
             else:
+                physical_eviction = report.get("history_kv_physical_eviction")
+                physical_eviction_succeeded = (
+                    isinstance(physical_eviction, dict)
+                    and physical_eviction.get("success") is True
+                )
+                measured_history = (
+                    int(physical_eviction["kept_history_tokens"])
+                    if physical_eviction_succeeded
+                    else 0
+                )
                 report.update(
-                    active_history_kv_tokens=0,
-                    active_full_raw_tokens=0,
+                    active_history_kv_tokens=measured_history,
+                    active_full_raw_tokens=measured_history,
                     reference_history_token_slots=0,
                     reference_history_resident_bytes=0,
                     reference_history_layer_count=0,
                 )
+                if physical_eviction_succeeded:
+                    report["active_history_kv_tokens_source"] = "physical_eviction_measured"
             report["persistent_session_discarded_decode_kv_tokens"] = allocated_len - prompt_len
             report["persistent_session_reclaimed_decode_kv_tokens"] = int(free_pages.numel()) * self.page_size
             report["persistent_session_prompt_physical_tokens"] = prompt_len
