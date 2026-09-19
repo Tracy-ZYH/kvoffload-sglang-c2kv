@@ -2014,12 +2014,31 @@ class Scheduler(
         elif session_id in self.session_controller:
             # Session exists: create request from session
             session = self.session_controller.get(session_id)
-            req = session.create_req(
-                recv_req,
-                self.tokenizer,
-                self.model_config.vocab_size,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-            )
+            try:
+                req = session.create_req(
+                    recv_req,
+                    self.tokenizer,
+                    self.model_config.vocab_size,
+                    eos_token_ids=self.model_config.hf_eos_token_id,
+                )
+            except ValueError as exc:
+                # A persistent-history session left in an unusable state by an
+                # earlier aborted turn (e.g. no active output after a finish_abort)
+                # must fail this request, not the scheduler process.
+                error_msg = f"Invalid request: session {session_id}: {exc}"
+                logger.error(error_msg)
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
             # TODO: set trace context
             if self.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
@@ -5784,6 +5803,23 @@ class Scheduler(
 
         return ret
 
+    def _abort_missing_persistent_history_session(self, req: Req) -> None:
+        """Return a missing resident slot as a request error, not an engine crash."""
+        error = "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING"
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["history_kv_runtime_status"] = "resident_cache_missing"
+            report["persistent_history_session_error"] = error
+        req.set_finish_with_abort(error)
+        req.check_finished()
+        self._cleanup_aborted_c2kv_waiting_req(req)
+        session = getattr(req, "session", None)
+        if session is not None and session.session_id in self.session_controller:
+            self.session_controller.close(
+                CloseSessionReqInput(session_id=session.session_id)
+            )
+        self.stream_output([req], req.return_logprob)
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -5863,6 +5899,7 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        failed_session_reqs = []
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -5906,7 +5943,16 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            try:
+                req.init_next_round_input(self.tree_cache)
+            except RuntimeError as exc:
+                if str(exc) != "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING":
+                    raise
+                # The canonical continuation cannot be reconstructed from the
+                # prompt without reviving evicted KV. Fail only this request.
+                self._abort_missing_persistent_history_session(req)
+                failed_session_reqs.append(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -5935,6 +5981,11 @@ class Scheduler(
                 break
 
         # Update waiting queue
+        if failed_session_reqs:
+            failed_session_set = set(failed_session_reqs)
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in failed_session_set
+            ]
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
@@ -6312,7 +6363,7 @@ class Scheduler(
 
         pending_req, deadline = self._pending_flush
 
-        if self.is_fully_idle():
+        if self.is_fully_idle() and not self.session_controller.sessions:
             success = self.flush_cache()
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
@@ -6635,7 +6686,7 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.is_fully_idle():
+        if self.is_fully_idle() and not self.session_controller.sessions:
             self.cur_batch = None
             self.last_batch = None
             if self.recovery_checkpoint_manager is not None:
@@ -6657,9 +6708,10 @@ class Scheduler(
             success = True
         else:
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
+                f"Cache not flushed because requests or sessions remain. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"#open-session: {len(self.session_controller.sessions)}"
             )
             success = False
         return success

@@ -145,6 +145,12 @@ class CommitKVRuntimeState:
             raise RuntimeError("previous CommitKV transition is still pending")
         if total_budget < 1:
             raise ValueError("total_budget must be positive")
+        # Pages accepted by an earlier joint retirement are gone from the cache
+        # for good (Eq. 11); the serving layer re-derives the page list from
+        # message spans every turn, so drop them before scanning. Otherwise a
+        # retired page could be protected as pending and the checkpoint would
+        # see one token as both retired and pending.
+        pages = [page for page in pages if page.page_id not in self.retired_pages]
         if len(pages) > self.config.max_scanned_pages:
             raise ValueError(
                 "caller-provided CommitKV scan exceeds max_scanned_pages; "
