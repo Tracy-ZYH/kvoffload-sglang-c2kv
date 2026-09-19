@@ -135,8 +135,17 @@ class Session:
                 abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
-                _, last_req_node = self.req_nodes.popitem()
-                last_req = last_req_node.req
+                last_req_node = next(iter(self.req_nodes.values()))
+                if not last_req_node.req.finished():
+                    # The prior request still owns the live KV. Replacing its
+                    # node would detach it before SessionAwareCache can save
+                    # the slot, leaving the incoming continuation orphaned.
+                    abort = True
+                    abort_message = "Streaming session previous request has not finished."
+                    last_req_node = None
+                else:
+                    self.req_nodes.clear()
+                    last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
@@ -271,6 +280,7 @@ class Session:
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
+            new_req.check_finished()
         elif self.streaming:
             if last_req is not None:
                 last_req.session = None
