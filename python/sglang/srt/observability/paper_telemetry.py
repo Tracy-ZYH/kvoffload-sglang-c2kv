@@ -447,6 +447,24 @@ class _PaperTelemetry:
         physical = report.get("history_kv_physical_eviction")
         if not isinstance(physical, dict):
             physical = {}
+        history_kv_backend = report.get("history_kv_backend")
+        reference_attention_succeeded = bool(
+            physical.get("success") is True
+            and history_kv_backend == "reference_attention"
+            and report.get("reference_attention_backend")
+        )
+        runtime_status = report.get("history_kv_runtime_status")
+        if reference_attention_succeeded:
+            runtime_status = "reference_attention_ok"
+        storage_runtime_status = report.get("history_kv_storage_runtime_status")
+        if storage_runtime_status is None:
+            storage_runtime_status = physical.get("storage_runtime_status")
+        if (
+            storage_runtime_status is None
+            and reference_attention_succeeded
+            and physical.get("runtime_status") != "reference_attention_ok"
+        ):
+            storage_runtime_status = physical.get("runtime_status")
         lifecycle = report.get("history_kv_lifecycle")
         if not isinstance(lifecycle, dict):
             lifecycle = {}
@@ -504,7 +522,9 @@ class _PaperTelemetry:
             "selection_query_tokens_observed": _as_int(
                 report.get("selection_query_tokens_observed")
             ),
-            "history_kv_runtime_status": report.get("history_kv_runtime_status"),
+            "history_kv_backend": history_kv_backend,
+            "history_kv_runtime_status": runtime_status,
+            "history_kv_storage_runtime_status": storage_runtime_status,
             "history_kv_physical_eviction_success": physical.get("success"),
             "history_kv_lifecycle": lifecycle or None,
             "canonical_full_source": canonical_full_source,

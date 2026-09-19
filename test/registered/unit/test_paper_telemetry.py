@@ -95,6 +95,65 @@ def test_request_scoped_metrics_include_generation_and_history(monkeypatch, tmp_
     assert json.loads(log_path.read_text(encoding="utf-8"))["metrics"] == metrics
 
 
+def test_reference_success_separates_semantic_and_storage_runtime_status(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), _C2KVPool(), bytes_per_kv_token=4)
+    telemetry.start(
+        server_request_id="reference-1",
+        outer_request_id="outer-reference-1",
+        phase="chat",
+        kind="generation",
+        whole_full_kv_tokens=100,
+    )
+    req = SimpleNamespace(
+        rid="reference-1",
+        kv_committed_len=40,
+        origin_input_ids=list(range(80)),
+        kv_memory_report={
+            "active_history_kv_tokens": 16,
+            "history_kv_backend": "reference_attention",
+            "reference_attention_backend": "torch_sdpa",
+            # This is the legacy nested physical receipt emitted by CUDA v2.
+            "history_kv_runtime_status": "physical_eviction_globalized",
+            "history_kv_physical_eviction": {
+                "success": True,
+                "runtime_status": "physical_eviction_globalized",
+            },
+        },
+    )
+    telemetry.mark_generation_start(req)
+    metrics = telemetry.finish(req=req, success=True)["metrics"]
+
+    assert metrics["history_kv_backend"] == "reference_attention"
+    assert metrics["history_kv_runtime_status"] == "reference_attention_ok"
+    assert metrics["history_kv_storage_runtime_status"] == (
+        "physical_eviction_globalized"
+    )
+    assert metrics["history_kv_physical_eviction_success"] is True
+
+
+def test_reference_failure_runtime_status_is_not_overridden():
+    req = SimpleNamespace(
+        kv_memory_report={
+            "history_kv_backend": "reference_attention",
+            "reference_attention_backend": "torch_sdpa",
+            "history_kv_runtime_status": "physical_eviction_exception",
+            "history_kv_physical_eviction": {
+                "success": False,
+                "runtime_status": "physical_eviction_failed",
+            },
+        }
+    )
+
+    semantics = _PaperTelemetry._req_semantics(req)
+
+    assert semantics["history_kv_runtime_status"] == "physical_eviction_exception"
+    assert semantics["history_kv_storage_runtime_status"] is None
+    assert semantics["history_kv_physical_eviction_success"] is False
+
+
 def test_transformed_text_history_is_not_labeled_full(monkeypatch):
     monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
     monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)

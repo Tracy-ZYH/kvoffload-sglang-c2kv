@@ -3554,6 +3554,18 @@ class Scheduler(
         serving_state = getattr(req, "history_kv_runtime_state", None)
         if not isinstance(serving_state, CommitKVServingState):
             raise RuntimeError("COMMITKV_RUNTIME_STATE_UNAVAILABLE")
+        reference_config = getattr(req, "history_kv_reference_config", None)
+        declared_target_tokens = (
+            int(reference_config.get("target_tokens") or 2048)
+            if isinstance(reference_config, dict)
+            else serving_state.target_tokens
+        )
+        if declared_target_tokens != serving_state.target_tokens:
+            raise RuntimeError(
+                "COMMITKV_TOTAL_BUDGET_CHANGED: "
+                f"state={serving_state.target_tokens}, "
+                f"request={declared_target_tokens}"
+            )
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         history_len = history_end - history_start
@@ -3598,7 +3610,7 @@ class Scheduler(
         selected, metadata = serving_state.policy.checkpoint(
             baseline,
             resident_positions,
-            target_tokens=int(config.get("target_tokens") or history_len),
+            target_tokens=serving_state.target_tokens,
             num_layers=len(layer_ids),
             num_kv_heads=num_kv_heads,
             device=first_key.device,
@@ -3609,6 +3621,10 @@ class Scheduler(
             baseline_policy="most_recent_first_project_convention",
             scan_order="latest_fully_resident_pages_project_convention",
             capture_receipts=list(serving_state.receipts),
+            commitkv_total_budget_tokens=serving_state.target_tokens,
+            commitkv_request_effective_target_tokens=int(
+                config.get("target_tokens") or history_len
+            ),
         )
         layers = {}
         for layer_id, indices in zip(layer_ids, selected):
@@ -3774,12 +3790,25 @@ class Scheduler(
             report["selection_query_tokens_observed"] = (
                 selection_query_tokens_observed
             )
-            report["history_kv_physical_eviction"] = (
-                result.as_dict() if result is not None else {"success": False, "error": error}
+            physical_receipt = (
+                result.as_dict()
+                if result is not None
+                else {"success": False, "error": error}
             )
+            if result is not None and result.success and reference_state is not None:
+                storage_runtime_status = physical_receipt.get("runtime_status")
+                physical_receipt["storage_runtime_status"] = storage_runtime_status
+                physical_receipt["runtime_status"] = "reference_attention_ok"
+                report["history_kv_storage_runtime_status"] = storage_runtime_status
+            report["history_kv_physical_eviction"] = physical_receipt
             if result is not None and result.success:
-                runtime_status = str(
-                    config.get("runtime_status_override") or result.runtime_status
+                runtime_status = (
+                    "reference_attention_ok"
+                    if reference_state is not None
+                    else str(
+                        config.get("runtime_status_override")
+                        or result.runtime_status
+                    )
                 )
                 if reference_state is not None:
                     reference_slots = sum(

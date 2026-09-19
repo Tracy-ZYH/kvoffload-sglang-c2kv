@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import math
 import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import List
 
 import torch
 import pytest
@@ -43,9 +45,14 @@ def _extract_method(path: Path, class_name: str, method_name: str):
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
     namespace = {
+        "List": List,
+        "math": math,
         "torch": torch,
         "ForwardBatch": object,
-        "paper_telemetry": SimpleNamespace(sample=lambda *args, **kwargs: None),
+        "paper_telemetry": SimpleNamespace(
+            bind_request=lambda *args, **kwargs: None,
+            sample=lambda *args, **kwargs: None,
+        ),
     }
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[method_name]
@@ -65,6 +72,16 @@ SCHEDULER_BUILD = _extract_method(
     ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py",
     "Scheduler",
     "_build_commitkv_reference_state",
+)
+SCHEDULER_INIT = _extract_method(
+    ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py",
+    "Scheduler",
+    "_init_c2kv_kv_memory_report",
+)
+SERVING_RESOLVE_RANGE = _extract_method(
+    ROOT / "python" / "sglang" / "srt" / "entrypoints" / "openai" / "serving_chat.py",
+    "OpenAIServingChat",
+    "_resolve_history_kv_eviction_range",
 )
 
 
@@ -88,6 +105,35 @@ class _KVPool:
 
     def get_kv_buffer(self, layer_id: int):
         return self._keys[layer_id], self._values[layer_id]
+
+
+def _resolved_commitkv_hint(history_tokens: int, *, total_budget: int = 2048):
+    hint = {
+        "history_kv_eviction": {
+            "method": "commitkv",
+            "history_start_message_count": 1,
+            "history_message_count": 2,
+            "target_tokens": total_budget,
+        },
+        "history_kv_reference_config": {
+            "method": "commitkv",
+            "target_tokens": total_budget,
+            "measurement_layer_id": 0,
+        },
+    }
+    request = SimpleNamespace(messages=[object(), object()], c2kv_kv_memory_hint=hint)
+    completed_ids = list(range(history_tokens + 1))
+    owner = SimpleNamespace(
+        _chat_template_tools=lambda request: None,
+        _c2kv_chat_template_input_ids=(
+            lambda request, messages, tools: (
+                [0] if len(messages) == 1 else completed_ids
+            )
+        ),
+        _find_token_subsequence=lambda haystack, needle: 0,
+    )
+    SERVING_RESOLVE_RANGE(owner, request, completed_ids + [history_tokens + 1])
+    return hint
 
 
 def test_new_transition_is_not_consumed_while_previous_post_window_is_pending():
@@ -407,3 +453,88 @@ def test_scheduler_commitkv_builder_protects_pending_and_uses_common_indices():
     assert config["commitkv_baseline_policy"] == (
         "most_recent_first_project_convention"
     )
+
+
+def test_commitkv_absolute_budget_survives_resolver_clamps_across_turns():
+    hints = [_resolved_commitkv_hint(size) for size in (137, 274, 2100)]
+    assert [hint["history_kv_eviction"]["target_tokens"] for hint in hints] == [
+        137,
+        274,
+        2048,
+    ]
+    assert [
+        hint["history_kv_reference_config"]["target_tokens"] for hint in hints
+    ] == [2048, 2048, 2048]
+
+    scheduler = SimpleNamespace(model_config=SimpleNamespace(num_hidden_layers=1))
+    scheduler._init_c2kv_kv_memory_report = MethodType(SCHEDULER_INIT, scheduler)
+    req = SimpleNamespace(
+        history_kv_runtime_state=None,
+        history_kv_reference_config=None,
+        history_kv_resident_positions=list(range(137)),
+        history_kv_reference_state=None,
+        req_pool_idx=0,
+    )
+    scheduler._init_c2kv_kv_memory_report(req, hints[0])
+    serving_state = req.history_kv_runtime_state
+    assert isinstance(serving_state, CommitKVServingState)
+    assert serving_state.target_tokens == 2048
+
+    serving_state.pre_window = _FixedEffectWindow(list(range(137)))
+    serving_state.pre_pages = (EventPage("act-0", 0, 0, 16),)
+    serving_state.configure_events(
+        [
+            {
+                "message_index": 1,
+                "role": "tool",
+                "phase": "tool",
+                "start": 16,
+                "end": 32,
+            }
+        ]
+    )
+    assert serving_state.policy.pending.total_budget == 2048
+
+    def build(normal_positions, effective_target, existing_state):
+        count = len(normal_positions)
+        keys = torch.tensor(normal_positions, dtype=torch.float32).view(count, 1, 1)
+        kv_pool = _KVPool([keys], [keys + 10000])
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(count, dtype=torch.long).view(1, -1)
+        )
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            get_kvcache=lambda: kv_pool
+        )
+        scheduler._build_commitkv_reference_state = MethodType(
+            SCHEDULER_BUILD, scheduler
+        )
+        req.history_kv_resident_positions = list(normal_positions)
+        req.history_kv_reference_state = existing_state
+        config = {
+            "history_start": 0,
+            "history_end": count,
+            "target_tokens": effective_target,
+        }
+        return scheduler._build_commitkv_reference_state(req, config), config
+
+    state, config = build(range(137), 137, None)
+    assert state.layers[0].positions.shape == (1, 137)
+    assert state.selection_metadata["commitkv_total_budget_tokens"] == 2048
+    assert state.selection_metadata["commitkv_request_effective_target_tokens"] == 137
+
+    state, config = build(range(137, 274), 274, state)
+    assert state.layers[0].positions.shape == (1, 274)
+    assert state.selection_metadata["commitkv_total_budget_tokens"] == 2048
+    assert state.selection_metadata["commitkv_request_effective_target_tokens"] == 274
+
+    state, config = build(range(274, 2100), 2048, state)
+    assert state.layers[0].positions.shape == (1, 2048)
+    assert state.selection_metadata["commitkv_total_budget_tokens"] == 2048
+    assert state.selection_metadata["commitkv_request_effective_target_tokens"] == 2048
+
+    req.history_kv_reference_config = {
+        **req.history_kv_reference_config,
+        "target_tokens": 1024,
+    }
+    with pytest.raises(RuntimeError, match="COMMITKV_TOTAL_BUDGET_CHANGED"):
+        build(range(2100, 2200), 1024, state)
