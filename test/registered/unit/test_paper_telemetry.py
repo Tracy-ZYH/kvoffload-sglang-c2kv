@@ -362,3 +362,52 @@ def test_extract_wrapper_persists_cache_miss_only_gist_duration(
         assert report["metrics"]["extraction_duration_ns"] == report["duration_ns"]
         assert report["metrics"]["gist_generation_duration_ns"] == expected_duration
         assert report["metrics"]["cache_hit"] is expected_hit
+
+
+def test_reference_payload_counts_shared_session_once_and_temporary_overlap(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    layer = SimpleNamespace(key=torch.zeros(2, 3, 4), value=torch.zeros(2, 3, 4),
+                            positions=torch.arange(3).expand(2, -1).clone())
+    state = SimpleNamespace(layers={0: layer})
+    slot = SimpleNamespace(history_kv_reference_state=state)
+    cache = SimpleNamespace(slots={"s": slot})
+    telemetry = _PaperTelemetry()
+    telemetry.configure(_Allocator(), None, bytes_per_kv_token=64, tree_cache=cache)
+    telemetry.start(server_request_id="r", outer_request_id="r", phase="prefill", kind="generation")
+    req = SimpleNamespace(rid="r", kv_committed_len=4, history_kv_reference_state=state)
+    telemetry.bind_request(req)
+    snap = telemetry.sample("shared")
+    external = layer.key.nbytes + layer.value.nbytes + layer.positions.nbytes
+    assert snap["kv"]["reference_history_resident_bytes"] == external
+    assert snap["kv"]["request_resident_kv_bytes"] == 30 * 64 + external
+    new_tensors = [layer.key.clone(), layer.value.clone(), layer.positions.clone()]
+    peak = telemetry.sample("new_state_before_swap", tensors=new_tensors, temporary_kv=True)
+    assert peak["kv"]["request_resident_kv_bytes"] == 30 * 64 + 2 * external
+    telemetry.mark_generation_start(req)
+    generation = telemetry._active["generation_start"]
+    assert generation["request_active_kv_bytes"] == 4 * 64 + external
+    assert generation["request_active_kv_tokens"] == 4 + 3
+    # A new object owned by the request while the prior session state is live
+    # represents two allocations and must contribute both resident payloads.
+    req.history_kv_reference_state = SimpleNamespace(layers={0: SimpleNamespace(
+        key=new_tensors[0], value=new_tensors[1], positions=new_tensors[2])})
+    assert telemetry.sample("overlap")["kv"]["reference_history_resident_bytes"] == 2 * external
+    cache.slots.clear()
+    assert telemetry.sample("released")["kv"]["reference_history_resident_bytes"] == external
+
+
+def test_reference_recovery_snapshot_is_resident_even_when_not_selected(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    def state():
+        return SimpleNamespace(layers={0: SimpleNamespace(
+            key=torch.zeros(1, 2, 4), value=torch.zeros(1, 2, 4),
+            positions=torch.arange(2).view(1, 2))})
+    live, baseline = state(), state()
+    owner = SimpleNamespace(history_kv_reference_state=live,
+                            reference_decode_baseline_state=baseline,
+                            reference_decode_persistent_state=baseline)
+    telemetry = _PaperTelemetry()
+    telemetry.configure(None, None, bytes_per_kv_token=32,
+                        tree_cache=SimpleNamespace(slots={"s": owner}))
+    assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 2 * (64 + 16)
+    assert telemetry._reference_payload([owner], include_snapshots=False)["bytes"] == 64 + 16

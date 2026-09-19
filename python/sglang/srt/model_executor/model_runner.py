@@ -256,6 +256,15 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def _requires_reference_attention_eager(forward_batch):
+    """Reference KV tensors and query capture are request-specific Python state."""
+    return any(
+        item is not None
+        for name in ("history_kv_reference_configs", "history_kv_reference_states")
+        for item in (getattr(forward_batch, name, None) or ())
+    )
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -2689,7 +2698,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
 
         can_run_graph = (
-            self.piecewise_cuda_graph_runner is not None
+            not _requires_reference_attention_eager(forward_batch)
+            and self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
 
@@ -2899,7 +2909,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            not _requires_reference_attention_eager(forward_batch)
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

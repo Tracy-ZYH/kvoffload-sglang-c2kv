@@ -185,13 +185,39 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
+            session_output_ids = last_req.output_ids[
+                : last_req.sampling_params.max_new_tokens
+            ]
+            if (
+                persistent_history_session
+                and not session_params.drop_previous_output
+                and (hint or {}).get("persistent_session_computed_prefix_tokens")
+                is not None
+            ):
+                active_output_ids = getattr(
+                    last_req, "persistent_session_active_output_ids", None
+                )
+                if active_output_ids is None:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_ACTIVE_OUTPUT_UNAVAILABLE"
+                    )
+                session_output_ids = list(active_output_ids)
+            input_ids = last_req.origin_input_ids + session_output_ids
 
             if session_params.drop_previous_output:
                 input_ids = last_req.origin_input_ids[:]
+                drop_prefix = int(
+                    (hint or {}).get(
+                        "persistent_session_drop_generation_prefix_tokens"
+                    )
+                    or 0
+                )
+                if drop_prefix:
+                    if not persistent_history_session or not 0 < drop_prefix < len(input_ids):
+                        raise ValueError(
+                            "PERSISTENT_HISTORY_RECOVERY_INVALID_GENERATION_PREFIX"
+                        )
+                    input_ids = input_ids[:-drop_prefix]
 
             if session_params.offset and session_params.offset != 0:
                 input_ids = input_ids[: session_params.offset] + req.input_ids
@@ -199,11 +225,12 @@ class Session:
                 input_ids += req.input_ids
 
             input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+                last_req.origin_input_ids_unpadded + session_output_ids
             )
             if session_params.drop_previous_output:
                 input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+                if drop_prefix:
+                    input_ids_unpadded = input_ids_unpadded[:-drop_prefix]
 
             if session_params.offset and session_params.offset != 0:
                 input_ids_unpadded = (

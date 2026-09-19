@@ -438,6 +438,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     c2kv_gist_projection_start_positions: Optional[torch.Tensor] = None
     c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None
     c2kv_history_kv_selection_scores: Optional[Dict[int, Dict[str, Any]]] = None
+    history_kv_reference_states: Optional[List[Any]] = None
+    history_kv_reference_configs: Optional[List[Optional[Dict[str, Any]]]] = None
+    history_kv_runtime_states: Optional[List[Any]] = None
+    history_kv_resident_positions: Optional[List[List[int]]] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -495,6 +499,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.c2kv_history_kv_eviction_configs = (
             batch.c2kv_history_kv_eviction_configs
         )
+        ret.history_kv_reference_states = batch.history_kv_reference_states
+        ret.history_kv_reference_configs = batch.history_kv_reference_configs
+        ret.history_kv_runtime_states = batch.history_kv_runtime_states
+        ret.history_kv_resident_positions = batch.history_kv_resident_positions
         if ret.c2kv_history_kv_eviction_configs is not None:
             ret.c2kv_history_kv_selection_scores = {}
         device = model_runner.device

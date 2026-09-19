@@ -59,6 +59,8 @@ class SchedulerOutputProcessorMixin:
             req.history_kv_selection_scores = {
                 **incoming,
                 "layers": list(incoming_layers),
+                "headwise_layers": list(incoming.get("headwise_layers") or []),
+                "layer_ids": list(incoming.get("layer_ids") or []),
                 "query_tokens": int(incoming.get("query_tokens") or 0),
             }
             return
@@ -89,6 +91,29 @@ class SchedulerOutputProcessorMixin:
         current["layers"] = [
             left + right for left, right in zip(current_layers, incoming_layers)
         ]
+        current_headwise = current.get("headwise_layers") or []
+        incoming_headwise = incoming.get("headwise_layers") or []
+        if current_headwise or incoming_headwise:
+            if (
+                len(current_headwise) != len(incoming_headwise)
+                or list(current.get("layer_ids") or [])
+                != list(incoming.get("layer_ids") or [])
+                or any(
+                    tuple(left.shape) != tuple(right.shape)
+                    for left, right in zip(current_headwise, incoming_headwise)
+                )
+            ):
+                req.history_kv_selection_scores = {
+                    "error": "HISTORY_KV_HEADWISE_SELECTION_CHUNK_MISMATCH",
+                    "layers": [],
+                    "headwise_layers": [],
+                    "query_tokens": 0,
+                }
+                return
+            current["headwise_layers"] = [
+                left + right
+                for left, right in zip(current_headwise, incoming_headwise)
+            ]
         current["query_tokens"] = int(current.get("query_tokens") or 0) + int(
             incoming.get("query_tokens") or 0
         )
@@ -634,6 +659,33 @@ class SchedulerOutputProcessorMixin:
                             req.c2kv_virtual_input_ids = list(persistent_active_ids)
                         self._release_c2kv_pins(req)
 
+                    # All ordinary KV remaining after turn-prefill eviction is
+                    # protected system/tool/current-input context. Periodic
+                    # reference checkpoints may compress only the subsequently
+                    # decoded suffix.
+                    req.reference_decode_protected_len = int(
+                        req.kv_committed_len
+                    )
+                    reference_config = getattr(
+                        req, "history_kv_reference_config", None
+                    )
+                    reference_method = (
+                        str(reference_config.get("method") or "").lower()
+                        if isinstance(reference_config, dict)
+                        else ""
+                    )
+                    req.reference_decode_persistent_state = (
+                        None
+                        if reference_method in {"agentkv", "commitkv"}
+                        else getattr(req, "history_kv_reference_state", None)
+                    )
+                    req.reference_decode_logical_start = int(
+                        req.kv_committed_len
+                    ) + int(getattr(req, "c2kv_position_correction", 0) or 0)
+                    if isinstance(reference_config, dict) and str(
+                        reference_config.get("method") or ""
+                    ).lower() in {"agentkv", "commitkv"}:
+                        req.reference_decode_baseline_runtime_state = None
                     paper_telemetry.mark_generation_start(req)
 
                     # req output_ids are set here
@@ -1000,6 +1052,14 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.token_to_kv_pool_allocator.free_group_end()
+        for batch_idx, req in enumerate(batch.reqs):
+            if req.finished() or req.is_retracted:
+                continue
+            seq_delta = self._apply_reference_decode_checkpoint(req)
+            if seq_delta:
+                batch.seq_lens_cpu[batch_idx] += seq_delta
+                batch.seq_lens[batch_idx] += seq_delta
+                batch.seq_lens_sum += seq_delta
         paper_telemetry.sample("decode_release_complete")
         self.stream_output(batch.reqs, batch.return_logprob)
 

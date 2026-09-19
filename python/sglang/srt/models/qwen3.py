@@ -46,6 +46,10 @@ from sglang.srt.mem_cache.history_kv_selection import (
     select_streamingllm_indices,
     summarize_headwise_indices,
 )
+from sglang.srt.mem_cache.history_kv_reference import (
+    ReferenceLayerKV,
+    reference_sdpa,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.observability import paper_telemetry
 from sglang.srt.model_loader.weight_utils import (
@@ -111,6 +115,16 @@ def _npu_fusion_attention_output(
         if tensor.shape == expected_shape:
             return tensor
     return candidates[0]
+
+
+def _requires_reference_runtime_qkv(forward_batch: ForwardBatch) -> bool:
+    """Keep explicit Q/K/V available for reference selection and attention."""
+
+    return any(
+        item is not None
+        for name in ("history_kv_reference_configs", "history_kv_reference_states")
+        for item in (getattr(forward_batch, name, None) or [])
+    )
 
 
 class Qwen3Attention(nn.Module):
@@ -432,7 +446,52 @@ class Qwen3Attention(nn.Module):
                     raise RuntimeError("HISTORY_KV_UNSUPPORTED_KEY_BUFFER_LAYOUT")
                 cached = key_buffer.reshape(-1, self.num_kv_heads, self.head_dim)[slots]
                 k_req = torch.cat([cached.to(k_req.dtype), k_req], dim=0)
+            # Keep this construction local: lifecycle unit tests extract this
+            # method in isolation, and production needs the same canonical
+            # ledger fallback as the reference attention helper.
+            normal_seq_len = prefix_len + extend_len
+            ledgers = getattr(
+                forward_batch, "history_kv_resident_positions", None
+            )
+            ledger = (
+                list(ledgers[batch_idx])
+                if ledgers and batch_idx < len(ledgers)
+                else list(config.get("resident_logical_positions") or [])
+            )
+            if len(ledger) >= normal_seq_len:
+                normal_positions = torch.tensor(
+                    ledger[:normal_seq_len],
+                    dtype=torch.long,
+                    device=flat_positions.device,
+                )
+            else:
+                query_position_list = [
+                    int(item)
+                    for item in flat_positions[token_start:token_end].tolist()
+                ]
+                known = ledger[:prefix_len]
+                missing = prefix_len - len(known)
+                if missing:
+                    start = (
+                        query_position_list[0] - missing
+                        if query_position_list
+                        else (known[-1] + 1 if known else 0)
+                    )
+                    known.extend(range(start, start + missing))
+                normal_positions = torch.tensor(
+                    known + query_position_list,
+                    dtype=torch.long,
+                    device=flat_positions.device,
+                )
             k_req = k_req.transpose(0, 1).contiguous()
+            reference_state = None
+            states = getattr(forward_batch, "history_kv_reference_states", None)
+            if states and batch_idx < len(states) and states[batch_idx] is not None:
+                reference_state = states[batch_idx].layer(self.attn.layer_id)
+            reference_len = 0
+            if reference_state is not None:
+                reference_state.validate()
+                reference_len = int(reference_state.key.shape[1])
             if self.num_heads != self.num_kv_heads:
                 groups = self.num_heads // self.num_kv_heads
                 k_score = k_req.repeat_interleave(groups, dim=0)
@@ -446,6 +505,13 @@ class Qwen3Attention(nn.Module):
             # heads attending to current content get overstated history scores.
             key_end = prefix_len + q_end
             k_all = k_score[:, :key_end, :]
+            if reference_state is not None:
+                reference_keys = reference_state.key.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=0
+                )
+                k_all = torch.cat(
+                    [reference_keys.to(k_all.dtype), k_all], dim=1
+                )
             logits = torch.matmul(
                 q_window.float(),
                 k_all.transpose(-2, -1).float(),
@@ -453,25 +519,39 @@ class Qwen3Attention(nn.Module):
             q_pos = flat_positions[token_start + q_start : token_start + q_end].to(
                 logits.device
             ).view(1, -1, 1)
-            ledger = config.get("resident_logical_positions")
-            if ledger is not None:
-                prefix_positions = list(ledger[:prefix_len])
-                extend_positions = flat_positions[
-                    token_start : token_start + q_end
-                ].tolist()
-                key_positions = torch.tensor(
-                    prefix_positions + extend_positions,
-                    device=logits.device,
+            key_positions = normal_positions[:key_end].to(logits.device)
+            if reference_state is not None:
+                reference_positions = reference_state.positions.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=0
                 )
-            elif prefix_len:
-                # First-request chunked prefill has not evicted anything yet.
-                key_positions = torch.arange(key_end, device=logits.device)
+                k_pos = torch.cat(
+                    [
+                        reference_positions.to(logits.device),
+                        key_positions.view(1, -1).expand(self.num_heads, -1),
+                    ],
+                    dim=1,
+                ).unsqueeze(1)
             else:
-                key_positions = flat_positions[token_start : token_start + key_end].to(logits.device)
-            k_pos = key_positions.view(1, 1, -1)
+                k_pos = key_positions.view(1, 1, -1)
             logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
             probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            layer_score = probs[:, :, history_start:history_end].sum(dim=(0, 1))
+            groups = self.num_heads // self.num_kv_heads
+            headwise_probs = probs.view(
+                self.num_kv_heads, groups, q_end - q_start, -1
+            ).sum(dim=(1, 2))
+            layer_score = headwise_probs[
+                :, reference_len + history_start : reference_len + history_end
+            ].sum(dim=0)
+            headwise_layer_score = torch.cat(
+                [
+                    headwise_probs[:, :reference_len],
+                    headwise_probs[
+                        :,
+                        reference_len + history_start : reference_len + history_end,
+                    ],
+                ],
+                dim=1,
+            )
 
             req_pool_idx = int(forward_batch.req_pool_indices[batch_idx].item())
             entry = score_store.setdefault(
@@ -486,9 +566,362 @@ class Qwen3Attention(nn.Module):
                     "selection_query_end": config.get("selection_query_end"),
                     "selection_query_phase": config.get("selection_query_phase"),
                     "layers": [],
+                    "headwise_layers": [],
+                    "layer_ids": [],
                 },
             )
             entry["layers"].append(layer_score.detach().cpu())
+            entry["headwise_layers"].append(
+                headwise_layer_score.detach().cpu()
+            )
+            entry["layer_ids"].append(int(self.attn.layer_id))
+
+    def _capture_history_kv_runtime_queries(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Persist method query observations, including first-turn decode."""
+
+        configs = getattr(forward_batch, "history_kv_reference_configs", None)
+        states = getattr(forward_batch, "history_kv_runtime_states", None)
+        if not configs or not states or q is None or positions is None:
+            return
+        if forward_batch.forward_mode.is_decode():
+            query_lens = [1] * int(forward_batch.batch_size)
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            if forward_batch.extend_seq_lens_cpu is None:
+                return
+            query_lens = [int(item) for item in forward_batch.extend_seq_lens_cpu]
+        else:
+            return
+        query = q.view(-1, self.num_heads, self.head_dim)
+        flat_positions = positions.reshape(-1)
+        flat_token_ids = forward_batch.input_ids.reshape(-1)
+        offset = 0
+        for batch_idx, query_len in enumerate(query_lens):
+            token_query = query[offset : offset + query_len]
+            token_positions = flat_positions[offset : offset + query_len].to(
+                dtype=torch.long
+            )
+            token_ids = flat_token_ids[offset : offset + query_len]
+            offset += query_len
+            config = configs[batch_idx] if batch_idx < len(configs) else None
+            state = states[batch_idx] if batch_idx < len(states) else None
+            if not isinstance(config, dict) or state is None:
+                continue
+            method = str(config.get("method") or "").lower()
+            if method == "commitkv":
+                from sglang.srt.mem_cache.history_kv_reference import (
+                    CommitKVServingState,
+                )
+
+                if not isinstance(state, CommitKVServingState):
+                    raise RuntimeError("COMMITKV_RUNTIME_STATE_TYPE_MISMATCH")
+                if self.attn.layer_id != state.policy.config.measurement_layer_id:
+                    continue
+                state.configure_events(config.get("event_token_spans") or [])
+                if not forward_batch.forward_mode.is_decode():
+                    continue
+                if k is None or v is None or query_len != 1:
+                    raise RuntimeError("COMMITKV_DECODE_CAPTURE_REQUIRES_EXPLICIT_KV")
+                seq_len = int(forward_batch.seq_lens[batch_idx].item())
+                req_pool_idx = int(
+                    forward_batch.req_pool_indices[batch_idx].item()
+                )
+                prefix_slots = forward_batch.req_to_token_pool.req_to_token[
+                    req_pool_idx, : max(0, seq_len - 1)
+                ].long()
+                key_buffer, value_buffer = (
+                    forward_batch.token_to_kv_pool.get_kv_buffer(
+                        self.attn.layer_id
+                    )
+                )
+                key_buffer = key_buffer.reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                value_buffer = value_buffer.reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                normal_key = torch.cat(
+                    [
+                        key_buffer[prefix_slots].to(token_query.dtype),
+                        k[offset - query_len : offset].view(
+                            query_len, self.num_kv_heads, self.head_dim
+                        ),
+                    ],
+                    dim=0,
+                )
+                normal_value = torch.cat(
+                    [
+                        value_buffer[prefix_slots].to(token_query.dtype),
+                        v[offset - query_len : offset].view(
+                            query_len, self.num_kv_heads, self.head_dim
+                        ),
+                    ],
+                    dim=0,
+                )
+                normal_positions = self._reference_normal_positions(
+                    forward_batch,
+                    batch_idx,
+                    seq_len,
+                    token_positions,
+                )
+                reference_layer = None
+                reference_states = getattr(
+                    forward_batch, "history_kv_reference_states", None
+                ) or []
+                if (
+                    batch_idx < len(reference_states)
+                    and reference_states[batch_idx] is not None
+                ):
+                    reference_layer = reference_states[batch_idx].layer(
+                        self.attn.layer_id
+                    )
+                key = normal_key.transpose(0, 1)
+                value = normal_value.transpose(0, 1)
+                key_positions = normal_positions
+                if reference_layer is not None:
+                    reference_layer.validate()
+                    if not torch.equal(
+                        reference_layer.positions,
+                        reference_layer.positions[:1].expand_as(
+                            reference_layer.positions
+                        ),
+                    ):
+                        raise RuntimeError(
+                            "COMMITKV_REQUIRES_COMMON_HEADWISE_POSITIONS"
+                        )
+                    key = torch.cat([reference_layer.key, key], dim=1)
+                    value = torch.cat([reference_layer.value, value], dim=1)
+                    key_positions = torch.cat(
+                        [reference_layer.positions[0], normal_positions], dim=0
+                    )
+                state.record_decode_window(
+                    token_query,
+                    token_positions,
+                    key,
+                    value,
+                    key_positions,
+                    scale=self.scaling,
+                )
+                continue
+            if method != "agentkv":
+                # CommitKV captures paired pre/post windows at explicit action
+                # boundaries; ordinary prompt queries must not enter them.
+                continue
+            from sglang.srt.mem_cache.agentkv import (
+                AGENTKV_STAGE_THINK,
+                AgentKVQueryRing,
+                agentkv_stage_for_event,
+            )
+
+            if not isinstance(state, AgentKVQueryRing):
+                raise RuntimeError("AGENTKV_RUNTIME_STATE_TYPE_MISMATCH")
+            stage_ids = torch.full(
+                (query_len,),
+                AGENTKV_STAGE_THINK,
+                dtype=torch.int32,
+                device=token_query.device,
+            )
+            for span in config.get("event_token_spans") or []:
+                if not isinstance(span, dict):
+                    continue
+                start = int(span.get("start", -1))
+                end = int(span.get("end", -1))
+                if end <= start:
+                    continue
+                stage = agentkv_stage_for_event(
+                    str(span.get("role") or ""),
+                    str(span.get("phase") or "others"),
+                )
+                mask = (token_positions >= start) & (token_positions < end)
+                stage_ids[mask] = stage
+            marker_reassignments = []
+            if forward_batch.forward_mode.is_decode():
+                tails = getattr(state, "_decode_marker_tails", None)
+                stages = getattr(state, "_decode_marker_stages", None)
+                if tails is None:
+                    tails = state._decode_marker_tails = {}
+                if stages is None:
+                    stages = state._decode_marker_stages = {}
+                tail = list(tails.get(self.attn.layer_id, []))
+                current_stage = int(
+                    stages.get(self.attn.layer_id, AGENTKV_STAGE_THINK)
+                )
+                markers = sorted(
+                    [
+                        (
+                            tuple(int(x) for x in item.get("token_ids") or []),
+                            int(item.get("stage")),
+                        )
+                        for item in config.get(
+                            "agentkv_marker_stage_sequences", []
+                        )
+                        if item.get("token_ids")
+                    ],
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+                max_marker = max((len(item[0]) for item in markers), default=1)
+                for local_idx, (token_id, token_position) in enumerate(
+                    zip(token_ids.tolist(), token_positions.tolist())
+                ):
+                    tail.append((int(token_id), int(token_position)))
+                    tail = tail[-max_marker:]
+                    for sequence, marker_stage in markers:
+                        if tuple(item[0] for item in tail[-len(sequence) :]) == sequence:
+                            current_stage = marker_stage
+                            marker_reassignments.append(
+                                (
+                                    [item[1] for item in tail[-len(sequence) :]],
+                                    marker_stage,
+                                )
+                            )
+                            break
+                    stage_ids[local_idx] = current_stage
+                tails[self.attn.layer_id] = tail
+                stages[self.attn.layer_id] = current_stage
+            state.write_layer(
+                layer_id=self.attn.layer_id,
+                query=token_query,
+                positions=token_positions,
+                stage_ids=stage_ids,
+            )
+            for marker_positions, marker_stage in marker_reassignments:
+                state.reassign_positions(
+                    layer_id=self.attn.layer_id,
+                    positions=marker_positions,
+                    stage=marker_stage,
+                )
+
+    @staticmethod
+    def _reference_normal_positions(
+        forward_batch: ForwardBatch,
+        batch_idx: int,
+        seq_len: int,
+        query_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return canonical positions for the ordinary paged sequence."""
+
+        device = query_positions.device
+        ledgers = getattr(forward_batch, "history_kv_resident_positions", None)
+        ledger = list(ledgers[batch_idx]) if ledgers and batch_idx < len(ledgers) else []
+        if len(ledger) >= seq_len:
+            return torch.tensor(ledger[:seq_len], dtype=torch.long, device=device)
+        q_positions = [int(item) for item in query_positions.reshape(-1).tolist()]
+        prefix_len = seq_len - len(q_positions)
+        known = ledger[:prefix_len]
+        missing = prefix_len - len(known)
+        if missing:
+            if q_positions:
+                start = q_positions[0] - missing
+            elif known:
+                start = known[-1] + 1
+            else:
+                start = 0
+            known.extend(range(start, start + missing))
+        positions = known + q_positions
+        if len(positions) != seq_len:
+            raise RuntimeError("REFERENCE_HISTORY_POSITION_LENGTH_MISMATCH")
+        return torch.tensor(positions, dtype=torch.long, device=device)
+
+    def _reference_history_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Correctness route for per-layer/per-head persistent history."""
+
+        if k is None or v is None:
+            raise RuntimeError("REFERENCE_HISTORY_REQUIRES_EXPLICIT_KV")
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            self.attn.k_scale,
+            self.attn.v_scale,
+        )
+        key_buffer, value_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+            self.attn.layer_id
+        )
+        if key_buffer.ndim not in (3, 4) or tuple(key_buffer.shape[-2:]) != (
+            self.num_kv_heads,
+            self.head_dim,
+        ):
+            raise RuntimeError("REFERENCE_HISTORY_UNSUPPORTED_KV_BUFFER_LAYOUT")
+        key_buffer = key_buffer.reshape(-1, self.num_kv_heads, self.head_dim)
+        value_buffer = value_buffer.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        if forward_batch.forward_mode.is_decode():
+            query_lens = [1] * int(forward_batch.batch_size)
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            if forward_batch.extend_seq_lens_cpu is None:
+                raise RuntimeError("REFERENCE_HISTORY_EXTEND_LENGTHS_REQUIRED")
+            query_lens = [int(item) for item in forward_batch.extend_seq_lens_cpu]
+        else:
+            raise RuntimeError("REFERENCE_HISTORY_FORWARD_MODE_UNSUPPORTED")
+
+        states = getattr(forward_batch, "history_kv_reference_states", None) or []
+        outputs = []
+        offset = 0
+        flat_positions = positions.reshape(-1)
+        for batch_idx, query_len in enumerate(query_lens):
+            query = q[offset : offset + query_len]
+            query_pos = flat_positions[offset : offset + query_len]
+            offset += query_len
+            seq_len = int(forward_batch.seq_lens[batch_idx].item())
+            req_pool_idx = int(forward_batch.req_pool_indices[batch_idx].item())
+            slots = forward_batch.req_to_token_pool.req_to_token[
+                req_pool_idx, :seq_len
+            ].long()
+            normal_key = key_buffer[slots].to(query.dtype)
+            normal_value = value_buffer[slots].to(query.dtype)
+            normal_positions = self._reference_normal_positions(
+                forward_batch, batch_idx, seq_len, query_pos
+            )
+            layer = None
+            if batch_idx < len(states) and states[batch_idx] is not None:
+                layer = states[batch_idx].layer(self.attn.layer_id)
+            if layer is None:
+                layer = ReferenceLayerKV(
+                    key=normal_key.new_empty(
+                        self.num_kv_heads, 0, self.head_dim
+                    ),
+                    value=normal_value.new_empty(
+                        self.num_kv_heads, 0, self.head_dim
+                    ),
+                    positions=torch.empty(
+                        self.num_kv_heads,
+                        0,
+                        dtype=torch.long,
+                        device=normal_key.device,
+                    ),
+                )
+            outputs.append(
+                reference_sdpa(
+                    query,
+                    layer,
+                    normal_key,
+                    normal_value,
+                    normal_positions,
+                    query_pos,
+                    scale=self.scaling,
+                ).reshape(query_len, -1)
+            )
+        if offset != q.shape[0]:
+            raise RuntimeError("REFERENCE_HISTORY_BATCH_LENGTH_MISMATCH")
+        return torch.cat(outputs, dim=0)
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         if split_qkv_rmsnorm_rope is None:
@@ -588,11 +1021,20 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
+        reference_states = getattr(
+            forward_batch, "history_kv_reference_states", None
+        ) or []
+        use_reference_attention = any(
+            state is not None and state.layer(self.attn.layer_id) is not None
+            for state in reference_states
+        )
+        use_reference_runtime = _requires_reference_runtime_qkv(forward_batch)
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
             and getattr(forward_batch, "c2kv_use_gist_projection", None) is None
             and get_global_server_args().rl_on_policy_target is None
+            and not use_reference_runtime
         )
 
         if use_aiter_fused:
@@ -602,6 +1044,8 @@ class Qwen3Attention(nn.Module):
             save_kv_cache = False
         elif (
             getattr(forward_batch, "c2kv_use_gist_projection", None) is not None
+            or
+            use_reference_runtime
             or
             not _is_npu
             or split_qkv_rmsnorm_rope is None
@@ -624,6 +1068,9 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         self._collect_history_kv_eviction_scores(q, k, positions, forward_batch)
+        self._capture_history_kv_runtime_queries(
+            q, k, v, positions, forward_batch
+        )
 
         # ---------------------------------------------------------
         # C2KV_LAYER0_DIFF_DUMP
@@ -702,13 +1149,18 @@ class Qwen3Attention(nn.Module):
                 "scaling": float(self.scaling),
             }
 
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache=save_kv_cache,
-        )
+        if use_reference_attention:
+            attn_output = self._reference_history_attention(
+                q, k, v, positions, forward_batch
+            )
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
 
         if _c2kv_do_dump:
             # self.attn() has now written current query K/V into cache.

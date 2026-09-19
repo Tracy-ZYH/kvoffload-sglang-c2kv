@@ -59,6 +59,9 @@ class SessionSlot:
     c2kv_position_correction: int = 0
     history_kv_resident_positions: Any = None
     history_kv_score_state: Any = None
+    history_kv_reference_state: Any = None
+    history_kv_reference_config: Any = None
+    history_kv_runtime_state: Any = None
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -85,6 +88,15 @@ class SessionSlot:
         resident = set(self.history_kv_resident_positions)
         self.history_kv_score_state = {layer: {p: s for p, s in scores.items() if p in resident}
                                      for layer, scores in (getattr(req, "history_kv_score_state", {}) or {}).items()}
+        self.history_kv_reference_state = getattr(
+            req, "history_kv_reference_state", None
+        )
+        self.history_kv_reference_config = getattr(
+            req, "history_kv_reference_config", None
+        )
+        self.history_kv_runtime_state = getattr(
+            req, "history_kv_runtime_state", None
+        )
 
         if is_first:
             self.last_node = req.last_node
@@ -99,6 +111,10 @@ class SessionSlot:
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.history_kv_reference_state = None
+        req.history_kv_runtime_state = None
+        req.reference_decode_persistent_state = None
+        req.reference_decode_baseline_runtime_state = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -107,7 +123,23 @@ class SessionSlot:
         req.kv_allocated_len = self.kv_allocated_len
         req.swa_evicted_seqlen = self.swa_evicted_seqlen
         req.c2kv_position_correction = self.c2kv_position_correction
+        req.history_kv_resident_positions = list(
+            self.history_kv_resident_positions or []
+        )
         req.history_kv_score_state = self.history_kv_score_state
+        req.history_kv_reference_state = self.history_kv_reference_state
+        incoming_reference_config = getattr(
+            req, "history_kv_reference_config", None
+        )
+        if incoming_reference_config is None:
+            req.history_kv_reference_config = self.history_kv_reference_config
+        elif self.history_kv_reference_config is not None and str(
+            incoming_reference_config.get("method") or ""
+        ).lower() != str(
+            self.history_kv_reference_config.get("method") or ""
+        ).lower():
+            raise RuntimeError("PERSISTENT_HISTORY_REFERENCE_METHOD_CHANGED")
+        req.history_kv_runtime_state = self.history_kv_runtime_state
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -227,6 +259,12 @@ class SessionAwareCache(BasePrefixCache):
             if logical_prefix > 0:
                 self._adopt_legacy_persistent_prefix(slot, logical_prefix)
 
+        drop_generation_prefix = int(
+            hint.get("persistent_session_drop_generation_prefix_tokens") or 0
+        )
+        if drop_generation_prefix:
+            self._trim_persistent_generation_prefix(slot, req)
+
         slot.restore_to_req(req)
 
         report = getattr(req, "kv_memory_report", None)
@@ -260,11 +298,16 @@ class SessionAwareCache(BasePrefixCache):
             )
             hint = req.c2kv_kv_memory_hint or {}
             logical_prefix = int(hint["persistent_session_logical_prefix_tokens"])
+            computed_prefix = int(
+                hint.get("persistent_session_computed_prefix_tokens", logical_prefix)
+            )
             canonical_len = int(hint["persistent_session_canonical_prompt_tokens"])
             prior_positions = list(slot.history_kv_resident_positions or [])
             if len(prior_positions) != int(req.kv_committed_len):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_LEDGER_LENGTH_MISMATCH")
-            positions = append_resident_positions(prior_positions, logical_prefix, canonical_len)
+            positions = append_resident_positions(
+                prior_positions, computed_prefix, canonical_len
+            )
             req.history_kv_resident_positions = positions
             protected, history_end = physical_history_range(positions,
                 int(config.get("persistent_protected_prefix_tokens") or 0),
@@ -394,25 +437,77 @@ class SessionAwareCache(BasePrefixCache):
                     int(hint.get("persistent_session_logical_prefix_tokens", 0)),
                     int(hint.get("persistent_session_canonical_prompt_tokens", len(req.origin_input_ids))))
                 req.history_kv_resident_positions = positions
-            if len(positions) != len(req.origin_input_ids):
+            reference_config = getattr(req, "history_kv_reference_config", None)
+            exact_generated_prefix = bool(
+                isinstance(reference_config, dict)
+                and str(reference_config.get("method") or "").lower()
+                in {"agentkv", "commitkv"}
+            )
+            if (
+                not exact_generated_prefix
+                and len(positions) != len(req.origin_input_ids)
+            ):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
+            protected_prompt_len = int(
+                getattr(req, "reference_decode_protected_len", len(positions))
+                or 0
+            )
             self._discard_persistent_decode_suffix(req)
+            positions = list(req.history_kv_resident_positions or [])
+            if not 0 <= protected_prompt_len <= len(positions):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_PROTECTED_PROMPT_LENGTH_MISMATCH"
+                )
             if isinstance(getattr(req, "kv_memory_report", None), dict):
                 req.kv_memory_report["persistent_session_saved_position_summary"] = position_summary(positions)
                 old_slot = self.slots.get(req.session.session_id)
                 prior = list(old_slot.history_kv_resident_positions or []) if old_slot else []
                 event = req.kv_memory_report.setdefault("history_kv_lifecycle", {})
+                reference_method = str(
+                    (reference_config or {}).get("method") or ""
+                ).lower()
+                if exact_generated_prefix:
+                    computed_prefix = int(
+                        hint.get("persistent_session_computed_prefix_tokens", 0)
+                        or 0
+                    )
+                    canonical_prompt = int(
+                        hint.get(
+                            "persistent_session_canonical_prompt_tokens",
+                            len(req.origin_input_ids),
+                        )
+                        or 0
+                    )
+                    appended_physical_tokens = canonical_prompt - computed_prefix
+                else:
+                    appended_physical_tokens = int(
+                        hint.get("persistent_session_delta_tokens", 0)
+                    )
+                if appended_physical_tokens < 0:
+                    raise RuntimeError(
+                        "PERSISTENT_HISTORY_SESSION_APPEND_COUNT_INVALID"
+                    )
+                resident_after_append = len(prior) + appended_physical_tokens
+                prompt_positions = positions[:protected_prompt_len]
                 event.update({
                     **{k: hint.get(k) for k in ("episode_id", "turn_id", "step_id")},
                     "event": "session_prompt_saved", "session_id": req.session.session_id,
-                    "history_kv_backend": "physical_eviction", "persistent_session_enabled": True,
+                    "history_kv_backend": (
+                        "reference_attention"
+                        if reference_method in {"pyramid", "pyramidkv", "agentkv", "commitkv"}
+                        else "physical_eviction"
+                    ), "persistent_session_enabled": True,
                     "resident_tokens_before_append": len(prior),
                     "new_turn_tokens": int(hint.get("persistent_session_delta_tokens", 0)),
-                    "resident_tokens_after_append": len(prior) + int(hint.get("persistent_session_delta_tokens", 0)),
-                    "resident_tokens_after_eviction": len(positions),
-                    "evicted_tokens_this_turn": len(prior) + int(hint.get("persistent_session_delta_tokens", 0)) - len(positions),
+                    "physical_tokens_appended": appended_physical_tokens,
+                    "resident_tokens_after_append": resident_after_append,
+                    "resident_tokens_after_eviction": protected_prompt_len,
+                    "evicted_tokens_this_turn": resident_after_append - protected_prompt_len,
+                    "resident_stream_tokens_after_decode": len(positions),
+                    "resident_decode_normal_tokens": len(positions) - protected_prompt_len,
                     "previous_resident_position_summary": position_summary(prior),
-                    "resident_position_summary": position_summary(positions),
+                    "resident_position_summary": position_summary(prompt_positions),
+                    "resident_stream_position_summary": position_summary(positions),
                     "full_history_reprefill_performed": False,
                     "history_prefill_tokens": int((getattr(req, "history_kv_eviction", None) or {}).get("persistent_delta_history_tokens", 0)),
                     "canonical_delta_prefill_tokens": int(hint.get("persistent_session_delta_tokens", 0)),
@@ -447,6 +542,145 @@ class SessionAwareCache(BasePrefixCache):
         session may start at any page in the pool; comparing a physical page
         ID with ceil(prompt_len/page_size) can free the prompt itself.
         """
+        reference_config = getattr(req, "history_kv_reference_config", None)
+        reference_method = (
+            str(reference_config.get("method") or "").lower()
+            if isinstance(reference_config, dict)
+            else ""
+        )
+        if reference_method in {"agentkv", "commitkv"}:
+            # These methods checkpoint generated KV during decode. Persist the
+            # exact raw token stream instead of rolling back and re-prefilling
+            # a structured serialization, which would revive evicted tokens.
+            committed_len = int(req.kv_committed_len)
+            allocated_len = int(req.kv_allocated_len)
+            if not 0 <= committed_len <= allocated_len:
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_INVALID_FINISHED_LENGTHS"
+                )
+            correction = int(getattr(req, "c2kv_position_correction", 0) or 0)
+            ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+            if len(ledger) > committed_len:
+                raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
+            if len(ledger) < committed_len:
+                start = len(ledger) + correction
+                ledger.extend(range(start, start + committed_len - len(ledger)))
+            logical_start = getattr(req, "reference_decode_logical_start", None)
+            if logical_start is None:
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_GENERATION_START_UNAVAILABLE"
+                )
+            logical_start = int(logical_start)
+            computed_horizon = committed_len + correction
+            output_ids = list(getattr(req, "output_ids", None) or [])
+            computed_output_tokens = computed_horizon - logical_start
+            if not 0 <= computed_output_tokens <= len(output_ids):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_OUTPUT_HORIZON_MISMATCH"
+                )
+            normal_output_ids = []
+            for position in ledger:
+                if logical_start <= position < computed_horizon:
+                    output_index = position - logical_start
+                    if not 0 <= output_index < computed_output_tokens:
+                        raise RuntimeError(
+                            "PERSISTENT_HISTORY_SESSION_OUTPUT_POSITION_MISMATCH"
+                        )
+                    normal_output_ids.append(output_ids[output_index])
+            req.persistent_session_active_output_ids = (
+                normal_output_ids + output_ids[computed_output_tokens:]
+            )
+            if (
+                len(req.origin_input_ids) + len(normal_output_ids)
+                != committed_len
+            ):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_ACTIVE_STREAM_LENGTH_MISMATCH"
+                )
+            req.history_kv_resident_positions = ledger
+
+            row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+            keep_slots = row[:committed_len].long()
+            keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+            tail_slots = row[committed_len:allocated_len].long()
+            explicit = getattr(req, "persistent_decode_cache_locs", None) or []
+            if explicit:
+                tail_slots = torch.cat(
+                    [
+                        tail_slots,
+                        torch.stack([slot.reshape(()) for slot in explicit])
+                        .long()
+                        .to(row.device),
+                    ]
+                )
+            tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+            free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+            if free_pages.numel():
+                self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+            row[committed_len:allocated_len] = 0
+            req.persistent_decode_cache_locs = []
+            req.kv_allocated_len = committed_len
+            req.already_computed = committed_len
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                state = getattr(req, "history_kv_reference_state", None)
+                if state is not None and hasattr(state, "layers"):
+                    slots = sum(
+                        int(layer.key.shape[0] * layer.key.shape[1])
+                        for layer in state.layers.values()
+                    )
+                    denominator = sum(
+                        int(layer.key.shape[0])
+                        for layer in state.layers.values()
+                    )
+                    active = (slots + max(1, denominator) - 1) // max(
+                        1, denominator
+                    )
+                    report.update(
+                        active_history_kv_tokens=active,
+                        active_full_raw_tokens=active,
+                        active_history_kv_tokens_source=(
+                            "reference_history_physical_token_equivalent"
+                        ),
+                        history_kv_backend="reference_attention",
+                        reference_attention_backend="torch_sdpa",
+                        history_kv_runtime_status="reference_attention_ok",
+                        reference_history_token_slots=slots,
+                        reference_history_resident_bytes=int(state.resident_bytes),
+                        reference_history_layer_count=len(state.layers),
+                        reference_history_selection_metadata=dict(
+                            state.selection_metadata
+                        ),
+                    )
+                report.update(
+                    persistent_session_continuation_mode="exact_generated_prefix",
+                    persistent_session_computed_logical_horizon=computed_horizon,
+                    persistent_session_uncomputed_output_tokens=(
+                        len(output_ids) - computed_output_tokens
+                    ),
+                    persistent_session_active_output_tokens=len(
+                        req.persistent_session_active_output_ids
+                    ),
+                    persistent_session_discarded_decode_kv_tokens=0,
+                    persistent_session_reclaimed_decode_kv_tokens=(
+                        int(free_pages.numel()) * self.page_size
+                    ),
+                    persistent_session_prompt_physical_tokens=committed_len,
+                    persistent_session_decode_page_free_scope=(
+                        "overallocated_pages_excluding_committed_stream"
+                    ),
+                )
+            return
+
+        # Periodic decode checkpoints may hold raw generated K/V in a
+        # transient reference state for same-generation attention. The next
+        # turn reserializes that output canonically, so transfer only the
+        # state that existed at generation start into the persistent slot.
+        if hasattr(req, "reference_decode_persistent_state"):
+            req.history_kv_reference_state = (
+                req.reference_decode_persistent_state
+            )
+            req.reference_decode_persistent_state = None
         prompt_len = len(req.origin_input_ids)
         committed_len = int(req.kv_committed_len)
         allocated_len = int(req.kv_allocated_len)
@@ -473,10 +707,104 @@ class SessionAwareCache(BasePrefixCache):
         req.already_computed = prompt_len
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
+            state = getattr(req, "history_kv_reference_state", None)
+            if state is not None:
+                slots = sum(
+                    int(layer.key.shape[0] * layer.key.shape[1])
+                    for layer in state.layers.values()
+                )
+                denominator = sum(
+                    int(layer.key.shape[0])
+                    for layer in state.layers.values()
+                )
+                active = (slots + max(1, denominator) - 1) // max(
+                    1, denominator
+                )
+                report.update(
+                    active_history_kv_tokens=active,
+                    active_full_raw_tokens=active,
+                    reference_history_token_slots=slots,
+                    reference_history_resident_bytes=int(state.resident_bytes),
+                    reference_history_layer_count=len(state.layers),
+                    reference_history_selection_metadata=dict(
+                        state.selection_metadata
+                    ),
+                )
+            else:
+                report.update(
+                    active_history_kv_tokens=0,
+                    active_full_raw_tokens=0,
+                    reference_history_token_slots=0,
+                    reference_history_resident_bytes=0,
+                    reference_history_layer_count=0,
+                )
             report["persistent_session_discarded_decode_kv_tokens"] = allocated_len - prompt_len
             report["persistent_session_reclaimed_decode_kv_tokens"] = int(free_pages.numel()) * self.page_size
             report["persistent_session_prompt_physical_tokens"] = prompt_len
             report["persistent_session_decode_page_free_scope"] = "request_owned_pages_excluding_prompt_pages"
+
+    def _trim_persistent_generation_prefix(self, slot: SessionSlot, req: Req) -> None:
+        """Replace only the verified generation scaffold for an evidence append.
+
+        Canonical body positions missing after compression remain missing.
+        Page reclamation uses physical ownership, including partial tail pages.
+        The logical horizon and physical length shrink together, so the RoPE
+        correction for older evicted positions does not change.
+        """
+        hint = req.c2kv_kv_memory_hint or {}
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict) and isinstance(
+            report.get("persistent_session_generation_prefix_splice"), dict
+        ):
+            return
+        rollback_free_pages = torch.empty(0, dtype=torch.long)
+        rollback_generated = 0
+        logical_prefix = int(hint["persistent_session_logical_prefix_tokens"])
+        drop = int(hint["persistent_session_drop_generation_prefix_tokens"])
+        positions = list(slot.history_kv_resident_positions or [])
+        tail = [p for p in positions if p >= logical_prefix]
+        if tail and tail != list(range(logical_prefix, logical_prefix + drop)):
+            raise RuntimeError("PERSISTENT_HISTORY_RECOVERY_GENERATION_PREFIX_LEDGER_MISMATCH")
+        # match_prefix can run repeatedly while a request waits for admission.
+        trim = len(tail)
+        old_len = int(slot.kv_allocated_len)
+        if len(positions) != old_len or int(slot.kv_committed_len) != old_len:
+            raise RuntimeError("PERSISTENT_HISTORY_RECOVERY_SLOT_LENGTH_MISMATCH")
+        keep_len = old_len - trim
+        row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+        keep_slots = row[:keep_len].long()
+        tail_slots = row[keep_len:old_len].long()
+        keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+        tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+        free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+        if free_pages.numel():
+            self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+        row[keep_len:old_len] = 0
+        slot.kv_committed_len = keep_len
+        slot.kv_allocated_len = keep_len
+        slot.history_kv_resident_positions = positions[:keep_len]
+        resident = set(slot.history_kv_resident_positions)
+        slot.history_kv_score_state = {
+            layer: {p: score for p, score in scores.items() if p in resident}
+            for layer, scores in (slot.history_kv_score_state or {}).items()
+        }
+        if isinstance(report, dict):
+            report["persistent_session_generation_prefix_splice"] = {
+                "enabled": True,
+                "session_id": req.session.session_id,
+                "generation_prefix_tokens": drop,
+                "retained_body_physical_tokens": keep_len,
+                "retained_body_resident_page_tokens": (
+                    int(keep_pages.numel()) * self.page_size
+                ),
+                "freed_physical_page_tokens": int(free_pages.numel()) * self.page_size,
+                "rolled_back_generated_tokens": rollback_generated,
+                "rollback_freed_physical_page_tokens": (
+                    int(rollback_free_pages.numel()) * self.page_size
+                ),
+                "full_history_reprefill_performed": False,
+                "scope": "verified_generation_prefix_only",
+            }
 
     def _rollback_failed_persistent_request(self, req: Req) -> None:
         """Drop a failed turn's partial suffix while preserving prior session KV."""
@@ -508,6 +836,12 @@ class SessionAwareCache(BasePrefixCache):
             )
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.history_kv_reference_state = None
+        req.history_kv_runtime_state = None
+        req.reference_decode_persistent_state = None
+        req.reference_decode_baseline_runtime_state = None
+        # SessionSlot is now the sole owner while the request node remains
+        # available for streaming-session protocol bookkeeping.
 
     def _adopt_legacy_persistent_prefix(
         self, slot: SessionSlot, logical_prefix: int

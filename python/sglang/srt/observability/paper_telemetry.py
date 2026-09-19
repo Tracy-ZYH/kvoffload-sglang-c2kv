@@ -136,6 +136,35 @@ class _PaperTelemetry:
         except Exception:
             return None
 
+    def bind_request(self, req: Any) -> None:
+        if not enabled():
+            return
+        with self._lock:
+            if self._active is not None and self._active["server_request_id"] == str(req.rid):
+                self._active["req"] = req
+
+    def _reference_payload(self, owners: Iterable[Any], *, include_snapshots: bool = True) -> Dict[str, int]:
+        states = {}
+        fields = ["history_kv_reference_state"]
+        if include_snapshots:
+            fields += ["reference_decode_baseline_state", "reference_decode_persistent_state"]
+        for owner in owners:
+            for field in fields:
+                state = getattr(owner, field, None)
+                if state is not None:
+                    states[id(state)] = state
+        kv_tensors, position_tensors = [], []
+        for state in states.values():
+            for layer in state.layers.values():
+                kv_tensors.extend((layer.key, layer.value))
+                position_tensors.append(layer.positions)
+        kv_bytes = self._tensor_bytes(kv_tensors)["storage_bytes"]
+        position_bytes = self._tensor_bytes(position_tensors)["storage_bytes"]
+        bpt = self._bytes_per_kv_token
+        return {"bytes": kv_bytes + position_bytes,
+                "tokens": (kv_bytes + bpt - 1) // bpt if bpt else 0,
+                "kv_bytes": kv_bytes, "position_bytes": position_bytes}
+
     def _kv_snapshot(self) -> Dict[str, int]:
         allocator = self._main_allocator
         main_capacity = _as_int(getattr(allocator, "size", 0))
@@ -153,6 +182,10 @@ class _PaperTelemetry:
         resident_tokens = main_tokens + c2kv_tokens
         bpt = self._bytes_per_kv_token
         cache = self._tree_cache_sizes()
+        owners = list(getattr(self._tree_cache, "slots", {}).values())
+        if self._active is not None and self._active.get("req") is not None:
+            owners.append(self._active["req"])
+        reference = self._reference_payload(owners)
         return {
             "bytes_per_kv_token": bpt,
             "main_live_kv_tokens": main_tokens,
@@ -174,8 +207,12 @@ class _PaperTelemetry:
             # identical to the pooled live payload.
             "simultaneous_temporary_kv_tokens": 0,
             "simultaneous_temporary_kv_bytes": 0,
-            "request_resident_kv_tokens": resident_tokens,
-            "request_resident_kv_bytes": resident_tokens * bpt,
+            "reference_history_resident_bytes": reference["bytes"],
+            "reference_history_kv_bytes": reference["kv_bytes"],
+            "reference_history_position_bytes": reference["position_bytes"],
+            "reference_history_token_equivalent": reference["tokens"],
+            "request_resident_kv_tokens": resident_tokens + reference["tokens"],
+            "request_resident_kv_bytes": resident_tokens * bpt + reference["bytes"],
             "main_pool_capacity_tokens": main_capacity,
             "main_pool_capacity_bytes": main_capacity * bpt,
             "c2kv_pool_capacity_tokens": c2kv_capacity,
@@ -338,11 +375,11 @@ class _PaperTelemetry:
                         tensor_bytes["logical_bytes"]
                     )
                     snapshot["kv"]["request_resident_kv_tokens"] = (
-                        snapshot["kv"]["resident_kv_tokens"] + temporary_tokens
+                        snapshot["kv"]["request_resident_kv_tokens"] + temporary_tokens
                     )
                     snapshot["kv"]["request_resident_kv_bytes"] = (
-                        snapshot["kv"]["resident_kv_bytes"]
-                        + tensor_bytes["logical_bytes"]
+                        snapshot["kv"]["request_resident_kv_bytes"]
+                        + tensor_bytes["storage_bytes"]
                     )
                     self._active["temporary_logical_peak_bytes"] = max(
                         self._active["temporary_logical_peak_bytes"],
@@ -393,8 +430,11 @@ class _PaperTelemetry:
                     active["whole_full_kv_tokens"] = _as_int(whole_full)
             snapshot = self._snapshot("generation_start")
             active_tokens = _as_int(getattr(req, "kv_committed_len", 0))
-            snapshot["request_active_kv_tokens"] = active_tokens
-            snapshot["request_active_kv_bytes"] = active_tokens * self._bytes_per_kv_token
+            reference = self._reference_payload([req], include_snapshots=False)
+            snapshot["request_active_kv_tokens"] = active_tokens + reference["tokens"]
+            snapshot["request_active_kv_bytes"] = (
+                active_tokens * self._bytes_per_kv_token + reference["bytes"])
+            snapshot["reference_history_resident_bytes"] = reference["bytes"]
             active["generation_start"] = snapshot
             self._update_peak(snapshot)
             self.set_phase("decode")
@@ -551,7 +591,10 @@ class _PaperTelemetry:
             "cached_evictable_kv_peak_tokens": evictable_peak_tokens,
             "cached_evictable_kv_peak_bytes": evictable_peak_tokens * bpt,
             "generation_active_kv_tokens": whole_active,
-            "generation_active_kv_bytes": whole_active * bpt,
+            "generation_active_kv_bytes": generation.get(
+                "request_active_kv_bytes", whole_active * bpt),
+            "reference_history_resident_bytes": generation.get(
+                "reference_history_resident_bytes", 0),
             "whole_full_kv_tokens": whole_full,
             "whole_active_kv_tokens": whole_active,
             "history_full_kv_tokens": semantics.get("history_full_kv_tokens", 0),
@@ -658,8 +701,8 @@ class _PaperTelemetry:
                 "kind": self._active["kind"],
                 "success": None,
                 "metrics": {
-                    "request_peak_resident_kv_tokens": self._active["peak"]["kv"]["resident_kv_tokens"],
-                    "request_peak_resident_kv_bytes": self._active["peak"]["kv"]["resident_kv_bytes"],
+                    "request_peak_resident_kv_tokens": self._active["peak"]["kv"]["request_resident_kv_tokens"],
+                    "request_peak_resident_kv_bytes": self._active["peak"]["kv"]["request_resident_kv_bytes"],
                 },
             }
 
@@ -669,6 +712,7 @@ _STATE = _PaperTelemetry()
 
 configure = _STATE.configure
 start_request = _STATE.start
+bind_request = _STATE.bind_request
 sample = _STATE.sample
 set_phase = _STATE.set_phase
 mark_generation_start = _STATE.mark_generation_start

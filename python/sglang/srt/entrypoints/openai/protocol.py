@@ -1573,6 +1573,21 @@ class C2KVExtractRequest(BaseModel):
     tools: Optional[List[Dict]] = None
 
 
+class C2KVTokenizeRequest(BaseModel):
+    """Token-count-only form of C2KV document rendering (no model work)."""
+
+    text: str
+    role: Optional[str] = None
+    chat_template_kwargs: Optional[Dict] = None
+    tools: Optional[List[Dict]] = None
+
+
+class C2KVTokenizeResponse(BaseModel):
+    token_count: int = 0
+    success: bool = True
+    error: Optional[str] = None
+
+
 class C2KVNativePackedChunk(BaseModel):
     """One exact encoder input in an event-native packed request."""
 

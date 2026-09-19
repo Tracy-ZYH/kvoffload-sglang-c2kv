@@ -1,5 +1,6 @@
 """CPU-only lifecycle regression tests. Never import a model or contact HTTP."""
 import ast
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -30,8 +31,13 @@ selection = load("history_kv_selection_test", CACHE / "history_kv_selection.py")
 
 def method(path, cls, name, namespace):
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    node = next(n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == cls
-                for n in c.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    node = next(
+        n
+        for c in tree.body
+        if isinstance(c, ast.ClassDef) and c.name == cls
+        for n in c.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     return namespace[name]
 
@@ -365,6 +371,144 @@ def test_serving_delta_prefix_mismatch_fails_without_full_prefill_fallback():
     req.session_params['id'] = 'other'
     with pytest.raises(ValueError, match="ID_MISMATCH"):
         prepare(self, req, [0, 1, 2, 3, 4, 5])
+
+
+def test_recovery_append_replaces_only_server_verified_generation_prefix():
+    path = ROOT / "python/sglang/srt/entrypoints/openai/serving_chat.py"
+    prepare = method(
+        path,
+        "OpenAIServingChat",
+        "_prepare_persistent_history_delta",
+        {"ChatCompletionRequest": object, "List": list,
+         "Optional": __import__('typing').Optional},
+    )
+    previous = [10, 11, 12, 90, 91]
+    self = SimpleNamespace(
+        _is_persistent_history_request=lambda _: True,
+        _persistent_history_sessions={"s": previous},
+        _persistent_history_generation_prefixes={"s": [90, 91]},
+    )
+    req = SimpleNamespace(
+        stream=False,
+        session_params={"id": "s"},
+        c2kv_kv_memory_hint={
+            "persistent_history_session": {
+                "enabled": True,
+                "session_id": "s",
+                "recovery_append": {"enabled": True},
+            },
+            "history_kv_eviction": {
+                "method": "pyramidkv", "history_start": 1,
+                "history_end": 5,
+            },
+        },
+    )
+    full = [10, 11, 12, 70, 71, 92, 93]
+    delta, sid, canonical = prepare(self, req, full)
+    assert sid == "s" and canonical == full
+    assert delta == [70, 71, 92, 93]
+    hint = req.c2kv_kv_memory_hint
+    assert hint["persistent_session_logical_prefix_tokens"] == 3
+    assert hint["persistent_session_drop_generation_prefix_tokens"] == 2
+    assert req.session_params["drop_previous_output"] is True
+
+    # The exception is narrowly scoped: callers cannot nominate the removed
+    # tokens or alter anything before the server-verified generation prefix.
+    with pytest.raises(ValueError, match="RECOVERY_BODY_PREFIX_MISMATCH"):
+        prepare(self, req, [10, 99, 12, 70, 71, 92, 93])
+    self._persistent_history_generation_prefixes.clear()
+    with pytest.raises(ValueError, match="GENERATION_PREFIX_UNAVAILABLE"):
+        prepare(self, req, full)
+
+
+def test_recovery_splice_physically_preserves_lossy_history_and_accounts_pages():
+    trim = method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "_trim_persistent_generation_prefix",
+        {"torch": torch, "SessionSlot": SimpleNamespace, "Req": SimpleNamespace},
+    )
+    row = torch.tensor([[40, 41, 42, 43, 44, 45, 0, 0]])
+    freed = []
+    # Canonical history positions 1 and 3 are already absent. Only the
+    # contiguous generation scaffold [6, 7] may be removed.
+    slot = SimpleNamespace(
+        req_pool_idx=0, kv_committed_len=6, kv_allocated_len=6,
+        history_kv_resident_positions=[0, 2, 4, 5, 6, 7],
+        history_kv_score_state={0: {0: 1.0, 6: 2.0, 7: 3.0}},
+    )
+    req = SimpleNamespace(
+        session=SimpleNamespace(session_id="s"), kv_memory_report={},
+        c2kv_kv_memory_hint={
+            "persistent_session_logical_prefix_tokens": 6,
+            "persistent_session_drop_generation_prefix_tokens": 2,
+        },
+    )
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=row), page_size=2,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda indices: freed.extend(indices.tolist())
+        ),
+    )
+    trim(owner, slot, req)
+    assert slot.history_kv_resident_positions == [0, 2, 4, 5]
+    assert slot.kv_committed_len == slot.kv_allocated_len == 4
+    assert row[0].tolist() == [40, 41, 42, 43, 0, 0, 0, 0]
+    assert freed == [44]
+    assert slot.history_kv_score_state == {0: {0: 1.0}}
+    receipt = req.kv_memory_report["persistent_session_generation_prefix_splice"]
+    assert receipt["scope"] == "verified_generation_prefix_only"
+    assert receipt["retained_body_physical_tokens"] == 4
+    assert receipt["retained_body_resident_page_tokens"] == 4
+    assert receipt["freed_physical_page_tokens"] == 2
+    assert receipt["full_history_reprefill_performed"] is False
+
+
+def test_failed_recovery_splice_closes_session_instead_of_reusing_trimmed_state():
+    path = ROOT / "python/sglang/srt/entrypoints/openai/serving_chat.py"
+
+    class Close:
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+    handle = method(
+        path,
+        "OpenAIServingChat",
+        "_handle_non_streaming_request",
+        {
+            "GenerateReqInput": object, "ChatCompletionRequest": object,
+            "Request": object, "Union": __import__('typing').Union,
+            "ChatCompletionResponse": object, "ErrorResponse": object,
+            "ORJSONResponse": object, "CloseSessionReqInput": Close,
+            "logger": SimpleNamespace(exception=lambda *args, **kwargs: None),
+        },
+    )
+    closed = []
+
+    class Manager:
+        async def close_session(self, obj, raw_request):
+            closed.append(obj.session_id)
+
+        async def generate_request(self, adapted, raw_request):
+            if False:
+                yield None
+            raise ValueError("generation failed after recovery splice")
+
+    released = []
+    self = SimpleNamespace(
+        tokenizer_manager=Manager(),
+        create_error_response=lambda message: message,
+        release_persistent_history_session=lambda sid: released.append(sid),
+    )
+    adapted = SimpleNamespace(
+        c2kv_kv_memory_hint={
+            "persistent_session_drop_generation_prefix_tokens": 2
+        },
+        _persistent_history_session_id="recovery",
+    )
+    result = asyncio.run(handle(self, adapted, SimpleNamespace(), object()))
+    assert "generation failed" in result
+    assert closed == ["recovery"] and released == ["recovery"]
 
 
 @pytest.mark.parametrize(

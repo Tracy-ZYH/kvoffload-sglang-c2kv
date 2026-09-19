@@ -84,6 +84,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     C2KVNativePackedGenerateRequest,
     C2KVRepairExtractRequest,
     C2KVRepairExtractResponse,
+    C2KVTokenizeRequest,
+    C2KVTokenizeResponse,
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
@@ -591,6 +593,11 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
+        "model_dimensions": {
+            key: getattr(model_config.hf_config, key, None)
+            for key in ("hidden_size", "intermediate_size", "num_hidden_layers",
+                        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size")
+        },
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         "c2kv_native_packed": _c2kv_native_capability(),
         # "hf_config": model_config.hf_config.to_dict(),
@@ -1925,35 +1932,13 @@ async def v1_c2kv_extract(
     try:
         tokenizer_manager = _global_state.tokenizer_manager
         tokenizer = tokenizer_manager.tokenizer
-        chat_template_kwargs = request.chat_template_kwargs or {}
-
         if request.role:
-            # Tokenize the same way the HF training code does
-            # (tokenize_for_reuse): apply chat template to get a string,
-            # then tokenize the string.  The two-step approach avoids BPE
-            # boundary differences that arise when subtracting token-ID
-            # prefixes from a jointly-tokenized multi-message sequence.
-            extract_template_kwargs = dict(chat_template_kwargs)
-            if request.tools:
-                # Render tool schemas through the SAME helper and the SAME
-                # --c2kv-tools-dump flag as the chat path, so
-                # original_seq_len measures the system block this server
-                # actually serves. Passing request.tools verbatim here made
-                # extract short by ~4 tokens per tool whenever the flag is
-                # "full" (the default), which is exactly the offset
-                # c2kv/c2kv_serving_semantics.md section 2 fixed.
-                extract_template_kwargs["tools"] = _c2kv_flat_tools(request.tools)
-            text_str = tokenizer.apply_chat_template(
+            input_ids = _c2kv_template_ids(
+                tokenizer,
                 [{"role": request.role, "content": request.text}],
-                tokenize=False,
-                add_generation_prompt=False,
-                **extract_template_kwargs,
+                request.tools,
+                request.chat_template_kwargs,
             )
-            if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
-                text_str = text_str[len(tokenizer.bos_token):]
-            input_ids = tokenizer.encode(text_str, add_special_tokens=False)
-            if not isinstance(input_ids, list):
-                input_ids = list(input_ids)
             if not input_ids:
                 return C2KVExtractResponse(
                     key_hash="",
@@ -2013,6 +1998,35 @@ def _c2kv_template_ids(tokenizer, messages, tools, chat_template_kwargs):
         text_str = text_str[len(tokenizer.bos_token):]
     ids = tokenizer.encode(text_str, add_special_tokens=False)
     return list(ids)
+
+
+@app.post("/v1/c2kv/tokenize")
+async def v1_c2kv_tokenize(
+    request: C2KVTokenizeRequest,
+) -> C2KVTokenizeResponse:
+    """Count the exact extractor input tokens without scheduling model work."""
+    try:
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+        if request.role:
+            input_ids = _c2kv_template_ids(
+                tokenizer,
+                [{"role": request.role, "content": request.text}],
+                request.tools,
+                request.chat_template_kwargs,
+            )
+        else:
+            input_ids = tokenizer.encode(request.text)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
+        if not input_ids:
+            return C2KVTokenizeResponse(
+                token_count=0,
+                success=False,
+                error="The message contributes no tokens after applying the chat template.",
+            )
+        return C2KVTokenizeResponse(token_count=len(input_ids))
+    except Exception as e:
+        return C2KVTokenizeResponse(token_count=0, success=False, error=str(e))
 
 
 def _render_c2kv_repair_span(tokenizer, messages, target_index, tools, chat_template_kwargs):
