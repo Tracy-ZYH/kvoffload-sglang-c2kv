@@ -464,7 +464,8 @@ def test_session_restore_keeps_history_holes_and_appends_tool_rounds(engine, mon
         current.c2kv_position_correction = 13
         current.c2kv_tool_source_spans = [(2, 10)]
         current.history_kv_score_state = state
-    slot = SimpleNamespace(req_pool_idx=0, history_kv_resident_positions=previous,
+    slot = SimpleNamespace(req_pool_idx=0, kv_committed_len=7,
+        c2kv_position_correction=13, history_kv_resident_positions=previous,
         restore_to_req=restore, virtual_node=object(), cache_protected_len=0)
     cache = Cache()
     cache.slots = {"session": slot}
