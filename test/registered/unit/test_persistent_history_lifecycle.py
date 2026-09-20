@@ -1166,3 +1166,48 @@ def test_history_scores_preserve_prefill_window_and_causality(prefix_len):
     logits[torch.arange(6)[None, :] > torch.tensor([2, 3])[:, None]] = -torch.inf
     expected = torch.softmax(logits, dim=-1)[:, 1:4].sum(dim=0)
     torch.testing.assert_close(fb.c2kv_history_kv_selection_scores[0]["layers"][0], expected)
+
+
+def test_tool_h2o_scores_every_prefill_query_across_chunks():
+    collect = method(
+        ROOT / "python/sglang/srt/models/qwen3.py", "Qwen3Attention",
+        "_collect_history_kv_eviction_scores",
+        {"torch": torch, "ForwardBatch": SimpleNamespace},
+    )
+    merge = method(
+        ROOT / "python/sglang/srt/managers/scheduler_output_processor_mixin.py",
+        "SchedulerOutputProcessorMixin", "_accumulate_history_kv_selection_scores",
+        {"Req": SimpleNamespace},
+    )
+    config = {
+        "method": "h2o", "tool_kv_eviction": True,
+        "history_start": 0, "history_end": 5,
+        "selection_query_start": 0, "selection_query_end": 5,
+    }
+    cache = torch.zeros(16, 1, 1)
+    cache[[4, 8, 9], 0, 0] = torch.tensor([0., 1., 2.])
+    attention = SimpleNamespace(
+        num_heads=1, num_kv_heads=1, head_dim=1, scaling=1.,
+        attn=SimpleNamespace(layer_id=0),
+    )
+    req = SimpleNamespace(req_pool_idx=0, rid="tool", history_kv_selection_scores=None)
+    for prefix_len, new_keys in ((0, [0., 1., 2.]), (3, [3., 4.])):
+        fb = SimpleNamespace(
+            c2kv_history_kv_eviction_configs=[config],
+            forward_mode=SimpleNamespace(is_extend_or_draft_extend_or_mixed=lambda: True),
+            extend_seq_lens_cpu=[len(new_keys)], extend_prefix_lens_cpu=[prefix_len],
+            req_pool_indices=torch.tensor([0]),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.tensor([[4, 8, 9]])),
+            token_to_kv_pool=SimpleNamespace(_get_key_buffer=lambda _: cache),
+        )
+        collect(attention, torch.ones(len(new_keys), 1),
+                torch.tensor(new_keys).view(-1, 1),
+                torch.arange(prefix_len, prefix_len + len(new_keys)), fb)
+        merge(None, req, SimpleNamespace(history_kv_selection_scores=fb.c2kv_history_kv_selection_scores))
+    expected = torch.zeros(5)
+    for query_position in range(5):
+        expected[:query_position + 1] += torch.softmax(
+            torch.arange(query_position + 1, dtype=torch.float32), dim=0
+        )
+    torch.testing.assert_close(req.history_kv_selection_scores["headwise_layers"][0][0], expected)
+    assert req.history_kv_selection_scores["query_tokens"] == 5

@@ -145,6 +145,7 @@ class Qwen3Attention(nn.Module):
         pic_param: str = "qkv",
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        tool_gist_uses_served_t0: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -238,26 +239,28 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
-            # Optional second ("tool") gist projection set.  It exists only for
-            # extraction requests that name projection_set="tool"; ordinary
-            # tokens never select it, so the per-token base/gist mask and the
-            # CUDA-graph buffers stay exactly as before.
+            # Tool extraction uses the served T0 projection directly when both
+            # names identify that same checkpoint.  A distinct tool checkpoint
+            # keeps its own FP32 projection set.
             self.c2kv_tool_gist_enabled = False
             if not pic_enabled and getattr(
                 get_global_server_args(), "c2kv_tool_gist_weights", None
             ):
-                self.tool_gist_qkv_proj = QKVParallelLinear(
-                    hidden_size,
-                    self.head_dim,
-                    self.total_num_heads,
-                    self.total_num_kv_heads,
-                    bias=attention_bias,
-                    params_dtype=torch.float32,
-                    quant_config=None,
-                    tp_rank=attn_tp_rank,
-                    tp_size=attn_tp_size,
-                    prefix=add_prefix("tool_gist_qkv_proj", prefix),
-                )
+                if tool_gist_uses_served_t0:
+                    self.tool_gist_qkv_proj = c2kv_proj
+                else:
+                    self.tool_gist_qkv_proj = QKVParallelLinear(
+                        hidden_size,
+                        self.head_dim,
+                        self.total_num_heads,
+                        self.total_num_kv_heads,
+                        bias=attention_bias,
+                        params_dtype=torch.float32,
+                        quant_config=None,
+                        tp_rank=attn_tp_rank,
+                        tp_size=attn_tp_size,
+                        prefix=add_prefix("tool_gist_qkv_proj", prefix),
+                    )
                 self.c2kv_tool_gist_enabled = True
             if not pic_enabled:
                 # PIC/residual_qkv_proj is excluded by construction: there is no
@@ -449,18 +452,25 @@ class Qwen3Attention(nn.Module):
             history_start = int(config.get("history_start") or 0)
             history_end = int(config.get("history_end") or 0)
             available_end = prefix_len + extend_len
-            if not (0 <= history_start < history_end <= available_end):
+            tool_kv_eviction = bool(config.get("tool_kv_eviction"))
+            if not (0 <= history_start < history_end) or (
+                not tool_kv_eviction and history_end > available_end
+            ):
                 continue
 
             method = str(config.get("method") or "").strip().lower()
             if method in {"", "streamingllm"}:
                 continue
             recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
-            if prefix_len > 0 and history_end <= prefix_len:
+            if tool_kv_eviction:
+                q_start = max(0, int(config["selection_query_start"]) - prefix_len)
+                q_end = min(extend_len, int(config["selection_query_end"]) - prefix_len)
+            elif prefix_len > 0 and history_end <= prefix_len:
                 q_end = extend_len
+                q_start = max(0, q_end - recent_window)
             else:
                 q_end = min(extend_len, max(1, history_end - prefix_len))
-            q_start = max(0, q_end - recent_window)
+                q_start = max(0, q_end - recent_window)
             if q_start >= q_end:
                 continue
 
@@ -539,7 +549,6 @@ class Qwen3Attention(nn.Module):
             else:
                 k_score = k_req
 
-            q_window = q_req[:, q_start:q_end, :]
             # The query may follow an already-cached history boundary. Include
             # the resident current prefix and query's own key in the softmax;
             # only slice to history candidates after normalization. Otherwise
@@ -553,43 +562,61 @@ class Qwen3Attention(nn.Module):
                 k_all = torch.cat(
                     [reference_keys.to(k_all.dtype), k_all], dim=1
                 )
-            logits = torch.matmul(
-                q_window.float(),
-                k_all.transpose(-2, -1).float(),
-            ) * self.scaling
-            q_pos = flat_positions[token_start + q_start : token_start + q_end].to(
-                logits.device
-            ).view(1, -1, 1)
-            key_positions = normal_positions[:key_end].to(logits.device)
+            key_positions = normal_positions[:key_end].to(k_all.device)
             if reference_state is not None:
                 reference_positions = reference_state.positions.repeat_interleave(
                     self.num_heads // self.num_kv_heads, dim=0
                 )
                 k_pos = torch.cat(
                     [
-                        reference_positions.to(logits.device),
+                        reference_positions.to(k_all.device),
                         key_positions.view(1, -1).expand(self.num_heads, -1),
                     ],
                     dim=1,
                 ).unsqueeze(1)
             else:
                 k_pos = key_positions.view(1, 1, -1)
-            logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
-            probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
             groups = self.num_heads // self.num_kv_heads
-            headwise_probs = probs.view(
-                self.num_kv_heads, groups, q_end - q_start, -1
-            ).sum(dim=(1, 2))
-            layer_score = headwise_probs[
-                :, reference_len + history_start : reference_len + history_end
-            ].sum(dim=0)
+            headwise_probs = torch.zeros(
+                self.num_kv_heads,
+                reference_len + key_end,
+                dtype=torch.float32,
+                device=k_all.device,
+            )
+            # H2O scores every prompt query.  Bound the temporary attention
+            # matrix instead of materializing [heads, prompt, prompt].
+            for query_left in range(q_start, q_end, 64):
+                query_right = min(q_end, query_left + 64)
+                logits = torch.matmul(
+                    q_req[:, query_left:query_right, :].float(),
+                    k_all.transpose(-2, -1).float(),
+                ) * self.scaling
+                q_pos = flat_positions[
+                    token_start + query_left : token_start + query_right
+                ].to(logits.device).view(1, -1, 1)
+                logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
+                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                headwise_probs += probs.view(
+                    self.num_kv_heads, groups, query_right - query_left, -1
+                ).sum(dim=(1, 2))
+            candidate_end = min(history_end, key_end)
+            selected_probs = headwise_probs[
+                :, reference_len + history_start : reference_len + candidate_end
+            ]
+            if tool_kv_eviction and candidate_end < history_end:
+                padded = torch.zeros(
+                    self.num_kv_heads,
+                    history_end - history_start,
+                    device=selected_probs.device,
+                    dtype=selected_probs.dtype,
+                )
+                padded[:, : candidate_end - history_start] = selected_probs
+                selected_probs = padded
+            layer_score = selected_probs.sum(dim=0)
             headwise_layer_score = torch.cat(
                 [
                     headwise_probs[:, :reference_len],
-                    headwise_probs[
-                        :,
-                        reference_len + history_start : reference_len + history_end,
-                    ],
+                    selected_probs,
                 ],
                 dim=1,
             )
@@ -1542,6 +1569,9 @@ class Qwen3DecoderLayer(nn.Module):
             pic_param=getattr(config, "pic_param", "qkv"),
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            tool_gist_uses_served_t0=_c2kv_tool_gist_uses_served_t0(
+                config, get_global_server_args()
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -1776,6 +1806,25 @@ def _load_c2kv_tool_gist_config(source: str, config, server_args) -> Dict[str, A
     return tool_config
 
 
+def _c2kv_tool_gist_uses_served_t0(config, server_args) -> bool:
+    """Reuse the served FP32 gist Parameters only for one physical T0 source."""
+    source = getattr(server_args, "c2kv_tool_gist_weights", None)
+    served = getattr(server_args, "model_path", None)
+    if (
+        not source
+        or not served
+        or getattr(config, "history_memory_compression_domain", None) != "tool"
+        or getattr(config, "history_memory_variant", None) != "T0"
+    ):
+        return False
+    try:
+        return os.path.samefile(
+            os.path.expanduser(source), os.path.expanduser(served)
+        )
+    except OSError:
+        return False
+
+
 def _c2kv_gist_weight_files(source: str) -> List[str]:
     """Safetensors files of ``source`` that can hold gist tensors."""
     import json
@@ -1880,6 +1929,7 @@ class Qwen3ForCausalLM(nn.Module):
             )
             self.c2kv_tool_gist_identity = None
             self.c2kv_tool_gist_metadata = None
+            self.c2kv_tool_gist_uses_served_t0 = False
             if self.c2kv_tool_gist_source:
                 if self.full_length_pic:
                     raise ValueError(
@@ -1888,9 +1938,19 @@ class Qwen3ForCausalLM(nn.Module):
                 tool_config = _load_c2kv_tool_gist_config(
                     self.c2kv_tool_gist_source, config, _server_args
                 )
-                self.tool_gist_cfg = self.model._init_c2kv_tool_set(
-                    config, tool_config, _server_args
+                self.c2kv_tool_gist_uses_served_t0 = (
+                    _c2kv_tool_gist_uses_served_t0(config, _server_args)
                 )
+                if self.c2kv_tool_gist_uses_served_t0:
+                    self.tool_gist_cfg = self.gist_cfg
+                    self.model.tool_gist_embed_tokens = self.model.gist_embed_tokens
+                    self.model.prepare_tool_gist_input = (
+                        self.model.prepare_gist_input
+                    )
+                else:
+                    self.tool_gist_cfg = self.model._init_c2kv_tool_set(
+                        config, tool_config, _server_args
+                    )
                 self.c2kv_tool_gist_metadata = {
                     key: value
                     for key, value in tool_config.items()
@@ -3009,6 +3069,17 @@ class Qwen3ForCausalLM(nn.Module):
         source = getattr(self, "c2kv_tool_gist_source", None)
         if not source or getattr(self, "tool_gist_cfg", None) is None:
             raise RuntimeError("No C2KV tool gist set is configured on this model")
+        if getattr(self, "c2kv_tool_gist_uses_served_t0", False):
+            self.c2kv_tool_gist_identity = c2kv_tool_gist_identity(source)
+            summary = {
+                "source": source,
+                "identity": self.c2kv_tool_gist_identity,
+                "variant": "T0",
+                "compression_domain": "tool",
+                "parameter_source": "served_checkpoint",
+            }
+            logger.info("C2KV tool gist set aliases served T0: %s", summary)
+            return summary
         params_dict = dict(self.named_parameters())
         stacked = [
             ("tool_gist_qkv_proj", "gist_q_proj", "q"),

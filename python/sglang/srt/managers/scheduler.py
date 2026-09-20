@@ -3141,6 +3141,16 @@ class Scheduler(
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
+        tool_eviction = hint.get("tool_kv_eviction")
+        if isinstance(tool_eviction, dict):
+            if isinstance(history_eviction, dict):
+                raise ValueError("TOOL_KV_WITH_RAW_HISTORY_EVICTION_UNSUPPORTED")
+            from sglang.srt.mem_cache.tool_kv_eviction import plan_tool_kv_eviction
+
+            req.history_kv_eviction = plan_tool_kv_eviction(
+                tool_eviction, len(req.origin_input_ids)
+            )
+            req.tool_kv_eviction = dict(tool_eviction)
         reference_config = hint.get("history_kv_reference_config")
         if isinstance(reference_config, dict):
             req.history_kv_reference_config = dict(reference_config)
@@ -3201,6 +3211,31 @@ class Scheduler(
                 )
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
+        if isinstance(tool_eviction, dict) and req.history_kv_eviction.get("tool_no_op"):
+            config = req.history_kv_eviction
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            layers = int(kv_cache.layer_num)
+            prompt_tokens = len(req.origin_input_ids)
+            report["tool_kv_eviction"] = {
+                "success": True,
+                "method": str(tool_eviction.get("method") or config["method"]),
+                "internal_method": config["method"],
+                "full_prompt_tokens": prompt_tokens,
+                "resident_tokens_by_layer": [prompt_tokens] * layers,
+                "logical_kv_bytes": prompt_tokens * self._bytes_per_kv_token(),
+                "evictable_tokens": len(config["tool_evictable_indices"]),
+                "protected_tokens": prompt_tokens - len(config["tool_evictable_indices"]),
+                "target_resident_tokens_per_layer": tool_eviction.get("target_resident_tokens_per_layer"),
+                "tool_resident_tokens_by_layer": (
+                    [config["tool_protocol_resident_tokens"]] * layers
+                    if config["tool_protocol_resident_tokens"] is not None else None
+                ),
+                "first_token_after_selection": False,
+                "history_untouched": True,
+                "no_op": True,
+                "budget_status": config["tool_budget_status"],
+            }
+            req.history_kv_eviction = None
         paper_telemetry.bind_request(req)
 
     def _build_history_kv_eviction_rounds(self, req: "Req") -> Optional[str]:
@@ -3237,6 +3272,22 @@ class Scheduler(
 
         original_input_ids = list(req.origin_input_ids)
         original_len = len(original_input_ids)
+        if config.get("tool_kv_eviction"):
+            # The final prompt token is computed only after selection.  The
+            # first action token therefore comes from the pruned KV state.
+            if original_len < 2:
+                return "TOOL_KV_PROMPT_TOO_SHORT"
+            req.c2kv_rounds = [
+                C2KVPrefillRound(
+                    original_input_ids[:-1], [], post_history_kv_eviction=True
+                ),
+                C2KVPrefillRound(original_input_ids[-1:], []),
+            ]
+            req.c2kv_round_idx = 0
+            req.c2kv_round_start_len = 0
+            req.c2kv_virtual_input_ids = original_input_ids
+            req.c2kv_pinned_keys = []
+            return None
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         persistent_continuation = bool(config.get("persistent_continuation"))
@@ -3347,6 +3398,119 @@ class Scheduler(
             round_lens=[len(round_info.tokens) for round_info in rounds],
         )
         return None
+
+    def _build_tool_kv_reference_state(self, req: "Req", config: dict, score_info):
+        """Move only selected schema KV into per-layer/head reference tensors."""
+        from sglang.srt.mem_cache.history_kv_reference import (
+            ReferenceHistoryKVState,
+            gather_reference_layer,
+            select_pyramidkv_headwise,
+        )
+        from sglang.srt.mem_cache.history_kv_selection import select_streamingllm_indices
+        from sglang.srt.mem_cache.tool_kv_eviction import (
+            select_tool_h2o,
+            select_tool_snapkv,
+        )
+
+        evictable = [int(index) for index in config["tool_evictable_indices"]]
+        keep = int(config["tool_keep_tokens"])
+        method = str(config["method"])
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        layer_ids = list(range(kv_cache.start_layer, kv_cache.start_layer + kv_cache.layer_num))
+        if method != "streamingllm":
+            if not isinstance(score_info, dict) or list(score_info.get("layer_ids") or []) != layer_ids:
+                raise RuntimeError("TOOL_KV_HEADWISE_SCORES_UNAVAILABLE")
+            full_scores = list(score_info.get("headwise_layers") or [])
+            if len(full_scores) != len(layer_ids):
+                raise RuntimeError("TOOL_KV_HEADWISE_LAYER_COUNT_MISMATCH")
+            scores = []
+            for score in full_scores:
+                if score.ndim != 2 or score.shape[1] != int(config["history_end"]):
+                    raise RuntimeError("TOOL_KV_HEADWISE_SCORE_SHAPE_MISMATCH")
+                scores.append(score[:, evictable].to(torch.float32))
+        else:
+            scores = []
+
+        if method == "pyramidkv":
+            selected_by_layer, metadata = select_pyramidkv_headwise(
+                scores,
+                target_tokens=keep,
+                capacity_history_tokens=len(evictable),
+                recent_window=int(config["history_kv_recent_window"]),
+                kernel_size=int(config["history_kv_kernel_size"]),
+                pooling=str(config["history_kv_pooling"]),
+            )
+        else:
+            selected_by_layer = []
+            for score in (scores if scores else [None] * len(layer_ids)):
+                if method == "h2o":
+                    selected = select_tool_h2o(
+                        full_scores[len(selected_by_layer)], evictable, keep,
+                        float(config["h2o_recent_fraction"]),
+                    )
+                elif method == "snapkv_persistent":
+                    selected = select_tool_snapkv(
+                        full_scores[len(selected_by_layer)], evictable, keep,
+                        int(config["history_kv_kernel_size"]),
+                    )
+                else:
+                    selected = select_streamingllm_indices(
+                        len(evictable),
+                        target_tokens=keep,
+                        sink_tokens=int(config["streamingllm_sink_tokens"]),
+                    ).unsqueeze(0)
+                selected_by_layer.append(selected)
+            metadata = {
+                "algorithm_version": "tool_schema_reference_headwise_v1",
+                "per_layer_budget_tokens": [keep] * len(layer_ids),
+                "per_head_selection": method != "streamingllm",
+            }
+
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        slots = row[evictable].long()
+        layers = {}
+        for layer_id, selected in zip(layer_ids, selected_by_layer):
+            key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+            if key_buffer.ndim not in (3, 4) or value_buffer.ndim != key_buffer.ndim:
+                raise RuntimeError("TOOL_KV_UNSUPPORTED_BUFFER_LAYOUT")
+            normal_key = key_buffer.reshape(-1, *key_buffer.shape[-2:])[slots]
+            normal_value = value_buffer.reshape(-1, *value_buffer.shape[-2:])[slots]
+            if method == "streamingllm":
+                selected = selected.expand(normal_key.shape[1], -1)
+            layers[layer_id] = gather_reference_layer(
+                normal_key,
+                normal_value,
+                evictable,
+                selected.to(normal_key.device),
+            )
+        state = ReferenceHistoryKVState(
+            method=method,
+            layers=layers,
+            selection_metadata={
+                **metadata,
+                "memory_region": "tool_schema_only",
+                "evictable_schema_tokens": len(evictable),
+            },
+            expected_layer_ids=tuple(layer_ids),
+        )
+        state.validate()
+        cap = config.get("tool_max_resident_tokens")
+        protocol_resident = config.get("tool_protocol_resident_tokens")
+        if cap is not None and protocol_resident is not None:
+            baseline = int(protocol_resident) - keep
+            actual_mean = baseline + sum(
+                int(layer.key.shape[1]) for layer in state.layers.values()
+            ) / len(state.layers)
+            if actual_mean > int(cap):
+                raise RuntimeError("TOOL_KV_ACTUAL_TOOL_BUDGET_EXCEEDED")
+        config.update(
+            history_kv_backend="reference_attention",
+            reference_attention_backend="torch_sdpa",
+            runtime_status_override="reference_attention_ok",
+            per_layer_budget_tokens=metadata["per_layer_budget_tokens"],
+            selection_reason="tool_schema_headwise_reference",
+        )
+        return state
 
     def _build_pyramidkv_reference_state(
         self, req: "Req", config: dict, score_info: dict
@@ -3788,6 +3952,8 @@ class Scheduler(
                 "pyramidkv",
             }:
                 expected_query_tokens = config.get("selection_query_tokens")
+                if config.get("tool_kv_eviction") and int(config.get("tool_keep_tokens") or 0) == 0:
+                    expected_query_tokens = None
                 if (
                     expected_query_tokens is not None
                     and selection_query_tokens_observed != int(expected_query_tokens)
@@ -3806,7 +3972,13 @@ class Scheduler(
             if config.get("persistent_session") and getattr(req, "history_kv_resident_positions", None) is None:
                 req.history_kv_resident_positions = list(range(len(req.c2kv_virtual_input_ids)))
             reference_state = None
-            if method in {"pyramid", "pyramidkv"}:
+            if config.get("tool_kv_eviction"):
+                if int(config["tool_keep_tokens"]) > 0:
+                    reference_state = self._build_tool_kv_reference_state(
+                        req, config, score_info
+                    )
+                selected = list(config["protected_history_indices"])
+            elif method in {"pyramid", "pyramidkv"}:
                 if not isinstance(score_info, dict):
                     raise RuntimeError("PYRAMIDKV_SELECTION_SCORES_UNAVAILABLE")
                 reference_state = self._build_pyramidkv_reference_state(
@@ -3939,6 +4111,70 @@ class Scheduler(
             req.history_kv_reference_state = reference_state
         req.history_kv_eviction_result = result.as_dict()
         config = getattr(req, "history_kv_eviction", None)
+        if isinstance(config, dict) and config.get("tool_kv_eviction"):
+            # The request table is physically compacted, but RoPE positions
+            # of every protected history/current token must remain original.
+            req.history_kv_resident_positions = list(result.selected_history_indices or [])
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                normal_tokens_after_replay = int(req.kv_committed_len) + 1
+                kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+                selected_layers = (
+                    list(reference_state.layers.values())
+                    if reference_state is not None else []
+                )
+                by_layer = [
+                    normal_tokens_after_replay + int(layer.key.shape[1])
+                    for layer in selected_layers
+                ] if selected_layers else [normal_tokens_after_replay] * int(kv_cache.layer_num)
+                reference_kv_bytes = sum(
+                    layer.key.numel() * layer.key.element_size()
+                    + layer.value.numel() * layer.value.element_size()
+                    for layer in selected_layers
+                )
+                protocol_resident = config.get("tool_protocol_resident_tokens")
+                tool_by_layer = (
+                    [
+                        int(protocol_resident) - int(config["tool_keep_tokens"])
+                        + int(layer.key.shape[1])
+                        for layer in selected_layers
+                    ]
+                    if selected_layers and protocol_resident is not None
+                    else [int(protocol_resident)] * int(kv_cache.layer_num)
+                    if protocol_resident is not None
+                    else None
+                )
+                report["active_history_kv_tokens"] = 0
+                report["active_tool_kv_tokens"] = int(
+                    math.ceil(
+                        sum(int(layer.key.shape[1]) for layer in selected_layers)
+                        / max(1, len(selected_layers))
+                    )
+                )
+                report["tool_kv_eviction"] = {
+                    "success": True,
+                    "method": str(req.tool_kv_eviction.get("method") or config["method"]),
+                    "internal_method": config["method"],
+                    "full_prompt_tokens": int(config["tool_full_prompt_tokens"]),
+                    "resident_tokens_by_layer": by_layer,
+                    "logical_kv_bytes": (
+                        normal_tokens_after_replay * self._bytes_per_kv_token()
+                        + reference_kv_bytes
+                    ),
+                    "evictable_tokens": len(config["tool_evictable_indices"]),
+                    "protected_tokens": int(config["tool_full_prompt_tokens"])
+                    - len(config["tool_evictable_indices"]),
+                    "target_resident_tokens_per_layer": (
+                        req.tool_kv_eviction.get("target_resident_tokens_per_layer")
+                    ),
+                    "tool_resident_tokens_by_layer": tool_by_layer,
+                    "selection_query_start": int(config["selection_query_start"]),
+                    "selection_query_end": int(config["selection_query_end"]),
+                    "selection_query_tokens_observed": selection_query_tokens_observed,
+                    "first_token_after_selection": False,
+                    "history_untouched": True,
+                    "budget_status": config["tool_budget_status"],
+                }
         if isinstance(config, dict) and config.get("persistent_session"):
             # Keep the session's logical input sequence in the same order as
             # the compacted req_to_token mapping. The correction retained in

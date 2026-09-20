@@ -1004,6 +1004,53 @@ class OpenAIServingChat(OpenAIServingBase):
         # full-history token count used by persistent physical accounting.
         hint["full_equivalent_history_tokens"] = span_tokens
 
+    def _resolve_tool_kv_schema_spans(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("tool_kv_eviction") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return
+        if request.c2kv_tools_in_prompt is not False:
+            raise ValueError("TOOL_KV_REQUIRES_EXPLICIT_PROTOCOL")
+        if self.template_manager.chat_template_name is not None or self.use_dpsk_v32_encoding:
+            raise ValueError("TOOL_KV_REQUIRES_JINJA_TEXT_TEMPLATE")
+        if getattr(request, "continue_final_message", False):
+            raise ValueError("TOOL_KV_CONTINUE_FINAL_MESSAGE_UNSUPPORTED")
+        tokenizer = self.tokenizer_manager.tokenizer
+        messages = self._openai_messages_for_chat_template(list(request.messages))
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=None,
+            **self._chat_template_extra_kwargs(request),
+        )
+        from sglang.srt.mem_cache.tool_kv_spans import resolve_schema_token_spans
+
+        config["resolved_schema_token_spans"] = resolve_schema_token_spans(
+            rendered_prompt=rendered,
+            prompt_ids=prompt_ids,
+            message_contents=[item.get("content") for item in messages],
+            schema_spans=config.get("schema_spans") or [],
+            tokenizer=tokenizer,
+        )
+        protocol_span = config.get("tool_protocol_span")
+        if protocol_span is not None:
+            resolved = resolve_schema_token_spans(
+                rendered_prompt=rendered,
+                prompt_ids=prompt_ids,
+                message_contents=[item.get("content") for item in messages],
+                schema_spans=[{"schema_index": -1, **protocol_span}],
+                tokenizer=tokenizer,
+                boundary_policy="overlap",
+            )
+            config["resolved_tool_protocol_token_span"] = resolved[0]
+        config["server_tokenized"] = True
+        config["full_prompt_tokens"] = len(prompt_ids)
+
     def _resolve_history_kv_event_token_spans(
         self,
         request: "ChatCompletionRequest",
@@ -1247,6 +1294,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
         if not is_multimodal and isinstance(processed_messages.prompt_ids, list):
+            self._resolve_tool_kv_schema_spans(
+                request, processed_messages.prompt_ids
+            )
             self._resolve_history_kv_event_token_spans(
                 request, processed_messages.prompt_ids
             )

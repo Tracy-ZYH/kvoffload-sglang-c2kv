@@ -688,6 +688,25 @@ class SchedulerOutputProcessorMixin:
                         reference_config.get("method") or ""
                     ).lower() in {"agentkv", "commitkv"}:
                         req.reference_decode_baseline_runtime_state = None
+                    report = getattr(req, "kv_memory_report", None)
+                    tool_receipt = (
+                        report.get("tool_kv_eviction")
+                        if isinstance(report, dict) else None
+                    )
+                    if isinstance(tool_receipt, dict) and not tool_receipt.get("no_op"):
+                        state = getattr(req, "history_kv_reference_state", None)
+                        layers = list(state.layers.values()) if state is not None else []
+                        normal = int(req.kv_committed_len)
+                        actual_by_layer = (
+                            [normal + int(layer.key.shape[1]) for layer in layers]
+                            if layers else [normal] * int(self.token_to_kv_pool_allocator.get_kvcache().layer_num)
+                        )
+                        if actual_by_layer != tool_receipt["resident_tokens_by_layer"]:
+                            raise RuntimeError("TOOL_KV_POST_REPLAY_RESIDENT_MISMATCH")
+                        tool_receipt["first_token_after_selection"] = True
+                        snapshot = getattr(req, "history_kv_eviction_report_snapshot", None)
+                        if isinstance(snapshot, dict):
+                            snapshot["tool_kv_eviction"] = dict(tool_receipt)
                     paper_telemetry.mark_generation_start(req)
 
                     # req output_ids are set here
