@@ -352,7 +352,7 @@ def test_legacy_streaming_slot_is_reconciled_before_persistent_continuation():
     assert freed == [108, 109, 110, 111]
 
 
-def test_persistent_history_unfinished_kv_stays_out_of_radix_tree():
+def test_persistent_history_unfinished_kv_stays_out_of_radix_tree_upstream_case():
     cache_unfinished = method(
         CACHE / "session_aware_cache.py",
         "SessionAwareCache",
