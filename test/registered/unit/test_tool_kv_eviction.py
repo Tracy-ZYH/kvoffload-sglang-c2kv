@@ -89,6 +89,68 @@ def test_zero_keep_is_feasible_and_never_selects_history():
     assert plan["protected_history_indices"] == [0, 3, 4]
 
 
+def test_source_only_interface_crossing_token_is_raw_and_in_tool_cap():
+    rendered = "<S>abc|def</S>"
+    tokenizer = _Tokenizer(["<S>", "ab", "c|d", "ef", "</S>"])
+    schema = resolve_schema_token_spans(
+        rendered_prompt=rendered,
+        prompt_ids=list(range(5)),
+        message_contents=["abc|def"],
+        schema_spans=[{"schema_index": 0, "message_index": 0,
+                       "start": 0, "end": 7, "text": "abc|def"}],
+        tokenizer=tokenizer,
+    )
+    interface = resolve_schema_token_spans(
+        rendered_prompt=rendered,
+        prompt_ids=list(range(5)),
+        message_contents=["abc|def"],
+        schema_spans=[{"schema_index": -2, "message_index": 0,
+                       "start": 2, "end": 3, "text": "c"}],
+        tokenizer=tokenizer,
+        boundary_policy="overlap",
+    )
+    assert schema == [{"schema_index": 0, "token_start": 1, "token_end": 4}]
+    assert interface == [{"schema_index": -2, "token_start": 2, "token_end": 3}]
+    config = {
+        "method": "h2o", "full_prompt_tokens": 5,
+        "resolved_schema_token_spans": schema,
+        "resolved_protected_interface_token_spans": interface,
+        "target_evictable_tokens_per_layer": 1,
+        "max_resident_tool_tokens": 2,
+    }
+    plan = plan_tool_kv_eviction(config, 5)
+    assert plan["tool_evictable_indices"] == [1, 3]
+    assert 2 in plan["protected_history_indices"]
+    assert plan["tool_scope_full_tokens"] == 3
+    assert plan["tool_protocol_resident_tokens"] == 2
+    config["max_resident_tool_tokens"] = 1
+    with pytest.raises(ValueError, match="TOOL_KV_TOOL_BUDGET_EXCEEDED"):
+        plan_tool_kv_eviction(config, 5)
+
+
+def test_tool_cap_unions_protocol_and_source_schema_outside_protocol():
+    config = {
+        "method": "streamingllm", "full_prompt_tokens": 10,
+        "resolved_schema_token_spans": [
+            {"schema_index": 0, "token_start": 1, "token_end": 3},
+            {"schema_index": 1, "token_start": 6, "token_end": 8},
+        ],
+        "resolved_tool_protocol_token_span": {"token_start": 0, "token_end": 4},
+        "resolved_protected_interface_token_spans": [
+            {"token_start": 8, "token_end": 9},
+        ],
+        "target_evictable_tokens_per_layer": 1,
+        "max_resident_tool_tokens": 4,
+    }
+    plan = plan_tool_kv_eviction(config, 10)
+    assert plan["tool_evictable_indices"] == [1, 2, 6, 7]
+    assert plan["tool_scope_full_tokens"] == 7
+    assert plan["tool_protocol_resident_tokens"] == 4
+    config["max_resident_tool_tokens"] = 3
+    with pytest.raises(ValueError, match="TOOL_KV_TOOL_BUDGET_EXCEEDED"):
+        plan_tool_kv_eviction(config, 10)
+
+
 def test_headwise_h2o_recent_floor_and_snapkv_original_positions():
     scores = torch.tensor([[0.0, 1.0, 9.0, 8.0, 0.0],
                            [0.0, 9.0, 1.0, 0.0, 8.0]])

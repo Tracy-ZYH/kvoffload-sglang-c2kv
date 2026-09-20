@@ -30,6 +30,25 @@ sys.modules["history_kv_selection_under_test"] = history
 _SPEC.loader.exec_module(history)
 
 
+@pytest.mark.parametrize(
+    "method,seq_len,recent_window,expected",
+    [
+        ("h2o", 12, 3, 0),
+        ("snapkv_persistent", 12, 3, 9),
+        ("snapkv_refresh", 12, 20, 0),
+        ("pyramidkv", 12, 3, 9),
+        ("pyramidkv", 12, 20, 0),
+    ],
+)
+def test_repair_score_query_window(method, seq_len, recent_window, expected):
+    assert history.repair_score_query_start(method, seq_len, recent_window) == expected
+
+
+def test_repair_score_query_window_rejects_invalid_pyramid_window():
+    with pytest.raises(ValueError, match="history_kv_recent_window"):
+        history.repair_score_query_start("pyramidkv", 12, 0)
+
+
 def test_common_index_recovery_restores_only_missing_tokens_without_duplicates():
     merged, accounting = history.deduplicated_recovery_indices(
         [0, 1, 8, 9], [1, 2, 3], seq_len=10)

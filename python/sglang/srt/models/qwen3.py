@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.history_kv_selection import (
     deduplicated_recovery_indices,
     dense_headwise_recovery_indices,
     gather_paired_kv,
+    repair_score_query_start,
     require_rotated_headwise_storage,
     select_h2o_prefill_indices,
     select_snapkv_indices,
@@ -49,6 +50,11 @@ from sglang.srt.mem_cache.history_kv_selection import (
 from sglang.srt.mem_cache.history_kv_reference import (
     ReferenceLayerKV,
     reference_sdpa,
+)
+from sglang.srt.mem_cache.repair_tool_selection import (
+    SPARSE_REPAIR_METHODS,
+    select_sparse_repair_indices,
+    validate_sparse_repair_partition,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.observability import paper_telemetry
@@ -2211,6 +2217,8 @@ class Qwen3ForCausalLM(nn.Module):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        history_kv_selectable_relative_indices: Optional[List[int]] = None,
+        history_kv_mandatory_relative_indices: Optional[List[int]] = None,
         history_kv_recovery_mode: Optional[str] = None,
         history_kv_recovery_relative_indices: Optional[List[int]] = None,
         cacheblend: Optional[Dict[str, Any]] = None,
@@ -2286,12 +2294,23 @@ class Qwen3ForCausalLM(nn.Module):
         raw_key_values = []
         history_scores: List[torch.Tensor] = []
         requested_span_tokens = span_end - span_start
+        sparse_selectable, sparse_mandatory = validate_sparse_repair_partition(
+            requested_span_tokens,
+            history_kv_selectable_relative_indices,
+            history_kv_mandatory_relative_indices,
+            history_kv_target_tokens,
+        )
         history_method = (history_kv_method or "").strip().lower()
         if history_method == "snapkv":
             history_method = "snapkv_persistent"
         if history_method == "pyramid":
             history_method = "pyramidkv"
         require_rotated_headwise_storage(history_method, raw_kv_position_mode)
+        if history_kv_selectable_relative_indices is not None:
+            if history_method not in SPARSE_REPAIR_METHODS:
+                raise ValueError("unsupported sparse repair history method")
+            if history_method != "streamingllm" and raw_kv_position_mode != "rotated":
+                raise ValueError("headwise sparse repair requires rotated raw KV")
         if history_method.startswith("snapkv"):
             snap_recent_window = int(history_kv_recent_window)
             snap_kernel_size = int(history_kv_kernel_size)
@@ -2377,12 +2396,13 @@ class Qwen3ForCausalLM(nn.Module):
             k_attn = k_attn.transpose(1, 2).contiguous()
             v_attn = v_attn.transpose(1, 2).contiguous()
 
-            if history_method in HEADWISE_HISTORY_KV_METHODS:
-                if history_method == "h2o":
-                    score_query_start = 0
-                else:
-                    observation_window = min(snap_recent_window, seq_len)
-                    score_query_start = seq_len - observation_window
+            if history_method in HEADWISE_HISTORY_KV_METHODS or (
+                history_kv_selectable_relative_indices is not None
+                and history_method == "pyramidkv"
+            ):
+                score_query_start = repair_score_query_start(
+                    history_method, seq_len, history_kv_recent_window
+                )
                 layer_score = attention_scores_by_kv_head(
                     q,
                     k_attn,
@@ -2503,6 +2523,10 @@ class Qwen3ForCausalLM(nn.Module):
             else:
                 target_tokens = requested_span_tokens
             target_tokens = max(1, min(requested_span_tokens, target_tokens))
+            if history_kv_selectable_relative_indices is not None and (
+                target_tokens < len(sparse_mandatory)
+            ):
+                raise ValueError("sparse repair target is below mandatory token cost")
 
             def _unique_sorted(indices: Iterable[int]) -> List[int]:
                 return sorted({int(i) for i in indices if 0 <= int(i) < requested_span_tokens})
@@ -2552,7 +2576,54 @@ class Qwen3ForCausalLM(nn.Module):
                     restored = torch.cat([restored, tail.clone()], dim=0)
                 return restored.contiguous()
 
-            if history_method == "kivi":
+            if history_kv_selectable_relative_indices is not None:
+                selected_by_layer, sparse_metadata = select_sparse_repair_indices(
+                    history_method,
+                    history_scores,
+                    sparse_selectable,
+                    sparse_mandatory,
+                    target_tokens,
+                    recent_window=int(history_kv_recent_window),
+                    kernel_size=int(history_kv_kernel_size),
+                    pooling=history_kv_pooling.strip().lower(),
+                    h2o_recent_fraction=float(history_kv_h2o_recent_fraction),
+                    num_layers=len(raw_key_values),
+                    device=device,
+                )
+                if sparse_metadata["per_head_selection"]:
+                    raw_key_values = [
+                        gather_paired_kv(key, value, indices)
+                        for (key, value), indices in zip(
+                            raw_key_values, selected_by_layer
+                        )
+                    ]
+                    length = selected_by_layer[0].shape[1]
+                    repair_positions = full_repair_positions[-length:].contiguous().clone()
+                    repair_positions[-1] = full_repair_positions[-1]
+                    sparse_metadata.update(summarize_headwise_indices(selected_by_layer))
+                    sparse_metadata["repair_positions_semantics"] = "ledger_only_recent_suffix"
+                else:
+                    selected_tensor = selected_by_layer[0][0]
+                    raw_key_values = [
+                        (
+                            key.index_select(0, selected_tensor).contiguous().clone(),
+                            value.index_select(0, selected_tensor).contiguous().clone(),
+                        )
+                        for key, value in raw_key_values
+                    ]
+                    repair_positions = repair_positions.index_select(
+                        0, selected_tensor
+                    ).contiguous()
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "history_boundary_adaptation": True,
+                    "requested_span_tokens": requested_span_tokens,
+                    "selected_token_count": int(repair_positions.numel()),
+                    "selection_reason": "global_schema_candidates_with_mandatory_protocol",
+                    "selection_indices_coordinate_space": "span_relative",
+                    **sparse_metadata,
+                }
+            elif history_method == "kivi":
                 bits = max(1, int(os.environ.get("C2KV_KIVI_BITS", "2")))
                 group_size = max(1, int(os.environ.get("C2KV_KIVI_GROUP_SIZE", "32")))
                 residual_length = max(

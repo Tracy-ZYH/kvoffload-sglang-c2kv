@@ -115,6 +115,36 @@ def test_initial_tools_and_history_share_rounds_and_expanded_positions(engine, m
     assert req.c2kv_persistent_active_input_ids == req.c2kv_virtual_input_ids
 
 
+@pytest.mark.parametrize("method", ["agentkv", "commitkv"])
+def test_reference_state_history_preserves_external_tool_carrier_and_event_coordinates(engine, method):
+    req = request(method=method)
+    req.history_kv_reference_config = {"method": method, "event_token_spans": [
+        {"start": 2, "end": 10, "role": "system", "phase": "others"},
+        {"start": 10, "end": 16, "role": "user", "phase": "others"},
+    ]}
+    assert engine._build_c2kv_prefill_rounds(req) is None
+    assert req.history_kv_eviction["history_start"] == 4
+    assert req.history_kv_eviction["history_end"] == 10
+    assert req.history_kv_eviction["protected_history_indices"] == []
+    assert req.c2kv_tool_source_spans == [(2, 10)]
+    assert req.history_kv_reference_config["event_token_spans"] == [
+        {"start": 2, "end": 10, "role": "system", "phase": "others"},
+        {"start": 10, "end": 16, "role": "user", "phase": "others"},
+    ]
+    assert sum(round_info.post_history_kv_eviction for round_info in req.c2kv_rounds) == 1
+    assert next(round_info.tokens for round_info in req.c2kv_rounds
+                if round_info.post_history_kv_eviction) == [7]
+    assert req.c2kv_rounds[-1].tokens == [8, 9, 10, 11]
+
+
+@pytest.mark.parametrize("method", ["agentkv", "commitkv"])
+def test_reference_state_history_rejects_tool_carrier_inside_history(engine, method):
+    req = request(start=5, end=5, history_start=2, history_end=10, method=method)
+    assert engine._build_c2kv_prefill_rounds(req) == (
+        "C2KV_REFERENCE_TOOL_OVERLAP_UNSUPPORTED: " + method
+    )
+
+
 def test_first_turn_without_eviction_stores_physical_session_view(engine):
     req = request(persistent=True)
     req.history_kv_eviction = None
@@ -164,6 +194,51 @@ def test_append_ledger_preserves_evicted_holes_and_anchors_new_tool():
     assert len(positions) == 14
 
 
+def test_source_horizon_after_tool_protocol_maps_to_rendered_prompt():
+    segment = {"token_start": 2, "token_end": 2, "source_tokens": 8}
+    assert composition.source_boundary(12, [segment]) == 20
+    assert composition.trailing_source_horizon_to_input(21, 12, [segment]) == 13
+    with pytest.raises(ValueError, match="HORIZON_BEFORE_SOURCE_PROMPT"):
+        composition.trailing_source_horizon_to_input(19, 12, [segment])
+
+
+def test_exact_session_commit_maps_computed_source_horizon_to_rendered_prefix(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    Chat = extract_class(
+        "entrypoints/openai/serving_chat.py", "OpenAIServingChat",
+        {"_commit_persistent_history_session"},
+        extra={"GenerateReqInput": object, "Dict": dict, "Any": object},
+    )
+    chat = Chat()
+    chat._persistent_history_tool_segments = {}
+    chat._persistent_history_generation_bases = {}
+    chat._persistent_history_sessions = {}
+    chat._persistent_history_computed_prefixes = {}
+    chat._persistent_history_exact_output = {}
+    chat._persistent_history_generation_prefixes = {}
+    hint = {
+        "history_kv_reference_config": {"method": "agentkv"},
+        "persistent_session_canonical_prompt_tokens": 20,
+        "tool_memory_segments": [
+            {"token_start": 2, "token_end": 2, "source_tokens": 8}
+        ],
+    }
+    request = SimpleNamespace(
+        _persistent_history_session_id="session",
+        _persistent_history_canonical_prompt_ids=list(range(12)),
+        _persistent_history_generation_prefix_ids=None,
+        c2kv_kv_memory_hint=hint,
+    )
+    result = [{"output_ids": [50, 51], "text": "ok", "meta_info": {
+        "kv_memory_report": {"persistent_session_computed_logical_horizon": 21}
+    }}]
+    chat._commit_persistent_history_session(request, result)
+    assert len(chat._persistent_history_sessions["session"]) == 14
+    assert chat._persistent_history_computed_prefixes["session"] == 13
+    assert result[0]["meta_info"]["kv_memory_report"]["persistent_session_computed_input_horizon"] == 13
+    assert result[0]["meta_info"]["persistent_history_session"]["computed_prefix_tokens"] == 13
+
+
 def test_message_boundaries_and_event_metadata_remove_same_carriers():
     hint = {"history_kv_eviction": {"history_start_message_count": 2, "history_message_count": 5},
             "history_kv_event_messages": list("abcdef")}
@@ -205,13 +280,72 @@ def test_session_boundary_at_new_carrier_does_not_count_it_as_cached(monkeypatch
     previous = {"token_start": 2, "token_end": 2, "source_tokens": 8, "key_hash": "a"}
     fresh = {"token_start": 12, "token_end": 12, "source_tokens": 16, "key_hash": "b"}
     chat._persistent_history_tool_segments = {"session": [previous]}
+    chat._persistent_history_tool_source_digests = {"session": "fixed-source"}
     hint = {"tool_memory_segments": [previous, fresh], "persistent_session_logical_prefix_tokens": 12,
             "persistent_session_canonical_prompt_tokens": 20,
+            "joint_tool_memory": {"source_protocol_token_sha256": "fixed-source"},
             "history_kv_eviction": {"persistent_canonical_history_end": 16}}
     chat._translate_tool_session_coordinates(SimpleNamespace(c2kv_kv_memory_hint=hint, session_params={"id": "session"}), 12, 20)
     assert hint["persistent_session_logical_prefix_tokens"] == 20
     assert hint["persistent_session_canonical_prompt_tokens"] == 44
     assert hint["history_kv_eviction"]["persistent_canonical_history_end"] == 40
+
+
+def test_tool_session_refresh_keeps_source_frame_and_maps_event_boundaries(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    Chat = extract_class("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {"_translate_tool_session_coordinates"})
+    chat = Chat()
+    old = {"token_start": 2, "token_end": 2, "source_tokens": 8,
+           "key_hash": "", "repair_key_hashes": ["old"]}
+    new = {**old, "repair_key_hashes": ["new"]}
+    chat._persistent_history_tool_segments = {"session": [old]}
+    chat._persistent_history_tool_source_digests = {"session": "same-prefix"}
+    hint = {"tool_memory_segments": [new],
+            "joint_tool_memory": {"source_protocol_token_sha256": "same-prefix"},
+            "persistent_session_logical_prefix_tokens": 12,
+            "history_kv_event_token_spans": [
+                {"start": 0, "end": 2}, {"start": 2, "end": 5},
+                {"start": 5, "end": 12}],
+            "history_kv_event_generation_suffix_start": 12}
+    req = SimpleNamespace(c2kv_kv_memory_hint=hint, session_params={"id": "session"})
+    chat._translate_tool_session_coordinates(req, 12, 12)
+    assert hint["persistent_tool_refresh"]["previous_segment"] == old
+    assert hint["persistent_tool_refresh"]["new_segment"] == new
+    assert hint["persistent_session_logical_prefix_tokens"] == 20
+    assert hint["history_kv_event_token_spans"] == [
+        {"start": 0, "end": 10}, {"start": 10, "end": 13},
+        {"start": 13, "end": 20}]
+    assert hint["history_kv_event_generation_suffix_start"] == 20
+
+    changed = copy.deepcopy(hint)
+    changed["joint_tool_memory"]["source_protocol_token_sha256"] = "new-source"
+    with pytest.raises(ValueError, match="PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED"):
+        chat._translate_tool_session_coordinates(
+            SimpleNamespace(c2kv_kv_memory_hint=changed, session_params={"id": "session"}),
+            12, 12,
+        )
+
+
+def test_unchanged_t0_gist_carriers_continue_without_raw_refresh_digest(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_composition", composition)
+    Chat = extract_class("entrypoints/openai/serving_chat.py", "OpenAIServingChat", {"_translate_tool_session_coordinates"})
+    chat = Chat()
+    segments = [
+        {"token_start": 2, "token_end": 2, "source_tokens": 8,
+         "key_hash": "gist-a", "repair_key_hashes": []},
+        {"token_start": 4, "token_end": 4, "source_tokens": 6,
+         "key_hash": "gist-b", "repair_key_hashes": []},
+    ]
+    chat._persistent_history_tool_segments = {"session": copy.deepcopy(segments)}
+    chat._persistent_history_tool_source_digests = {}
+    hint = {"tool_memory_segments": copy.deepcopy(segments),
+            "persistent_session_logical_prefix_tokens": 12}
+    chat._translate_tool_session_coordinates(
+        SimpleNamespace(c2kv_kv_memory_hint=hint, session_params={"id": "session"}),
+        12, 12,
+    )
+    assert hint["persistent_session_logical_prefix_tokens"] == 26
+    assert "persistent_tool_refresh" not in hint
 
 
 def test_cached_prefix_injects_tool_without_zero_token_forward(engine):
@@ -307,8 +441,9 @@ def test_tool_ratio_does_not_change_history_handles():
 
 
 def test_session_restore_keeps_history_holes_and_appends_tool_rounds(engine, monkeypatch):
-    Cache = extract_class("mem_cache/session_aware_cache.py", "SessionAwareCache", {"match_prefix"},
-        extra={"MatchPrefixParams": object, "MatchResult": SimpleNamespace, "_is_streaming": lambda req: True})
+    Cache = extract_class("mem_cache/session_aware_cache.py", "SessionAwareCache", {"match_prefix", "_refresh_persistent_tool_prefix", "_is_persistent_history_req"},
+        extra={"MatchPrefixParams": object, "MatchResult": SimpleNamespace, "_is_streaming": lambda req: True,
+               "SessionSlot": object, "Req": object})
     req = request(start=7, end=7, persistent=True)
     # A previous turn keeps seven physical positions from a twenty-token
     # source. The new document is appended immediately after that prefix.
@@ -344,6 +479,159 @@ def test_session_restore_keeps_history_holes_and_appends_tool_rounds(engine, mon
     assert req.c2kv_rounds[-1].tokens == [41, 42]
     assert req.c2kv_rounds[-1].post_history_kv_eviction
     assert len(req.c2kv_virtual_input_ids) == len(req.history_kv_resident_positions)
+
+
+def test_persistent_match_returns_entire_resized_prefix_not_pre_refresh_key():
+    Cache = extract_class(
+        "mem_cache/session_aware_cache.py", "SessionAwareCache",
+        {"match_prefix", "_is_persistent_history_req"},
+        extra={"MatchPrefixParams": object, "MatchResult": SimpleNamespace,
+               "_is_streaming": lambda req: True, "Req": object},
+    )
+    cache = Cache()
+    old_prefix = 1789
+    grown_prefix = 2120
+    old_ids = list(range(old_prefix + 1))
+    req = SimpleNamespace(
+        session=SimpleNamespace(session_id="session"),
+        c2kv_kv_memory_hint={"persistent_history_session": {"enabled": True}},
+        history_kv_eviction=None,
+        origin_input_ids=list(old_ids), kv_memory_report={},
+    )
+    def restore(current):
+        current.req_pool_idx = 0
+        current.kv_committed_len = old_prefix
+        current.c2kv_position_correction = 100
+    slot = SimpleNamespace(
+        req_pool_idx=0, history_kv_resident_positions=[0] * old_prefix,
+        restore_to_req=restore, virtual_node=object(), cache_protected_len=0,
+    )
+    cache.slots = {"session": slot}
+    cache.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(grown_prefix + 32).reshape(1, -1))
+    def refresh(current_slot, current_req):
+        current_req.kv_committed_len = grown_prefix
+        current_req.origin_input_ids = list(range(grown_prefix + 2))
+    cache._refresh_persistent_tool_prefix = refresh
+    result = cache.match_prefix(SimpleNamespace(
+        req=req, key=SimpleNamespace(token_ids=old_ids)))
+    assert len(result.device_indices) == grown_prefix
+    assert req.kv_committed_len == grown_prefix
+
+
+def test_persistent_match_rejects_resident_prefix_beyond_refreshed_active_input():
+    Cache = extract_class(
+        "mem_cache/session_aware_cache.py", "SessionAwareCache",
+        {"match_prefix", "_is_persistent_history_req"},
+        extra={"MatchPrefixParams": object, "MatchResult": SimpleNamespace,
+               "_is_streaming": lambda req: True, "Req": object},
+    )
+    cache = Cache()
+    req = SimpleNamespace(
+        session=SimpleNamespace(session_id="session"),
+        c2kv_kv_memory_hint={"persistent_history_session": {"enabled": True}},
+        history_kv_eviction=None, origin_input_ids=[1, 2], kv_memory_report={},
+    )
+    def restore(current):
+        current.req_pool_idx = 0
+        current.kv_committed_len = 2
+        current.c2kv_position_correction = 0
+    cache.slots = {"session": SimpleNamespace(
+        req_pool_idx=0, history_kv_resident_positions=[0, 1],
+        restore_to_req=restore, virtual_node=object(), cache_protected_len=0)}
+    cache._refresh_persistent_tool_prefix = lambda slot, current: None
+    with pytest.raises(RuntimeError, match="PREFIX_EXCEEDS_ACTIVE_INPUT"):
+        cache.match_prefix(SimpleNamespace(
+            req=req, key=SimpleNamespace(token_ids=[1, 2])))
+
+
+@pytest.mark.parametrize("new_positions", [[2, 4, 5], [4]])
+@pytest.mark.parametrize("page_size", [1, 128])
+def test_persistent_tool_refresh_replaces_only_tool_kv_and_preserves_reference_state(
+    monkeypatch, new_positions, page_size,
+):
+    Cache = extract_class(
+        "mem_cache/session_aware_cache.py", "SessionAwareCache",
+        {"_refresh_persistent_tool_prefix"}, extra={"SessionSlot": object, "Req": object},
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.c2kv_pool",
+                        SimpleNamespace(c2kv_gist_token_ids=lambda key, count: [-50 - i for i in range(count)]))
+    cache = Cache()
+    old_view = {"token_start": 2, "token_end": 2, "source_tokens": 6,
+                "key_hash": "", "repair_key_hashes": ["old"]}
+    new_view = {**old_view, "repair_key_hashes": ["new"]}
+    entry = SimpleNamespace(entry_type="repair", already_rotated=True)
+    new_width = len(new_positions)
+    source_k = torch.arange(new_width * 2, dtype=torch.float32).reshape(new_width, 1, 2) + 300
+    source_v = source_k + 100
+    target_k = torch.zeros(512, 1, 2)
+    target_v = torch.zeros(512, 1, 2)
+    old_start = 10 if page_size == 1 else 128
+    old_row = list(range(old_start, old_start + 7))
+    target_k[old_row] = torch.arange(14, dtype=torch.float32).reshape(7, 1, 2)
+    target_v[old_row] = target_k[old_row] + 100
+    preserved_rows = [old_row[i] for i in (0, 1, 4, 5, 6)]
+    old_non_tool = target_k[preserved_rows].clone()
+    allocated = (torch.arange(30, 30 + new_width) if page_size == 1
+                 else torch.arange(256, 384))
+    frees = []
+    cache.c2kv_pool = SimpleNamespace(
+        pin_many=lambda keys: True, unpin_many=lambda keys: None,
+        get=lambda key: entry, get_position_ids=lambda item: torch.tensor(new_positions),
+        get_layer_kv=lambda item, layer: (source_k, source_v), num_layers=1,
+        start_layer=0,
+    )
+    cache.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([old_row + [0] * 9]))
+    def allocate(count):
+        assert count == len(allocated)
+        return allocated
+    cache.token_to_kv_pool_allocator = SimpleNamespace(
+        page_size=page_size, alloc=allocate,
+        free=lambda loc: frees.append(loc.tolist()),
+        get_kvcache=lambda: SimpleNamespace(
+            get_kv_buffer=lambda layer: (target_k, target_v)),
+    )
+    state = object()
+    slot = SimpleNamespace(
+        req_pool_idx=0, c2kv_tool_view=[old_view],
+        c2kv_tool_source_digest="fixed-prefix", c2kv_tool_source_spans=[(2, 8)],
+        history_kv_resident_positions=[0, 1, 2, 5, 8, 10, 11],
+        history_kv_reference_state=state, history_kv_score_state={0: {8: 9.0}},
+        kv_committed_len=7, kv_allocated_len=7, c2kv_position_correction=5,
+        cache_protected_len=0,
+        c2kv_tool_kv_accounting={"active_tool_kv_tokens": 2,
+                                 "active_tool_repair_tokens": 2},
+    )
+    old_ids = [1, 2, -1, -2, 5, 6, 7, 8]
+    req = SimpleNamespace(
+        c2kv_kv_memory_hint={"persistent_tool_refresh": {
+            "previous_segment": old_view, "new_segment": new_view,
+            "source_protocol_token_sha256": "fixed-prefix"}},
+        kv_memory_report={}, c2kv_pinned_keys=[], origin_input_ids=list(old_ids),
+        origin_input_ids_unpadded=list(old_ids), c2kv_virtual_input_ids=list(old_ids),
+        history_kv_reference_state=state,
+    )
+    cache._refresh_persistent_tool_prefix(slot, req)
+    expected_row = (old_row[:2] + allocated.tolist() + old_row[4:] if page_size == 1
+                    else allocated[:5 + new_width].tolist())
+    assert cache.req_to_token_pool.req_to_token[0, :len(expected_row)].tolist() == expected_row
+    expected_freed = old_row[2:4] if page_size == 1 else old_row
+    assert frees == [expected_freed]
+    new_tool_rows = expected_row[2:2 + new_width]
+    assert torch.equal(target_k[new_tool_rows], source_k)
+    assert torch.equal(target_v[new_tool_rows], source_v)
+    assert torch.equal(target_k[expected_row[:2] + expected_row[2 + new_width:]], old_non_tool)
+    assert slot.history_kv_reference_state is req.history_kv_reference_state is state
+    assert slot.history_kv_resident_positions == [0, 1] + new_positions + [8, 10, 11]
+    assert slot.kv_committed_len + slot.c2kv_position_correction == 12
+    assert req.origin_input_ids == [1, 2] + [-50 - i for i in range(new_width)] + [5, 6, 7, 8]
+    assert req.kv_memory_report["active_tool_repair_tokens"] == new_width
+    assert req.kv_memory_report["persistent_tool_kv_refreshed"] is True
+    cache._refresh_persistent_tool_prefix(slot, req)
+    assert frees == [expected_freed]
+    assert req.kv_memory_report['persistent_tool_kv_refresh_rebuilt_normal_row'] == (page_size > 1)
+    assert req.kv_memory_report['persistent_tool_kv_refresh_allocated_tokens'] == len(allocated)
 
 
 def test_canonical_source_and_history_measurement_views_are_independent():

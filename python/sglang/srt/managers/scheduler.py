@@ -956,6 +956,9 @@ class Scheduler(
                     "projection mask. Base-projection batches remain graph eligible."
                 )
 
+        if isinstance(self.tree_cache, SessionAwareCache):
+            self.tree_cache.c2kv_pool = self.c2kv_pool
+
         paper_telemetry.configure(
             self.token_to_kv_pool_allocator,
             self.c2kv_pool,
@@ -2644,6 +2647,21 @@ class Scheduler(
             return C2KVRepairExtractReqOutput(
                 error="repair span is empty.", success=False
             )
+        from sglang.srt.mem_cache.repair_tool_selection import (
+            SPARSE_REPAIR_METHODS,
+            validate_sparse_repair_partition,
+        )
+
+        selectable = recv_req.history_kv_selectable_relative_indices
+        try:
+            _, mandatory = validate_sparse_repair_partition(
+                token_len,
+                selectable,
+                recv_req.history_kv_mandatory_relative_indices,
+                recv_req.history_kv_target_tokens,
+            )
+        except ValueError as exc:
+            return C2KVRepairExtractReqOutput(error=str(exc), success=False)
         history_kv_method = (recv_req.history_kv_method or "").strip().lower()
         if history_kv_method == "snapkv":
             history_kv_method = "snapkv_persistent"
@@ -2663,6 +2681,31 @@ class Scheduler(
                 history_kv_method=history_kv_method,
                 requested_span_tokens=token_len,
             )
+        if selectable is not None:
+            if history_kv_method not in SPARSE_REPAIR_METHODS:
+                return C2KVRepairExtractReqOutput(
+                    error="sparse repair requires streamingllm, h2o, snapkv, or pyramidkv.",
+                    success=False,
+                )
+            if recv_req.history_kv_recovery_mode:
+                return C2KVRepairExtractReqOutput(
+                    error="sparse repair cannot be combined with history recovery.",
+                    success=False,
+                )
+            if recv_req.history_kv_target_tokens is None and (
+                recv_req.history_kv_retention_ratio is not None
+            ):
+                sparse_target = max(1, min(
+                    token_len,
+                    int(math.ceil(
+                        token_len * float(recv_req.history_kv_retention_ratio)
+                    )),
+                ))
+                if sparse_target < len(mandatory):
+                    return C2KVRepairExtractReqOutput(
+                        error="sparse repair target is below mandatory token cost",
+                        success=False,
+                    )
         raw_kv_position_mode = recv_req.raw_kv_position_mode or "rotated"
         if raw_kv_position_mode not in {"rotated", "pre_rope"}:
             return C2KVRepairExtractReqOutput(
@@ -2737,6 +2780,16 @@ class Scheduler(
                     alloc_check_len
                     + len(recv_req.history_kv_recovery_relative_indices or []),
                 )
+            if selectable is not None:
+                alloc_check_len = max(alloc_check_len, len(mandatory))
+                if history_kv_method == "pyramidkv":
+                    # The lower-layer PyramidKV funnel can retain more than
+                    # the nominal mean. Its maximum is bounded by twice the
+                    # selectable budget, plus every mandatory protocol token.
+                    candidate_target = max(0, alloc_check_len - len(mandatory))
+                    alloc_check_len = len(mandatory) + min(
+                        len(selectable), 2 * candidate_target
+                    )
         if alloc_check_len > min(
             self.c2kv_pool.max_entry_tokens,
             self.c2kv_pool.max_total_tokens,
@@ -2769,6 +2822,10 @@ class Scheduler(
             "history_kv_kernel_size": recv_req.history_kv_kernel_size,
             "history_kv_pooling": recv_req.history_kv_pooling,
             "history_kv_h2o_recent_fraction": recv_req.history_kv_h2o_recent_fraction,
+            "history_kv_selectable_relative_indices": selectable,
+            "history_kv_mandatory_relative_indices": (
+                mandatory if selectable is not None else None
+            ),
             "history_kv_recovery_mode": recv_req.history_kv_recovery_mode,
             "history_kv_recovery_relative_indices": (
                 recv_req.history_kv_recovery_relative_indices),
@@ -2791,6 +2848,12 @@ class Scheduler(
                 success=False,
                 extract_source=extract_source,
                 kv_reuse_method=kv_reuse_method,
+                requested_span_tokens=token_len,
+            )
+        if extract_source == "serving_cache" and selectable is not None:
+            return C2KVRepairExtractReqOutput(
+                error="sparse repair requires model_prefill extraction.",
+                success=False,
                 requested_span_tokens=token_len,
             )
         if extract_source == "serving_cache" and raw_kv_position_mode == "pre_rope":
@@ -2979,6 +3042,9 @@ class Scheduler(
                     history_kv_kernel_size=recv_req.history_kv_kernel_size,
                     history_kv_pooling=recv_req.history_kv_pooling,
                     history_kv_h2o_recent_fraction=recv_req.history_kv_h2o_recent_fraction,
+                    history_kv_selectable_relative_indices=selectable,
+                    history_kv_mandatory_relative_indices=(
+                        recv_req.history_kv_mandatory_relative_indices),
                     history_kv_recovery_mode=recv_req.history_kv_recovery_mode,
                     history_kv_recovery_relative_indices=(
                         recv_req.history_kv_recovery_relative_indices),
@@ -4914,7 +4980,7 @@ class Scheduler(
             method = "snapkv_persistent"
         if method == "pyramid":
             method = "pyramidkv"
-        if method not in {"h2o", "snapkv_persistent", "pyramidkv", "streamingllm"}:
+        if method not in {"h2o", "snapkv_persistent", "pyramidkv", "streamingllm", "agentkv", "commitkv"}:
             raise ValueError("C2KV_TOOL_HISTORY_METHOD_UNSUPPORTED: " + method)
         start, end = int(config.get("history_start") or 0), int(config.get("history_end") or 0)
         if not 0 <= start <= end <= len(req.origin_input_ids):
@@ -4924,6 +4990,11 @@ class Scheduler(
         start, end = physical_boundary(start, descriptors), physical_boundary(end, descriptors)
         config.update(method=method, history_start=start, history_end=end)
         config["protected_history_indices"] = protected_history_indices(positions, start, end, tool_spans)
+        if method in {"agentkv", "commitkv"} and config["protected_history_indices"]:
+            # These methods move the whole history range into per-head state.
+            # A tool carrier inside that range cannot remain an independent,
+            # protected physical tool segment.
+            raise ValueError("C2KV_REFERENCE_TOOL_OVERLAP_UNSUPPORTED: " + method)
         if start == end:
             return
         query_window = selection_query_window(method, 0, end, len(positions), config.get("history_kv_recent_window"))

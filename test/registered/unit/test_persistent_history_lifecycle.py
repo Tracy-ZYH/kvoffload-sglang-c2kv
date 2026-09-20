@@ -713,6 +713,9 @@ def test_session_match_restores_prefix_and_builds_only_new_history_round(monkeyp
     match = method(CACHE/'session_aware_cache.py', 'SessionAwareCache', 'match_prefix', {
         'MatchPrefixParams': object, 'MatchResult': lambda **kw: SimpleNamespace(**kw),
         'torch': torch, '_is_streaming': lambda _: True})
+    is_persistent = method(
+        CACHE/'session_aware_cache.py', 'SessionAwareCache',
+        '_is_persistent_history_req', {'Req': SimpleNamespace})
     row = torch.arange(4, 36).reshape(1, 32)
     prior = [0, 1, 2, 5, 7]
     req = SimpleNamespace(session=SimpleNamespace(session_id='s'), kv_memory_report={},
@@ -728,7 +731,9 @@ def test_session_match_restores_prefix_and_builds_only_new_history_round(monkeyp
         req.req_pool_idx=0; req.kv_committed_len=5; req.c2kv_position_correction=3
     slot=SimpleNamespace(req_pool_idx=0, history_kv_resident_positions=prior,
                          restore_to_req=restore, cache_protected_len=0, virtual_node=object())
-    self=SimpleNamespace(slots={'s':slot}, req_to_token_pool=SimpleNamespace(req_to_token=row))
+    self=SimpleNamespace(slots={'s':slot}, req_to_token_pool=SimpleNamespace(req_to_token=row),
+                         _refresh_persistent_tool_prefix=lambda slot, req: None,
+                         _is_persistent_history_req=is_persistent)
     result=match(self,SimpleNamespace(req=req,key=SimpleNamespace(token_ids=req.origin_input_ids)))
     assert result.device_indices.tolist()==[4,5,6,7,8]
     assert req.history_kv_resident_positions==prior+[8,9,10,11]

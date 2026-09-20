@@ -42,6 +42,16 @@ def source_boundary(position, segments):
     return result
 
 
+def trailing_source_horizon_to_input(source_horizon, input_prompt_len, segments):
+    """Map a source-space horizon after the prompt back to its rendered input."""
+    input_prompt_len = int(input_prompt_len)
+    source_prompt_len = source_boundary(input_prompt_len, segments)
+    source_horizon = int(source_horizon)
+    if source_horizon < source_prompt_len:
+        raise ValueError("C2KV_COMPOSITION_HORIZON_BEFORE_SOURCE_PROMPT")
+    return input_prompt_len + source_horizon - source_prompt_len
+
+
 def physical_boundary(position, segments):
     position = int(position)
     result = position

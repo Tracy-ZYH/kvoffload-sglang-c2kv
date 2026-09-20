@@ -64,6 +64,8 @@ class SessionSlot:
     history_kv_runtime_state: Any = None
     c2kv_tool_source_spans: Any = None
     c2kv_tool_kv_accounting: Any = None
+    c2kv_tool_view: Any = None
+    c2kv_tool_source_digest: Optional[str] = None
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -100,6 +102,13 @@ class SessionSlot:
             req, "history_kv_runtime_state", None
         )
         self.c2kv_tool_source_spans = list(getattr(req, "c2kv_tool_source_spans", []) or [])
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        tool_segments = hint.get("tool_memory_segments") or []
+        if tool_segments:
+            self.c2kv_tool_view = [dict(item) for item in tool_segments]
+            self.c2kv_tool_source_digest = (hint.get("joint_tool_memory") or {}).get(
+                "source_protocol_token_sha256"
+            )
         report = getattr(req, "kv_memory_report", None) or {}
         self.c2kv_tool_kv_accounting = {key: int(report.get(key) or 0) for key in (
             "active_tool_kv_tokens", "active_tool_gist_tokens", "active_tool_repair_tokens", "tool_encoder_source_tokens")}
@@ -179,6 +188,7 @@ class SessionAwareCache(BasePrefixCache):
     def __init__(self, inner: BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
+        self.c2kv_pool = None
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -292,6 +302,7 @@ class SessionAwareCache(BasePrefixCache):
             self._trim_persistent_generation_prefix(slot, req)
 
         slot.restore_to_req(req)
+        self._refresh_persistent_tool_prefix(slot, req)
 
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
@@ -458,10 +469,18 @@ class SessionAwareCache(BasePrefixCache):
                             report[key] = config[key]
                 config.pop("persistent_continuation_pending", None)
 
-        # logprob_start_len is already forced to -1 for streaming sessions
-        # (in Req.init_next_round_input), so the prefix key is not truncated
-        # and we can directly reuse the committed KV length.
-        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        # The caller built params.key before a tool refresh could resize the
+        # session's physical prefix. Its token count is stale after refresh;
+        # the refreshed active request IDs and committed KV row are the pair
+        # that the next prefill round must use together.
+        key_tokens = (
+            req.origin_input_ids
+            if self._is_persistent_history_req(req)
+            else params.key.token_ids
+        )
+        prefix_len = min(req.kv_committed_len, max(len(key_tokens) - 1, 0))
+        if self._is_persistent_history_req(req) and prefix_len != req.kv_committed_len:
+            raise RuntimeError("PERSISTENT_HISTORY_SESSION_PREFIX_EXCEEDS_ACTIVE_INPUT")
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -472,6 +491,182 @@ class SessionAwareCache(BasePrefixCache):
             last_host_node=slot.virtual_node,
             cache_protected_len=slot.cache_protected_len,
         )
+
+    def _refresh_persistent_tool_prefix(self, slot: SessionSlot, req: Req) -> None:
+        """Replace the tool view while preserving existing reference history.
+
+        Paged allocators own whole pages: rebuild the normal row on fresh
+        pages, then release the old row, including its partially used pages.
+        """
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        refresh = hint.get("persistent_tool_refresh")
+        if not refresh:
+            return
+        old_view = refresh["previous_segment"]
+        new_view = refresh["new_segment"]
+        if slot.c2kv_tool_view == [new_view]:
+            return  # match_prefix may retry this same request.
+        if (
+            slot.c2kv_tool_view != [old_view]
+            or slot.c2kv_tool_source_digest
+            != refresh["source_protocol_token_sha256"]
+            or len(slot.c2kv_tool_source_spans or []) != 1
+        ):
+            raise RuntimeError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+        if old_view.get("key_hash") or new_view.get("key_hash"):
+            raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_GIST_UNSUPPORTED")
+        keys = new_view.get("repair_key_hashes") or []
+        if len(keys) != 1 or self.c2kv_pool is None:
+            raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ENTRY_UNSUPPORTED")
+        key = keys[0]
+        if not self.c2kv_pool.pin_many([key]):
+            raise RuntimeError("C2KV_CACHE_MISS: persistent tool refresh entry")
+        try:
+            entry = self.c2kv_pool.get(key)
+            if entry is None or entry.entry_type != "repair" or not entry.already_rotated:
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ENTRY_UNSUPPORTED")
+            source_start, source_end = slot.c2kv_tool_source_spans[0]
+            if (
+                int(new_view["source_tokens"]) != source_end - source_start
+                or int(new_view["token_start"]) != source_start
+            ):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+            new_positions = [
+                int(position)
+                for position in self.c2kv_pool.get_position_ids(entry).tolist()
+            ]
+            if (
+                not new_positions
+                or
+                new_positions != sorted(set(new_positions))
+                or any(not source_start <= position < source_end for position in new_positions)
+            ):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_POSITIONS_INVALID")
+            old_positions = list(slot.history_kv_resident_positions or [])
+            indices = [
+                index for index, position in enumerate(old_positions)
+                if source_start <= position < source_end
+            ]
+            if (
+                not indices
+                or indices != list(range(indices[0], indices[-1] + 1))
+            ):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_LAYOUT_INVALID")
+            old_len = int(slot.kv_committed_len)
+            old_width = len(indices)
+            new_width = len(new_positions)
+            delta = new_width - old_width
+            page_size = int(getattr(self.token_to_kv_pool_allocator, "page_size", 1))
+            rebuild_row = page_size > 1
+            if (
+                int(slot.kv_allocated_len) != old_len
+                or len(old_positions) != old_len
+            ):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_SLOT_LAYOUT_UNSUPPORTED")
+            shared_prefix = int(slot.cache_protected_len)
+            if shared_prefix and (rebuild_row or shared_prefix > indices[0]):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_SHARED_PREFIX_UNSUPPORTED")
+            row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+            if old_len + delta > row.shape[0]:
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_CONTEXT_OVERFLOW")
+            old_loc = row[indices[0] : indices[-1] + 1].long().clone()
+            old_row = row[:old_len].long().clone()
+            if bool((old_row <= 0).any()):
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_SLOT_LAYOUT_UNSUPPORTED")
+            from sglang.srt.mem_cache.c2kv_pool import c2kv_gist_token_ids
+
+            replacement_ids = c2kv_gist_token_ids(key, new_width)
+            active_id_fields = ("origin_input_ids", "origin_input_ids_unpadded", "c2kv_virtual_input_ids")
+            updated_ids = {}
+            for field in active_id_fields:
+                ids = getattr(req, field, None)
+                if ids is None:
+                    continue
+                ids = list(ids)
+                if len(ids) < old_len:
+                    raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_ACTIVE_IDS_INVALID")
+                updated_ids[field] = (
+                    ids[:indices[0]] + replacement_ids + ids[indices[-1] + 1:]
+                )
+            new_len = old_len + delta
+            allocation_size = ((new_len + page_size - 1) // page_size * page_size
+                               if rebuild_row else new_width)
+            allocated = self.token_to_kv_pool_allocator.alloc(allocation_size)
+            if allocated is None:
+                raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_KV_OOM")
+            new_row = (allocated[:new_len] if rebuild_row else torch.cat(
+                (old_row[:indices[0]], allocated, old_row[indices[-1] + 1:])))
+            new_loc = new_row[indices[0]:indices[0] + new_width]
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            try:
+                for layer_idx in range(self.c2kv_pool.num_layers):
+                    layer_id = self.c2kv_pool.start_layer + layer_idx
+                    key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+                    dest_key = key_buffer.reshape(-1, *key_buffer.shape[-2:])
+                    dest_value = value_buffer.reshape(-1, *value_buffer.shape[-2:])
+                    new_key, new_value = self.c2kv_pool.get_layer_kv(entry, layer_idx)
+                    if (
+                        new_key.shape != dest_key[new_loc].shape
+                        or new_value.shape != dest_value[new_loc].shape
+                    ):
+                        raise RuntimeError("PERSISTENT_HISTORY_TOOL_REFRESH_SHAPE_CHANGED")
+                    if rebuild_row:
+                        dest_key[new_row] = torch.cat((
+                            dest_key[old_row[:indices[0]]], new_key,
+                            dest_key[old_row[indices[-1] + 1:]]))
+                        dest_value[new_row] = torch.cat((
+                            dest_value[old_row[:indices[0]]], new_value,
+                            dest_value[old_row[indices[-1] + 1:]]))
+                    else:
+                        dest_key[new_loc] = new_key
+                        dest_value[new_loc] = new_value
+            except Exception:
+                self.token_to_kv_pool_allocator.free(allocated)
+                raise
+            row[:new_len] = new_row
+            if delta < 0:
+                row[old_len + delta:old_len] = 0
+            self.token_to_kv_pool_allocator.free(old_row if rebuild_row else old_loc)
+            old_positions[indices[0] : indices[-1] + 1] = new_positions
+            slot.history_kv_resident_positions = old_positions
+            req.history_kv_resident_positions = list(old_positions)
+            slot.kv_committed_len += delta
+            slot.kv_allocated_len += delta
+            slot.c2kv_position_correction -= delta
+            req.kv_committed_len = slot.kv_committed_len
+            req.kv_allocated_len = slot.kv_allocated_len
+            req.c2kv_position_correction = slot.c2kv_position_correction
+            if slot.cache_protected_len >= indices[-1] + 1:
+                slot.cache_protected_len += delta
+            for field, ids in updated_ids.items():
+                setattr(req, field, ids)
+            resident = set(old_positions)
+            slot.history_kv_score_state = {
+                layer: {position: score for position, score in scores.items() if position in resident}
+                for layer, scores in (slot.history_kv_score_state or {}).items()
+            }
+            req.history_kv_score_state = slot.history_kv_score_state
+            slot.c2kv_tool_view = [dict(new_view)]
+            for name in ("active_tool_kv_tokens", "active_tool_repair_tokens"):
+                if name in (slot.c2kv_tool_kv_accounting or {}):
+                    slot.c2kv_tool_kv_accounting[name] += delta
+            pinned = getattr(req, "c2kv_pinned_keys", None)
+            if pinned is None:
+                req.c2kv_pinned_keys = pinned = []
+            pinned.append(key)
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                report["persistent_tool_kv_refreshed"] = True
+                report["persistent_tool_kv_refresh_tokens"] = len(new_positions)
+                report["persistent_tool_kv_refresh_old_tokens"] = old_width
+                report["persistent_tool_kv_refresh_delta_tokens"] = delta
+                report["persistent_tool_kv_refresh_rebuilt_normal_row"] = rebuild_row
+                report["persistent_tool_kv_refresh_allocated_tokens"] = allocation_size
+                report["persistent_tool_kv_refresh_page_size"] = page_size
+                report.update(slot.c2kv_tool_kv_accounting or {})
+        except Exception:
+            self.c2kv_pool.unpin_many([key])
+            raise
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         if getattr(req, "session_cache_closed_during_request", False):
@@ -529,18 +724,15 @@ class SessionAwareCache(BasePrefixCache):
                     (reference_config or {}).get("method") or ""
                 ).lower()
                 if exact_generated_prefix:
-                    computed_prefix = int(
-                        hint.get("persistent_session_computed_prefix_tokens", 0)
-                        or 0
+                    # The canonical source interval includes omitted tool
+                    # tokens. Count the actual physical prompt before history
+                    # eviction, not the source-space boundary difference.
+                    appended_before_eviction = event.get(
+                        "resident_tokens_after_append"
                     )
-                    canonical_prompt = int(
-                        hint.get(
-                            "persistent_session_canonical_prompt_tokens",
-                            len(req.origin_input_ids),
-                        )
-                        or 0
-                    )
-                    appended_physical_tokens = canonical_prompt - computed_prefix
+                    if appended_before_eviction is None:
+                        appended_before_eviction = protected_prompt_len
+                    appended_physical_tokens = int(appended_before_eviction) - len(prior)
                 else:
                     appended_physical_tokens = int(
                         hint.get("persistent_session_delta_tokens", 0)
