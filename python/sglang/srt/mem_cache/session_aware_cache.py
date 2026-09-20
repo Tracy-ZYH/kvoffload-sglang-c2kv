@@ -350,9 +350,32 @@ class SessionAwareCache(BasePrefixCache):
                     prior_positions, computed_prefix, canonical_len
                 )
             req.history_kv_resident_positions = positions
-            protected, history_end = physical_history_range(positions,
-                int(config.get("persistent_protected_prefix_tokens") or 0),
-                int(config["persistent_canonical_history_end"]))
+            canonical_scopes = config.get("persistent_canonical_scopes")
+            if isinstance(canonical_scopes, list) and canonical_scopes:
+                physical_scopes = []
+                for scope in canonical_scopes:
+                    start, end = physical_history_range(
+                        positions, int(scope["start"]), int(scope["end"]))
+                    mapped = dict(scope)
+                    mapped["canonical_start"] = int(scope["start"])
+                    mapped["canonical_end"] = int(scope["end"])
+                    mapped["start"] = start
+                    mapped["end"] = end
+                    # A persistent scope may already contain fewer resident
+                    # tokens than its nominal budget; never manufacture old
+                    # candidates that were previously evicted.
+                    mapped["target_tokens"] = min(
+                        end - start, int(scope.get("target_tokens") or end - start))
+                    physical_scopes.append(mapped)
+                config["semantic_scopes"] = physical_scopes
+                protected = min(scope["start"] for scope in physical_scopes)
+                history_end = max(scope["end"] for scope in physical_scopes)
+                config["target_tokens"] = sum(
+                    int(scope["target_tokens"]) for scope in physical_scopes)
+            else:
+                protected, history_end = physical_history_range(positions,
+                    int(config.get("persistent_protected_prefix_tokens") or 0),
+                    int(config["persistent_canonical_history_end"]))
             delta_history = int(config.get("persistent_delta_history_tokens") or 0)
             prefix_len = int(req.kv_committed_len)
             origin_len = len(req.c2kv_virtual_input_ids) if descriptors else len(req.origin_input_ids)
@@ -1069,13 +1092,25 @@ class SessionAwareCache(BasePrefixCache):
             "remaining_session_slots": len(self.slots)}))
 
     def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
-        total = 0
+        """KV tokens owned by sessions but not already counted as tree-protected.
+
+        ``cache_protected_len`` is only an ownership overlap when the wrapped
+        cache actually reports protected tokens.  With ``--disable-radix-cache``
+        the chunk cache reports zero protected tokens, so subtracting the saved
+        prefix unconditionally makes valid long-context session KV look leaked.
+        """
+        allocated_total = 0
+        claimed_tree_prefix = 0
         for slot in self.slots.values():
             if slot.is_holding_kv:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
-                total += allocated - slot.cache_protected_len
-        return total
+                allocated_total += allocated
+                claimed_tree_prefix += min(slot.cache_protected_len, allocated)
+        if not claimed_tree_prefix:
+            return allocated_total
+        tree_protected = int(self.inner.protected_size())
+        tree_accounted_session_prefix = min(claimed_tree_prefix, tree_protected)
+        return allocated_total - tree_accounted_session_prefix
 
     def session_held_full_tokens(self) -> int:
         """An alias to align the naming style of SWA"""

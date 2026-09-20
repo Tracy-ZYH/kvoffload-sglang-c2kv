@@ -272,6 +272,11 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    # Return only the configured prompt-last prefill hidden row. This reuses
+    # the native C2KV CaptureHiddenMode.LAST path for ordinary chat.
+    c2kv_prompt_last_hidden_only: bool = False
+    # Internal Racer draft: do not append generated suffix to persistent history.
+    racer_draft: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
 
@@ -646,6 +651,8 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     c2kv_return_full_hidden_states: bool = False
+    c2kv_prompt_last_hidden_only: bool = False
+    racer_draft: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None
@@ -1670,6 +1677,46 @@ class C2KVNativePackedGenerateRequest(BaseModel):
     tool_gist_segments: List[C2KVNativeToolGistSegment] = Field(default_factory=list)
     paper_whole_full_kv_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
     sampling_profile: Literal["greedy-v1", "acebench-agent-v1"] = "greedy-v1"
+    sampling_params: Dict[str, Any]
+    shadow_features: Optional[Dict[str, Any]] = None
+
+
+class C2KVNativePackedChunk(BaseModel):
+    """One exact encoder input in an event-native packed request."""
+
+    chunk_id: str
+    event_id: str
+    part_index: int
+    source_indices: List[int] = Field(default_factory=list)
+    source_token_start: int
+    source_token_end: int
+    token_ids: List[int]
+    handle: Optional[str] = None
+    # Required only when the chunk is selected for injection.
+    source_position_start: Optional[int] = None
+    gist_position_ids: Optional[List[int]] = None
+
+
+class C2KVNativePackedGenerateRequest(BaseModel):
+    """Exact-token event-native generation over cached C2KV gist chunks."""
+
+    schema_: Literal["c2kv-native-packed-generation-v1"] = Field(
+        alias="schema", default="c2kv-native-packed-generation-v1"
+    )
+    rid: Optional[str] = None
+    session_id: Optional[str] = None
+    generation_id: Optional[str] = None
+    packing_version: Literal["history-event-v1"] = "history-event-v1"
+    raw_layout_profile: Literal["event-native-evidence-v1"] = (
+        "event-native-evidence-v1"
+    )
+    encoding_scope: str
+    compression_ratio: int = 8
+    max_extraction_calls: int
+    system_input_ids: List[int] = Field(default_factory=list)
+    workspace_input_ids: List[int]
+    encoder_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
+    compression_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
     sampling_params: Dict[str, Any]
     shadow_features: Optional[Dict[str, Any]] = None
 

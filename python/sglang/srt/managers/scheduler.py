@@ -4084,6 +4084,38 @@ class Scheduler(
                 report["physical_kv_len"] = result.new_physical_kv_slots
                 report["next_rope_position"] = result.next_rope_position_after
                 report["selected_history_indices"] = result.selected_history_indices or []
+                scope_results = config.get("semantic_scope_results")
+                if isinstance(scope_results, list):
+                    report["joint_kv_scopes"] = scope_results
+                    report["joint_protected_kv"] = int(
+                        config.get("joint_protected_kv") or 0)
+                    # Physical eviction runs after the semantic prefix round;
+                    # Current Turn KV is prefetched in the following round and
+                    # is therefore absent from result.current_tokens here.
+                    # Report its canonical full size resolved by serving_chat.
+                    current_full_tokens = int(
+                        config.get("joint_current_full_tokens") or 0)
+                    report["joint_current_full_kv"] = current_full_tokens
+                    report["joint_system_current_full"] = bool(
+                        int(config.get("joint_protected_prefix_kv") or 0) >= 0
+                        and current_full_tokens > 0
+                    )
+                    report["joint_current_prefill_phase"] = (
+                        "post_eviction_uncompressed_round")
+                    for scope in scope_results:
+                        kind = str(scope.get("kind") or "")
+                        if kind in {"tool", "history"}:
+                            report[f"full_{kind}_kv"] = int(
+                                scope.get("full_tokens") or 0)
+                            report[f"active_{kind}_kv"] = int(
+                                scope.get("active_tokens") or 0)
+                    full_joint = sum(int(s.get("full_tokens") or 0)
+                                     for s in scope_results)
+                    active_joint = sum(int(s.get("active_tokens") or 0)
+                                       for s in scope_results)
+                    report["joint_active_kv"] = active_joint
+                    report["joint_compression_ratio"] = (
+                        full_joint / active_joint if active_joint else None)
                 for key in (
                     "selection_reason",
                     "h2o_heavy_kept",
@@ -4462,6 +4494,78 @@ class Scheduler(
             method = "snapkv_persistent"
         if method == "pyramid":
             method = "pyramidkv"
+        semantic_scopes = config.get("semantic_scopes")
+        if isinstance(semantic_scopes, list) and semantic_scopes:
+            broad_start = int(config.get("history_start") or 0)
+            broad_end = int(config.get("history_end") or 0)
+            score_info = getattr(req, "history_kv_selection_scores", None)
+            layers = (score_info or {}).get("layers") if isinstance(score_info, dict) else None
+            if method != "streamingllm" and not layers:
+                return None
+            covered = set()
+            selected_broad = []
+            diagnostics = []
+            original_scores = score_info
+            original_config = req.history_kv_eviction
+            try:
+                for scope in semantic_scopes:
+                    start, end = int(scope["start"]), int(scope["end"])
+                    if not (broad_start <= start < end <= broad_end):
+                        raise ValueError("JOINT_KV_SCOPE_OUTSIDE_COMPACTION_RANGE")
+                    absolute = set(range(start, end))
+                    if covered & absolute:
+                        raise ValueError("JOINT_KV_OVERLAPPING_SEMANTIC_SCOPES")
+                    covered.update(absolute)
+                    budget = min(end - start, max(
+                        1, int(scope.get("target_tokens") or end - start)))
+                    if method == "streamingllm":
+                        chosen = list(range(end - start - budget, end - start))
+                        scope_config = dict(scope)
+                    else:
+                        rel_start = start - broad_start
+                        rel_end = end - broad_start
+                        sliced = [item[rel_start:rel_end] for item in layers]
+                        req.history_kv_selection_scores = {"layers": sliced}
+                        scope_config = {
+                            **{k: v for k, v in config.items()
+                               if k != "semantic_scopes"},
+                            "history_start": start,
+                            "history_end": end,
+                            "target_tokens": budget,
+                        }
+                        req.history_kv_eviction = scope_config
+                        chosen = self._select_history_kv_eviction_indices(
+                            req, scope_config)
+                        if chosen is None:
+                            return None
+                    selected_broad.extend(
+                        start - broad_start + int(index) for index in chosen)
+                    diagnostics.append({
+                        **dict(scope),
+                        "full_tokens": int(scope.get("canonical_end", end))
+                        - int(scope.get("canonical_start", start)),
+                        "resident_candidate_tokens": end - start,
+                        "active_tokens": len(chosen),
+                        "selected_relative_indices": list(chosen),
+                        "selection_reason": scope_config.get("selection_reason"),
+                    })
+            finally:
+                req.history_kv_selection_scores = original_scores
+                req.history_kv_eviction = original_config
+
+            # Tokens between semantic scopes are System/template scaffold and
+            # therefore protected.  Include them in the one broad compaction.
+            protected = [
+                position - broad_start
+                for position in range(broad_start, broad_end)
+                if position not in covered
+            ]
+            selected_broad.extend(protected)
+            config["semantic_scope_results"] = diagnostics
+            config["joint_protected_prefix_kv"] = broad_start
+            config["joint_protected_kv"] = broad_start + len(protected)
+            config["selection_reason"] = "joint_independent_scope_union"
+            return sorted(set(selected_broad))
         if method == "streamingllm":
             return None
 

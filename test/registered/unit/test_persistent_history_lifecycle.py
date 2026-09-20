@@ -177,6 +177,80 @@ def test_ledger_rejects_duplicate_and_resurrected_old_positions():
         ledger.compact_positions([0, 1, 5], 1, 3, [0, 0])
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_persistent_history_unfinished_kv_stays_out_of_radix_tree(chunked):
+    cache_unfinished = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "cache_unfinished_req",
+        {"torch": torch, "Req": SimpleNamespace, "_is_streaming": lambda _: True},
+    )
+    row = torch.arange(400, 800).reshape(1, 400)
+    owner = SimpleNamespace(
+        _is_persistent_history_req=lambda _: True,
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        inner=SimpleNamespace(
+            cache_unfinished_req=lambda *args, **kwargs: pytest.fail(
+                "persistent history pages must not enter radix"
+            )
+        ),
+    )
+    req = SimpleNamespace(
+        req_pool_idx=0, fill_ids=list(range(134)),
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        cache_protected_len=256,
+    )
+    cache_unfinished(owner, req, chunked=chunked)
+    assert req.cache_protected_len == 0
+    assert req.prefix_indices.tolist() == list(range(400, 534))
+
+
+def test_chunked_persistent_history_preserves_session_ownership_after_compaction():
+    stash = method(
+        ROOT / "python/sglang/srt/managers/scheduler.py",
+        "Scheduler", "stash_chunked_request",
+        {"torch": torch, "Req": SimpleNamespace},
+    )
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.arange(400, 1200).reshape(1, 800)
+        ),
+        tree_cache=SimpleNamespace(
+            cache_unfinished_req=lambda *args, **kwargs: pytest.fail(
+                "multi-round stash must not enter tree cache"
+            )
+        ),
+    )
+    req = SimpleNamespace(
+        c2kv_rounds=[object(), object()], c2kv_round_idx=0,
+        req_pool_idx=0, kv_committed_len=256,
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+        already_computed=0, cache_protected_len=999,
+        c2kv_kv_memory_hint={"persistent_history_session": {"enabled": True}},
+    )
+    stash(owner, req)
+    assert req.prefix_indices.tolist() == list(range(400, 656))
+    assert req.already_computed == 256
+    assert req.cache_protected_len == 0
+
+    # Once eviction shrinks the prompt, all remaining pages still belong to
+    # the session. The stale 256-token prefix previously produced -122 here.
+    session_held = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "session_held_tokens",
+        {"ceil_align": lambda value, page: ((value + page - 1) // page) * page},
+    )
+    slot = SimpleNamespace(
+        is_holding_kv=True, kv_allocated_len=134,
+        cache_protected_len=req.cache_protected_len,
+    )
+    assert session_held(SimpleNamespace(slots={"history": slot}, page_size=1)) == 134
+
+    # Ordinary C2KV keeps its existing protected-prefix behavior.
+    req.c2kv_kv_memory_hint = {}
+    stash(owner, req)
+    assert req.cache_protected_len == 256
+
+
 def test_decode_cleanup_never_frees_prompt_pages_at_nonzero_allocator_offset():
     discard = method(CACHE / "session_aware_cache.py", "SessionAwareCache",
                      "_discard_persistent_decode_suffix", {"torch": torch, "Req": SimpleNamespace})
@@ -1076,7 +1150,7 @@ def test_history_scores_include_visible_current_keys_before_selection(
         "_select_history_kv_eviction_indices",
         {"torch": torch, "Optional": Optional},
     )
-    # Head 0 prefers old token 0, but attends mostly to the current content.
+    # Head 0 prefers old token 0, but attends mostly to current content.
     # Head 1 prefers old token 1 and still attends to history. Renormalizing
     # over history alone incorrectly gives head 0 enough weight to win.
     history_keys = torch.tensor([[2., 0.], [0., 1.], [-10., -10.]])
@@ -1211,3 +1285,198 @@ def test_tool_h2o_scores_every_prefill_query_across_chunks():
         )
     torch.testing.assert_close(req.history_kv_selection_scores["headwise_layers"][0][0], expected)
     assert req.history_kv_selection_scores["query_tokens"] == 5
+
+
+def test_tool_definition_span_keeps_qwen_system_and_current_full():
+    path = ROOT / "python/sglang/srt/entrypoints/openai/serving_chat.py"
+    locate = method(
+        path, "OpenAIServingChat", "_c2kv_tool_definition_span",
+        {"ChatCompletionRequest": object, "ChatMessage": object,
+         "List": list, "Dict": dict},
+    )
+    # Both renders remain in the Qwen tools branch. IDs 27/15918 and
+    # 522/15918 model the native <tools and </tools marker stems; the closing
+    # bracket is merged with a newline (397/1339) in the actual tokenizer.
+    # The final prompt has an extra generation suffix (8/9) that the helper's
+    # add_generation_prompt=False rendering does not contain.  Consequently
+    # the provisional reverse diff extends to the prompt end; native marker
+    # pairing must still stop before </tools.
+    real_prompt = [1, 27, 15918, 397, 10, 11, 12, 198,
+                   522, 15918, 1339, 6, 7, 8, 9]
+    sentinel_prompt = [1, 27, 15918, 397, 90, 91, 198,
+                       522, 15918, 1339, 6, 7]
+    def encode_marker(text, **kwargs):
+        return {"<tools": [27, 15918], "</tools": [522, 15918]}[text]
+    self = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(tokenizer=SimpleNamespace(
+            encode=encode_marker)),
+        _c2kv_chat_template_input_ids=(
+            lambda request, messages, tools: sentinel_prompt
+        )
+    )
+    assert locate(self, object(), [object()], [{"real": "tool"}], real_prompt) == (3, 8)
+
+
+def test_joint_native_tool_and_history_scopes_are_disjoint():
+    path = ROOT / "python/sglang/srt/entrypoints/openai/serving_chat.py"
+    resolve = method(
+        path, "OpenAIServingChat", "_resolve_history_kv_eviction_range",
+        {"ChatCompletionRequest": object, "List": list, "math": math},
+    )
+    messages = [object(), object(), object()]
+    self = SimpleNamespace(
+        _chat_template_tools=lambda request: [{"function": {"name": "x"}}],
+        _c2kv_tool_definition_span=(
+            lambda request, rendered_messages, tools, prompt: (1, 3)
+        ),
+        _c2kv_chat_template_input_ids=(
+            lambda request, rendered_messages, tools: (
+                [0, 10, 11, 20] if len(rendered_messages) == 1
+                else [0, 10, 11, 20, 30, 31]
+            )
+        ),
+        _find_token_subsequence=lambda haystack, needle: next(
+            (i for i in range(len(haystack) - len(needle) + 1)
+             if haystack[i:i + len(needle)] == needle), -1),
+    )
+    req = SimpleNamespace(
+        messages=messages,
+        c2kv_kv_memory_hint={"history_kv_eviction": {
+            "compress_tools": True,
+            "compress_completed_history": True,
+            "tool_retention_ratio": 0.25,
+            "history_start_message_count": 1,
+            "history_message_count": 2,
+            "retention_ratio": 0.25,
+        }},
+    )
+    prompt = [0, 10, 11, 20, 30, 31, 40, 41]
+    resolve(self, req, prompt)
+    scopes = req.c2kv_kv_memory_hint["history_kv_eviction"]["semantic_scopes"]
+    assert [(s["kind"], s["start"], s["end"]) for s in scopes] == [
+        ("tool", 1, 3), ("history", 4, 6)
+    ]
+    assert req.c2kv_kv_memory_hint["history_kv_eviction"]["history_end"] == 6
+    assert req.c2kv_kv_memory_hint["history_kv_eviction"][
+        "joint_current_full_tokens"] == 2
+
+
+def test_session_held_tokens_does_not_drop_prefix_when_radix_is_disabled():
+    held = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "session_held_tokens", {"ceil_align": lambda n, page: n},
+    )
+    slots = {
+        "long": SimpleNamespace(
+            is_holding_kv=True, kv_allocated_len=35_263,
+            cache_protected_len=28_168),
+    }
+    no_radix = SimpleNamespace(
+        slots=slots, page_size=1,
+        inner=SimpleNamespace(protected_size=lambda: 0),
+    )
+    assert held(no_radix) == 35_263
+
+    radix = SimpleNamespace(
+        slots=slots, page_size=1,
+        inner=SimpleNamespace(protected_size=lambda: 28_168),
+    )
+    assert held(radix) == 7_095
+
+
+def test_failed_persistent_eviction_rolls_back_without_finished_length_check():
+    path = CACHE / "session_aware_cache.py"
+    rollback = method(
+        path, "SessionAwareCache", "_rollback_failed_persistent_request",
+        {"Req": object, "torch": torch},
+    )
+    freed = []
+    # page_size=2: the old prefix owns pages 2/3; failed-turn pages 4/5 can be
+    # released without touching the valid session prefix.
+    row = torch.tensor([[4, 5, 6, 7, 8, 9, 10, 11]])
+    slot = SimpleNamespace(req_pool_idx=0, kv_committed_len=4)
+    self = SimpleNamespace(
+        slots={"s": slot}, page_size=2,
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda pages: freed.extend(pages.tolist())),
+    )
+    req = SimpleNamespace(
+        session=SimpleNamespace(session_id="s"), kv_allocated_len=8,
+        req_pool_idx=0, mamba_pool_idx=None, kv_memory_report={},
+    )
+    rollback(self, req)
+    assert freed == [8, 10]
+    assert row[0, 4:].tolist() == [0, 0, 0, 0]
+    assert req.req_pool_idx is None
+    assert self.slots["s"] is slot
+    assert req.kv_memory_report["persistent_session_failed_turn_rolled_back"]
+
+
+@pytest.mark.parametrize("method_name", ["streamingllm", "h2o", "snapkv_persistent", "pyramidkv"])
+def test_joint_scopes_select_independently_and_keep_protected_gap(method_name):
+    select = method(
+        ROOT/'python/sglang/srt/managers/scheduler.py', 'Scheduler',
+        '_select_history_kv_eviction_indices', {'torch':torch,'Optional':Optional})
+    owner = SimpleNamespace()
+    owner._select_history_kv_eviction_indices = types.MethodType(select, owner)
+    config = {
+        'method': method_name, 'history_start': 0, 'history_end': 10,
+        'target_tokens': 3, 'history_kv_recent_window': 2,
+        'history_kv_kernel_size': 1, 'history_kv_h2o_recent_fraction': .5,
+        'semantic_scopes': [
+            {'kind':'tool','start':0,'end':4,'target_tokens':1},
+            {'kind':'history','start':6,'end':10,'target_tokens':2},
+        ],
+    }
+    req = SimpleNamespace(
+        history_kv_eviction=config,
+        history_kv_selection_scores={'layers':[torch.arange(10, dtype=torch.float32)]},
+        history_kv_resident_positions=list(range(10)),
+        history_kv_score_state={},
+    )
+    selected = select(owner, req, config)
+    # Tool and History receive their own budgets. Positions 4/5 are the
+    # protected System/template gap and survive without entering selection.
+    assert selected == [3, 4, 5, 8, 9]
+    assert [row['active_tokens'] for row in config['semantic_scope_results']] == [1, 2]
+    assert config['joint_protected_kv'] == 2
+    assert config['selection_reason'] == 'joint_independent_scope_union'
+
+
+def test_joint_h2o_preserves_cumulative_state_for_every_scope():
+    select = method(
+        ROOT/'python/sglang/srt/managers/scheduler.py', 'Scheduler',
+        '_select_history_kv_eviction_indices',
+        {'torch': torch, 'Optional': Optional},
+    )
+    owner = SimpleNamespace()
+    owner._select_history_kv_eviction_indices = types.MethodType(select, owner)
+    config = {
+        'method': 'h2o', 'persistent_session': True,
+        'history_start': 0, 'history_end': 10, 'target_tokens': 3,
+        'history_kv_recent_window': 2,
+        'history_kv_h2o_recent_fraction': .5,
+        'semantic_scopes': [
+            {'kind': 'tool', 'start': 0, 'end': 4, 'target_tokens': 1},
+            {'kind': 'history', 'start': 6, 'end': 10, 'target_tokens': 2},
+        ],
+    }
+    req = SimpleNamespace(
+        history_kv_eviction=config,
+        history_kv_selection_scores={
+            'layers': [torch.arange(10, dtype=torch.float32)]
+        },
+        history_kv_resident_positions=list(range(10)),
+        history_kv_score_state={},
+    )
+    first = select(owner, req, config)
+    assert first == [3, 4, 5, 8, 9]
+    assert set(req.history_kv_score_state[0]) == {0, 1, 2, 3, 6, 7, 8, 9}
+
+    # A later zero-score observation must still see both scopes' accumulated
+    # heavy hitters; processing the history scope must not erase tool state.
+    req.history_kv_selection_scores = {'layers': [torch.zeros(10)]}
+    second = select(owner, req, config)
+    assert second == first
+    assert set(req.history_kv_score_state[0]) == {0, 1, 2, 3, 6, 7, 8, 9}
