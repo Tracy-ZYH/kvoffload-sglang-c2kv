@@ -543,45 +543,32 @@ class Qwen3Attention(nn.Module):
             if reference_state is not None:
                 reference_state.validate()
                 reference_len = int(reference_state.key.shape[1])
-            if self.num_heads != self.num_kv_heads:
-                groups = self.num_heads // self.num_kv_heads
-                k_score = k_req.repeat_interleave(groups, dim=0)
-            else:
-                k_score = k_req
+            groups = self.num_heads // self.num_kv_heads
 
             # The query may follow an already-cached history boundary. Include
             # the resident current prefix and query's own key in the softmax;
             # only slice to history candidates after normalization. Otherwise
             # heads attending to current content get overstated history scores.
             key_end = prefix_len + q_end
-            k_all = k_score[:, :key_end, :]
+            total_key_len = reference_len + key_end
+            key_positions = normal_positions[:key_end].to(k_req.device)
             if reference_state is not None:
-                reference_keys = reference_state.key.repeat_interleave(
-                    self.num_heads // self.num_kv_heads, dim=0
-                )
-                k_all = torch.cat(
-                    [reference_keys.to(k_all.dtype), k_all], dim=1
-                )
-            key_positions = normal_positions[:key_end].to(k_all.device)
-            if reference_state is not None:
-                reference_positions = reference_state.positions.repeat_interleave(
-                    self.num_heads // self.num_kv_heads, dim=0
-                )
                 k_pos = torch.cat(
                     [
-                        reference_positions.to(k_all.device),
-                        key_positions.view(1, -1).expand(self.num_heads, -1),
+                        reference_state.positions.to(k_req.device),
+                        key_positions.view(1, -1).expand(self.num_kv_heads, -1),
                     ],
                     dim=1,
-                ).unsqueeze(1)
+                ).view(self.num_kv_heads, 1, 1, -1)
             else:
-                k_pos = key_positions.view(1, 1, -1)
-            groups = self.num_heads // self.num_kv_heads
+                k_pos = key_positions.view(1, 1, 1, -1).expand(
+                    self.num_kv_heads, -1, -1, -1
+                )
             headwise_probs = torch.zeros(
                 self.num_kv_heads,
-                reference_len + key_end,
+                total_key_len,
                 dtype=torch.float32,
-                device=k_all.device,
+                device=k_req.device,
             )
             # A fixed query count still allocates hundreds of MiB of logits
             # once AppWorld's persistent history grows past 100k keys. Bound
@@ -592,24 +579,46 @@ class Qwen3Attention(nn.Module):
                 min(
                     64,
                     (16 * 1024 * 1024)
-                    // max(1, self.num_heads * k_all.shape[1] * 4),
+                    // max(1, self.num_heads * total_key_len * 4),
                 ),
             )
-            score_key = k_all.transpose(-2, -1).float()
-            for query_left in range(q_start, q_end, score_query_chunk):
-                query_right = min(q_end, query_left + score_query_chunk)
-                logits = torch.matmul(
-                    q_req[:, query_left:query_right, :].float(),
-                    score_key,
-                ) * self.scaling
-                q_pos = flat_positions[
-                    token_start + query_left : token_start + query_right
-                ].to(logits.device).view(1, -1, 1)
-                logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
-                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-                headwise_probs += probs.view(
-                    self.num_kv_heads, groups, query_right - query_left, -1
-                ).sum(dim=(1, 2))
+            # Score one KV head at a time. Keep reference/current keys separate
+            # until their small logits are joined for the full-key softmax.
+            # This avoids a large grouped key copy and full-history float cast.
+            grouped_query = q_req.reshape(
+                self.num_kv_heads, groups, extend_len, self.head_dim
+            )
+            for kv_head in range(self.num_kv_heads):
+                current_key = k_req[kv_head, :key_end, :].transpose(0, 1).float()
+                reference_key = (
+                    reference_state.key[kv_head]
+                    .to(k_req.dtype)
+                    .transpose(0, 1)
+                    .float()
+                    if reference_state is not None
+                    else None
+                )
+                for query_left in range(q_start, q_end, score_query_chunk):
+                    query_right = min(q_end, query_left + score_query_chunk)
+                    query_count = query_right - query_left
+                    score_query = grouped_query[
+                        kv_head, :, query_left:query_right, :
+                    ].reshape(1, groups * query_count, self.head_dim).float()
+                    logits = torch.bmm(score_query, current_key.unsqueeze(0))
+                    if reference_key is not None:
+                        reference_logits = torch.bmm(
+                            score_query, reference_key.unsqueeze(0)
+                        )
+                        logits = torch.cat([reference_logits, logits], dim=-1)
+                    logits = logits.view(groups, query_count, -1) * self.scaling
+                    q_pos = flat_positions[
+                        token_start + query_left : token_start + query_right
+                    ].to(logits.device).view(1, -1, 1)
+                    logits = logits.masked_fill(
+                        k_pos[kv_head] > q_pos, float("-inf")
+                    )
+                    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                    headwise_probs[kv_head] += probs.sum(dim=(0, 1))
             candidate_end = min(history_end, key_end)
             selected_probs = headwise_probs[
                 :, reference_len + history_start : reference_len + candidate_end

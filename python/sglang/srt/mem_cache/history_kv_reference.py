@@ -582,11 +582,13 @@ def reference_sdpa(
             # PyTorch's grouped-query SDPA handles Hq/Hkv on CPU and CUDA.
             # Keep other backends on their established expanded-head layout.
             attention_key, attention_value = key, value
-            enable_gqa = groups != 1
+            sdpa_kwargs = {"enable_gqa": groups != 1}
         else:
             attention_key = key.repeat_interleave(groups, dim=0)
             attention_value = value.repeat_interleave(groups, dim=0)
-            enable_gqa = False
+            # Older torch_npu SDPA wrappers do not necessarily accept this
+            # optional PyTorch keyword, even when its value is False.
+            sdpa_kwargs = {}
         output = F.scaled_dot_product_attention(
             query.transpose(0, 1).unsqueeze(0),
             attention_key.unsqueeze(0),
@@ -594,7 +596,7 @@ def reference_sdpa(
             attn_mask=None,
             dropout_p=0.0,
             scale=float(scale),
-            enable_gqa=enable_gqa,
+            **sdpa_kwargs,
         )
         return output.squeeze(0).transpose(0, 1).contiguous()
     key_pos = torch.cat([history.positions, normal_pos], dim=1)

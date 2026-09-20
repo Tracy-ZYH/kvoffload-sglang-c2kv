@@ -127,14 +127,15 @@ def test_long_history_score_logits_are_bounded_without_changing_scores(monkeypat
     )
     history_len = 100_000
     query_len = 20
-    matmul_query_lens = []
-    original_matmul = torch.matmul
+    bmm_query_lens = []
+    original_bmm = torch.bmm
 
     def checked(left, right):
-        matmul_query_lens.append(left.shape[1])
-        return original_matmul(left, right)
+        assert right.shape[0] == 1  # KV is not copied across four query heads.
+        bmm_query_lens.append(left.shape[1] // 4)
+        return original_bmm(left, right)
 
-    monkeypatch.setattr(torch, "matmul", checked)
+    monkeypatch.setattr(torch, "bmm", checked)
     config = {
         "method": "pyramidkv", "history_start": 0,
         "history_end": history_len, "history_kv_recent_window": 64,
@@ -164,8 +165,45 @@ def test_long_history_score_logits_are_bounded_without_changing_scores(monkeypat
     )
     scores = fb.c2kv_history_kv_selection_scores[0]["layers"][0]
     expected = 4 * sum(1 / (history_len + i + 1) for i in range(query_len))
-    assert matmul_query_lens == [10, 10]
+    assert bmm_query_lens == [10, 10]
     torch.testing.assert_close(scores[[0, -1]], torch.tensor([expected, expected]))
+
+
+def test_grouped_score_respects_each_kv_heads_reference_positions():
+    collect = method(
+        ROOT / "python/sglang/srt/models/qwen3.py",
+        "Qwen3Attention",
+        "_collect_history_kv_eviction_scores",
+        {"torch": torch, "ForwardBatch": SimpleNamespace},
+    )
+    layer = SimpleNamespace(
+        key=torch.zeros(2, 2, 1),
+        positions=torch.tensor([[0, 2], [1, 5]]),
+        validate=lambda: None,
+    )
+    fb = SimpleNamespace(
+        c2kv_history_kv_eviction_configs=[{
+            "method": "pyramidkv", "history_start": 0, "history_end": 1,
+        }],
+        history_kv_reference_states=[SimpleNamespace(layer=lambda _: layer)],
+        forward_mode=SimpleNamespace(is_extend_or_draft_extend_or_mixed=lambda: True),
+        extend_seq_lens_cpu=[2], extend_prefix_lens_cpu=[0],
+        req_pool_indices=torch.tensor([0]),
+    )
+    attention = SimpleNamespace(
+        num_heads=4, num_kv_heads=2, head_dim=1, scaling=1.,
+        attn=SimpleNamespace(layer_id=0),
+    )
+    collect(
+        attention, torch.zeros(2, 4), torch.zeros(2, 2),
+        torch.tensor([3, 4]), fb,
+    )
+    scores = fb.c2kv_history_kv_selection_scores[0]
+    torch.testing.assert_close(
+        scores["headwise_layers"][0],
+        torch.tensor([[2 / 3, 2 / 3, 2 / 3], [1., 0., 1.]]),
+    )
+    torch.testing.assert_close(scores["layers"][0], torch.tensor([5 / 3]))
 
 
 def test_overlap_processes_final_selection_round_before_decode_scheduling():
