@@ -726,7 +726,9 @@ def test_session_match_restores_prefix_and_builds_only_new_history_round(monkeyp
         origin_input_ids=prior+[8,9,10,11], c2kv_tool_source_spans=[])
     def restore(req):
         req.req_pool_idx=0; req.kv_committed_len=5; req.c2kv_position_correction=3
-    slot=SimpleNamespace(req_pool_idx=0, history_kv_resident_positions=prior,
+    slot=SimpleNamespace(req_pool_idx=0, kv_committed_len=5,
+                         c2kv_position_correction=3,
+                         history_kv_resident_positions=prior,
                          restore_to_req=restore, cache_protected_len=0, virtual_node=object())
     self=SimpleNamespace(slots={'s':slot}, req_to_token_pool=SimpleNamespace(req_to_token=row))
     result=match(self,SimpleNamespace(req=req,key=SimpleNamespace(token_ids=req.origin_input_ids)))

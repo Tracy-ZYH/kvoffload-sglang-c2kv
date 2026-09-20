@@ -6,9 +6,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[3]
 MANAGERS = ROOT / "python/sglang/srt/managers"
+CACHE = ROOT / "python/sglang/srt/mem_cache"
 
 
 def _method(path, class_name, method_name, namespace):
@@ -145,11 +148,18 @@ def test_flush_refuses_to_clear_live_session_slots():
     assert not reset_calls
 
 
-def test_missing_resident_slot_aborts_one_request_and_closes_session():
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        ("PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING", "resident_cache_missing"),
+        ("PERSISTENT_HISTORY_SESSION_STALE_CONTINUATION", "stale_continuation"),
+    ],
+)
+def test_invalid_resident_slot_aborts_one_request_and_closes_session(error, status):
     abort = _method(
         MANAGERS / "scheduler.py",
         "Scheduler",
-        "_abort_missing_persistent_history_session",
+        "_abort_invalid_persistent_history_session",
         {"Req": _Req, "CloseSessionReqInput": SimpleNamespace},
     )
     events = []
@@ -172,11 +182,11 @@ def test_missing_resident_slot_aborts_one_request_and_closes_session():
         stream_output=lambda reqs, logprob: events.append(("output", reqs, logprob)),
     )
 
-    abort(scheduler, request)
+    abort(scheduler, request, error)
 
-    assert request.finished_reason == "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING"
+    assert request.finished_reason == error
     assert request.kv_memory_report == {
-        "history_kv_runtime_status": "resident_cache_missing",
+        "history_kv_runtime_status": status,
         "persistent_history_session_error": request.finished_reason,
     }
     assert events == [
@@ -184,3 +194,37 @@ def test_missing_resident_slot_aborts_one_request_and_closes_session():
         ("close", "lost"),
         ("output", [request], False),
     ]
+
+
+def test_stale_continuation_does_not_take_advanced_session_slot():
+    match = _method(
+        CACHE / "session_aware_cache.py",
+        "SessionAwareCache",
+        "match_prefix",
+        {"MatchPrefixParams": object, "MatchResult": object,
+         "_is_streaming": lambda _: True},
+    )
+    restored = []
+    slot = SimpleNamespace(
+        req_pool_idx=3,
+        kv_committed_len=5,
+        c2kv_position_correction=7,
+        history_kv_resident_positions=[0, 1, 9, 10, 11],
+        restore_to_req=lambda req: restored.append(req),
+    )
+    owner = SimpleNamespace(
+        slots={"session": slot},
+        _is_persistent_history_req=lambda req: True,
+    )
+    req = SimpleNamespace(
+        session=SimpleNamespace(session_id="session"),
+        history_kv_eviction={"persistent_continuation_pending": True},
+        c2kv_kv_memory_hint={
+            "persistent_session_logical_prefix_tokens": 9,
+            "persistent_session_computed_prefix_tokens": 9,
+        },
+    )
+    with pytest.raises(RuntimeError, match="PERSISTENT_HISTORY_SESSION_STALE_CONTINUATION"):
+        match(owner, SimpleNamespace(req=req))
+    assert restored == []
+    assert slot.history_kv_resident_positions == [0, 1, 9, 10, 11]
