@@ -301,6 +301,23 @@ class SessionAwareCache(BasePrefixCache):
         if drop_generation_prefix:
             self._trim_persistent_generation_prefix(slot, req)
 
+        if isinstance(config, dict) and config.get("persistent_continuation_pending"):
+            # A timed-out generation can finish on the server after its caller
+            # retries the same prefix. The slot then belongs to a later
+            # canonical horizon than the queued retry. Reject it before
+            # transferring ownership or appending duplicate logical positions.
+            expected_horizon = int(
+                hint.get(
+                    "persistent_session_computed_prefix_tokens",
+                    hint["persistent_session_logical_prefix_tokens"],
+                )
+            )
+            slot_horizon = int(slot.kv_committed_len) + int(
+                slot.c2kv_position_correction
+            )
+            if expected_horizon != slot_horizon:
+                raise RuntimeError("PERSISTENT_HISTORY_SESSION_STALE_CONTINUATION")
+
         slot.restore_to_req(req)
         self._refresh_persistent_tool_prefix(slot, req)
 

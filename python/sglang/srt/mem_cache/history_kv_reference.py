@@ -537,11 +537,13 @@ def reference_sdpa(
     *,
     scale: float,
     validate_history: bool = True,
+    decode_causal: bool = False,
 ) -> torch.Tensor:
     """Attend over headwise history plus ordinary paged KV.
 
     ``query`` is ``[Q,Hq,D]`` and ordinary KV is ``[N,Hkv,D]``. Returned
     output is ``[Q,Hq,D]``. Keys in both inputs are already RoPE-rotated.
+    ``decode_causal`` requires one query after every supplied key position.
     """
 
     # Materialized serving states are validated at construction. Rechecking
@@ -567,8 +569,37 @@ def reference_sdpa(
     normal_pos = normal_positions.view(1, -1).expand(kv_heads, -1)
     key = torch.cat([history.key, normal_k], dim=1)
     value = torch.cat([history.value, normal_v], dim=1)
-    key_pos = torch.cat([history.positions, normal_pos], dim=1)
     groups = q_heads // kv_heads
+    if decode_causal:
+        # A decode request has one query at the current canonical position;
+        # its resident history and ordinary prefix are all earlier. The
+        # caller supplies this invariant. Avoid a per-head custom mask, which
+        # blocks fused CUDA SDPA, and let SDPA handle grouped KV heads without
+        # copying their entire history for every query head.
+        if q_len != 1:
+            raise ValueError("decode reference attention requires one query")
+        if query.device.type in {"cpu", "cuda"}:
+            # PyTorch's grouped-query SDPA handles Hq/Hkv on CPU and CUDA.
+            # Keep other backends on their established expanded-head layout.
+            attention_key, attention_value = key, value
+            sdpa_kwargs = {"enable_gqa": groups != 1}
+        else:
+            attention_key = key.repeat_interleave(groups, dim=0)
+            attention_value = value.repeat_interleave(groups, dim=0)
+            # Older torch_npu SDPA wrappers do not necessarily accept this
+            # optional PyTorch keyword, even when its value is False.
+            sdpa_kwargs = {}
+        output = F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            attention_key.unsqueeze(0),
+            attention_value.unsqueeze(0),
+            attn_mask=None,
+            dropout_p=0.0,
+            scale=float(scale),
+            **sdpa_kwargs,
+        )
+        return output.squeeze(0).transpose(0, 1).contiguous()
+    key_pos = torch.cat([history.positions, normal_pos], dim=1)
     key = key.repeat_interleave(groups, dim=0)
     value = value.repeat_interleave(groups, dim=0)
     key_pos = key_pos.repeat_interleave(groups, dim=0)

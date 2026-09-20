@@ -6298,12 +6298,15 @@ class Scheduler(
 
         return ret
 
-    def _abort_missing_persistent_history_session(self, req: Req) -> None:
-        """Return a missing resident slot as a request error, not an engine crash."""
-        error = "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING"
+    def _abort_invalid_persistent_history_session(self, req: Req, error: str) -> None:
+        """Return an invalid continuation as a request error, not an engine crash."""
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
-            report["history_kv_runtime_status"] = "resident_cache_missing"
+            report["history_kv_runtime_status"] = (
+                "resident_cache_missing"
+                if error == "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING"
+                else "stale_continuation"
+            )
             report["persistent_history_session_error"] = error
         req.set_finish_with_abort(error)
         req.check_finished()
@@ -6447,11 +6450,14 @@ class Scheduler(
                     failed_session_reqs.append(req)
                     continue
             except RuntimeError as exc:
-                if str(exc) != "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING":
+                if str(exc) not in {
+                    "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING",
+                    "PERSISTENT_HISTORY_SESSION_STALE_CONTINUATION",
+                }:
                     raise
                 # The canonical continuation cannot be reconstructed from the
                 # prompt without reviving evicted KV. Fail only this request.
-                self._abort_missing_persistent_history_session(req)
+                self._abort_invalid_persistent_history_session(req, str(exc))
                 failed_session_reqs.append(req)
                 continue
             res = adder.add_one_req(
