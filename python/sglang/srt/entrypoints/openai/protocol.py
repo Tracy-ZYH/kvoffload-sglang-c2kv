@@ -272,6 +272,11 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    # Return only the configured prompt-last prefill hidden row. This reuses
+    # the native C2KV CaptureHiddenMode.LAST path for ordinary chat.
+    c2kv_prompt_last_hidden_only: bool = False
+    # Internal Racer draft: do not append generated suffix to persistent history.
+    racer_draft: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
 
@@ -639,6 +644,9 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
+    # Racer feature capture and speculative-draft session control.
+    c2kv_prompt_last_hidden_only: bool = False
+    racer_draft: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     c2kv_kv_memory_hint: Optional[Dict[str, Any]] = None

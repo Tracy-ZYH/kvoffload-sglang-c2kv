@@ -1019,6 +1019,10 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
+            c2kv_prompt_last_hidden_only=(
+                request.return_hidden_states
+                and request.c2kv_prompt_last_hidden_only
+            ),
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
@@ -1657,7 +1661,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        self._commit_persistent_history_session(adapted_request, ret)
+        if not request.racer_draft:
+            self._commit_persistent_history_session(adapted_request, ret)
         parity_debug = getattr(adapted_request, "_parity_debug", None)
         if isinstance(parity_debug, dict) and ret:
             ret[0].setdefault("meta_info", {})["parity_debug"] = parity_debug
