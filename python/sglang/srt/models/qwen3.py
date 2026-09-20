@@ -1725,18 +1725,20 @@ class Qwen3ForCausalLM(nn.Module):
                 else:
                     k_run = k_attn
                     v_run = v_attn
-                scores = torch.matmul(
-                    q.float(),
-                    k_run.transpose(-2, -1).float(),
-                ) * layer.self_attn.scaling
-                keep = torch.tril(
-                    torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
-                ).view(1, 1, seq_len, seq_len)
-                scores = scores.masked_fill(~keep, float("-inf"))
-                probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(
-                    v_run.dtype
+                # The repair path used to materialize a float32
+                # [batch, heads, seq, seq] score tensor. At a 10k-token tau2
+                # history that temporary alone is roughly 12 GiB and can OOM
+                # an otherwise healthy 96 GiB serving process. SDPA preserves
+                # causal full-context attention while selecting a fused,
+                # memory-efficient CUDA kernel for bf16/fp16 inputs.
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k_run,
+                    v_run,
+                    dropout_p=0.0,
+                    is_causal=True,
+                    scale=layer.self_attn.scaling,
                 )
-                attn_output = torch.matmul(probs, v_run)
 
             attn_output = (
                 attn_output.transpose(1, 2)
@@ -2479,16 +2481,29 @@ class _Qwen3CacheBlendOps:
                 )
             attn_output = _npu_fusion_attention_output(attn_output, q_b.shape)
         else:
-            if attn.num_heads != attn.num_kv_heads:
-                groups = attn.num_heads // attn.num_kv_heads
-                k_run = k_b.repeat_interleave(groups, dim=1)
-                v_run = v_b.repeat_interleave(groups, dim=1)
-            else:
-                k_run, v_run = k_b, v_b
-            scores = torch.matmul(q_b.float(), k_run.transpose(-2, -1).float()) * attn.scaling
-            scores = scores.masked_fill(mask, float("-inf"))
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(v_run.dtype)
-            attn_output = torch.matmul(probs, v_run)
+            # Avoid materializing fp32 [heads, query, key] scores/probabilities
+            # for long CacheBlend spans. The boolean SDPA mask uses True for
+            # positions that may participate, the inverse of ``blocked``.
+            query_chunk = max(
+                1,
+                int(os.environ.get("C2KV_CACHEBLEND_ATTN_QUERY_CHUNK", "128")),
+            )
+            chunk_outputs = []
+            for query_start in range(0, num_q, query_chunk):
+                query_end = min(num_q, query_start + query_chunk)
+                chunk_outputs.append(
+                    torch.nn.functional.scaled_dot_product_attention(
+                        q_b[:, :, query_start:query_end],
+                        k_b,
+                        v_b,
+                        attn_mask=~mask[:, :, query_start:query_end],
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=attn.scaling,
+                        enable_gqa=attn.num_heads != attn.num_kv_heads,
+                    )
+                )
+            attn_output = torch.cat(chunk_outputs, dim=2)
         return (
             attn_output.transpose(1, 2)
             .contiguous()

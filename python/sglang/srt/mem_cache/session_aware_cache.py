@@ -598,13 +598,23 @@ class SessionAwareCache(BasePrefixCache):
             "remaining_session_slots": len(self.slots)}))
 
     def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
-        total = 0
+        """KV tokens owned by sessions but not already counted as tree-protected.
+
+        ``cache_protected_len`` is only an ownership overlap when the wrapped
+        cache actually reports protected tokens.  With ``--disable-radix-cache``
+        the chunk cache reports zero protected tokens, so subtracting the saved
+        prefix unconditionally makes valid long-context session KV look leaked.
+        """
+        allocated_total = 0
+        claimed_tree_prefix = 0
         for slot in self.slots.values():
             if slot.is_holding_kv:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
-                total += allocated - slot.cache_protected_len
-        return total
+                allocated_total += allocated
+                claimed_tree_prefix += min(slot.cache_protected_len, allocated)
+        tree_protected = int(self.inner.protected_size())
+        tree_accounted_session_prefix = min(claimed_tree_prefix, tree_protected)
+        return allocated_total - tree_accounted_session_prefix
 
     def session_held_full_tokens(self) -> int:
         """An alias to align the naming style of SWA"""

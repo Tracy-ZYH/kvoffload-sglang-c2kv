@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -234,6 +235,33 @@ class OpenAIServingChat(OpenAIServingBase):
                     dict(scope) for scope in canonical_scopes
                 ]
         return delta, session_id, full_prompt_ids
+
+    @staticmethod
+    def _parity_hash(values: List[int]) -> str:
+        return hashlib.sha256(
+            ",".join(str(int(value)) for value in values).encode("ascii")
+        ).hexdigest()
+
+    def _attach_parity_debug(
+        self, request: ChatCompletionRequest, adapted_request: GenerateReqInput,
+        full_prompt_ids: Optional[List[int]], input_ids: Optional[List[int]],
+    ) -> None:
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict) or not hint.get("parity_debug"):
+            return
+        full, delta = list(full_prompt_ids or []), list(input_ids or [])
+        prefix_len = max(0, len(full) - len(delta))
+        adapted_request._parity_debug = {
+            "prompt_ids_sha256": self._parity_hash(full),
+            "prompt_token_count": len(full),
+            "position_ids_sha256": self._parity_hash(list(range(len(full)))),
+            "position_token_count": len(full),
+            "cached_prefix_tokens": prefix_len,
+            "cached_prefix_ids_sha256": self._parity_hash(full[:prefix_len]),
+            "delta_tokens": len(delta),
+            "delta_ids_sha256": self._parity_hash(delta),
+            "canonical_reconstruction_matches": full[:prefix_len] + delta == full,
+        }
 
     def _commit_persistent_history_session(
         self,
@@ -1016,6 +1044,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if persistent_session_id is not None:
             adapted_request._persistent_history_session_id = persistent_session_id
             adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
+        self._attach_parity_debug(
+            request, adapted_request,
+            list(processed_messages.prompt_ids)
+            if isinstance(processed_messages.prompt_ids, list) else None,
+            input_ids if isinstance(input_ids, list) else None,
+        )
 
         if request.c2kv_kv_memory_hint:
             logger.info(
@@ -1624,6 +1658,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ret = [ret]
 
         self._commit_persistent_history_session(adapted_request, ret)
+        parity_debug = getattr(adapted_request, "_parity_debug", None)
+        if isinstance(parity_debug, dict) and ret:
+            ret[0].setdefault("meta_info", {})["parity_debug"] = parity_debug
 
         response = self._build_chat_response(
             request,
@@ -1749,6 +1786,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # from client-side history-token estimates.
             "kv_memory_report": kv_memory_report,
         }
+        parity_debug = ret[0]["meta_info"].get("parity_debug")
+        if isinstance(parity_debug, dict):
+            metadata["parity_debug"] = parity_debug
         # A C2KV injection that fails mid-prefill ends as FINISH_ABORT with no
         # status_code, i.e. an HTTP 200 whose finish_reason.type is "abort";
         # the per-choice field above copies only finish_reason["type"], so the

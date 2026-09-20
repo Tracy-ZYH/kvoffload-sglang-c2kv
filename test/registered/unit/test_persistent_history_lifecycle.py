@@ -475,6 +475,29 @@ def test_joint_native_tool_and_history_scopes_are_disjoint():
         "joint_current_full_tokens"] == 2
 
 
+def test_session_held_tokens_does_not_drop_prefix_when_radix_is_disabled():
+    held = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "session_held_tokens", {"ceil_align": lambda n, page: n},
+    )
+    slots = {
+        "long": SimpleNamespace(
+            is_holding_kv=True, kv_allocated_len=35_263,
+            cache_protected_len=28_168),
+    }
+    no_radix = SimpleNamespace(
+        slots=slots, page_size=1,
+        inner=SimpleNamespace(protected_size=lambda: 0),
+    )
+    assert held(no_radix) == 35_263
+
+    radix = SimpleNamespace(
+        slots=slots, page_size=1,
+        inner=SimpleNamespace(protected_size=lambda: 28_168),
+    )
+    assert held(radix) == 7_095
+
+
 def test_failed_persistent_eviction_rolls_back_without_finished_length_check():
     path = CACHE / "session_aware_cache.py"
     rollback = method(
