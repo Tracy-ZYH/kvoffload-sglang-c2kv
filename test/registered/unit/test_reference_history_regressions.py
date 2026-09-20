@@ -64,6 +64,38 @@ def test_reference_attention_uses_four_dimensional_sdpa(monkeypatch):
     assert observed == [(4, 4, 4, 4)]
 
 
+def test_reference_decode_grouped_kv_matches_causal_mask(monkeypatch):
+    torch.manual_seed(20260920)
+    history = ReferenceLayerKV(
+        key=torch.randn(2, 4, 8),
+        value=torch.randn(2, 4, 8),
+        positions=torch.tensor([[0, 2, 4, 6], [1, 3, 5, 7]]),
+    )
+    query = torch.randn(1, 4, 8)
+    normal_key = torch.randn(3, 2, 8)
+    normal_value = torch.randn(3, 2, 8)
+    normal_positions = torch.tensor([8, 9, 10])
+    query_positions = torch.tensor([10])
+    expected = reference_sdpa(
+        query, history, normal_key, normal_value, normal_positions,
+        query_positions, scale=0.5,
+    )
+    observed = []
+    original = reference_module.F.scaled_dot_product_attention
+
+    def checked(q, k, v, **kwargs):
+        observed.append((q.shape[1], k.shape[1], kwargs["attn_mask"], kwargs["enable_gqa"]))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
+    actual = reference_sdpa(
+        query, history, normal_key, normal_value, normal_positions,
+        query_positions, scale=0.5, decode_causal=True,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    assert observed == [(4, 2, None, True)]
+
+
 def test_reference_attention_chunks_headwise_mask_without_changing_values(monkeypatch):
     torch.manual_seed(20260920)
     history = ReferenceLayerKV(

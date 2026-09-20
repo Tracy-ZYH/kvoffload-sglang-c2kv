@@ -118,6 +118,56 @@ def test_attention_selection_window_uses_only_new_tail_queries():
         ledger.selection_query_window("h2o", 5, 5, 5, 64)
 
 
+def test_long_history_score_logits_are_bounded_without_changing_scores(monkeypatch):
+    collect = method(
+        ROOT / "python/sglang/srt/models/qwen3.py",
+        "Qwen3Attention",
+        "_collect_history_kv_eviction_scores",
+        {"torch": torch, "ForwardBatch": SimpleNamespace},
+    )
+    history_len = 100_000
+    query_len = 20
+    matmul_query_lens = []
+    original_matmul = torch.matmul
+
+    def checked(left, right):
+        matmul_query_lens.append(left.shape[1])
+        return original_matmul(left, right)
+
+    monkeypatch.setattr(torch, "matmul", checked)
+    config = {
+        "method": "pyramidkv", "history_start": 0,
+        "history_end": history_len, "history_kv_recent_window": 64,
+    }
+    key_buffer = torch.zeros(history_len + 1, 1, 1)
+    fb = SimpleNamespace(
+        c2kv_history_kv_eviction_configs=[config],
+        forward_mode=SimpleNamespace(is_extend_or_draft_extend_or_mixed=lambda: True),
+        extend_seq_lens_cpu=[query_len],
+        extend_prefix_lens_cpu=[history_len],
+        req_pool_indices=torch.tensor([0]),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.arange(1, history_len + 1).unsqueeze(0)
+        ),
+        token_to_kv_pool=SimpleNamespace(_get_key_buffer=lambda _: key_buffer),
+    )
+    attention = SimpleNamespace(
+        num_heads=4, num_kv_heads=1, head_dim=1, scaling=1.,
+        attn=SimpleNamespace(layer_id=0),
+    )
+    collect(
+        attention,
+        torch.zeros(query_len, 4),
+        torch.zeros(query_len, 1),
+        torch.arange(history_len, history_len + query_len),
+        fb,
+    )
+    scores = fb.c2kv_history_kv_selection_scores[0]["layers"][0]
+    expected = 4 * sum(1 / (history_len + i + 1) for i in range(query_len))
+    assert matmul_query_lens == [10, 10]
+    torch.testing.assert_close(scores[[0, -1]], torch.tensor([expected, expected]))
+
+
 def test_overlap_processes_final_selection_round_before_decode_scheduling():
     path = ROOT / "python/sglang/srt/managers/scheduler.py"
     node = next(
@@ -192,6 +242,39 @@ def test_decode_cleanup_never_frees_prompt_pages_at_nonzero_allocator_offset():
     assert row[0, :5].tolist() == [40, 41, 42, 43, 44]
     assert row[0, 5:10].tolist() == [0]*5
     assert req.kv_committed_len == req.kv_allocated_len == 5
+
+
+@pytest.mark.parametrize("reference_method", [None, "agentkv", "commitkv"])
+def test_single_uncommitted_decode_token_is_reclaimed(reference_method):
+    discard = method(
+        CACHE / "session_aware_cache.py", "SessionAwareCache",
+        "_discard_persistent_decode_suffix", {"torch": torch, "Req": SimpleNamespace},
+    )
+    row = torch.tensor([[40, 41, 42, 43, 44, 0, 0]])
+    freed = []
+    owner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=row), page_size=1,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda slots: freed.extend(slots.tolist())
+        ),
+    )
+    req = SimpleNamespace(
+        origin_input_ids=list(range(5)), req_pool_idx=0,
+        kv_committed_len=5, kv_allocated_len=5,
+        c2kv_position_correction=0,
+        history_kv_resident_positions=list(range(5)),
+        history_kv_reference_config=(
+            {"method": reference_method} if reference_method else None
+        ),
+        reference_decode_logical_start=5,
+        output_ids=[777],
+        persistent_decode_cache_locs=[torch.tensor(45)],
+        kv_memory_report={},
+    )
+    discard(owner, req)
+    assert freed == [45]
+    assert req.kv_committed_len == req.kv_allocated_len == 5
+    assert req.persistent_decode_cache_locs == []
 
 
 @pytest.mark.parametrize(

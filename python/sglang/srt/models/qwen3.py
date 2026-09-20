@@ -583,13 +583,24 @@ class Qwen3Attention(nn.Module):
                 dtype=torch.float32,
                 device=k_all.device,
             )
-            # H2O scores every prompt query.  Bound the temporary attention
-            # matrix instead of materializing [heads, prompt, prompt].
-            for query_left in range(q_start, q_end, 64):
-                query_right = min(q_end, query_left + 64)
+            # A fixed query count still allocates hundreds of MiB of logits
+            # once AppWorld's persistent history grows past 100k keys. Bound
+            # float logits by bytes, including grouped query heads, while
+            # preserving the same softmax denominator and score reduction.
+            score_query_chunk = max(
+                1,
+                min(
+                    64,
+                    (16 * 1024 * 1024)
+                    // max(1, self.num_heads * k_all.shape[1] * 4),
+                ),
+            )
+            score_key = k_all.transpose(-2, -1).float()
+            for query_left in range(q_start, q_end, score_query_chunk):
+                query_right = min(q_end, query_left + score_query_chunk)
                 logits = torch.matmul(
                     q_req[:, query_left:query_right, :].float(),
-                    k_all.transpose(-2, -1).float(),
+                    score_key,
                 ) * self.scaling
                 q_pos = flat_positions[
                     token_start + query_left : token_start + query_right
@@ -995,6 +1006,7 @@ class Qwen3Attention(nn.Module):
                     query_pos,
                     scale=self.scaling,
                     validate_history=False,
+                    decode_causal=forward_batch.forward_mode.is_decode(),
                 ).reshape(query_len, -1)
             )
         if offset != q.shape[0]:
