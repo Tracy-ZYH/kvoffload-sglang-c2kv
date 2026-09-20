@@ -4848,7 +4848,18 @@ class Scheduler(
                 req.req_pool_idx, : req.kv_committed_len
             ].to(torch.int64)
             req.already_computed = req.kv_committed_len
-            req.cache_protected_len = len(req.prefix_indices)
+            hint = getattr(req, "c2kv_kv_memory_hint", None)
+            persistent_history = bool(
+                isinstance(hint, dict)
+                and isinstance(hint.get("persistent_history_session"), dict)
+                and hint["persistent_history_session"].get("enabled")
+            )
+            # Physical history pages belong to the request/session, not radix.
+            # A stale protected prefix can exceed the compacted resident length
+            # and cause negative session accounting or skipped page releases.
+            req.cache_protected_len = (
+                0 if persistent_history else len(req.prefix_indices)
+            )
             return
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
