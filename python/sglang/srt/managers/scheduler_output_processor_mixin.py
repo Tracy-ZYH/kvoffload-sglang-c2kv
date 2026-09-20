@@ -696,7 +696,10 @@ class SchedulerOutputProcessorMixin:
                     if isinstance(tool_receipt, dict) and not tool_receipt.get("no_op"):
                         state = getattr(req, "history_kv_reference_state", None)
                         layers = list(state.layers.values()) if state is not None else []
-                        normal = int(req.kv_committed_len)
+                        # Overlap may already reserve the next decode slot on
+                        # req. This completed batch still holds the exact
+                        # post-replay prompt length used by the receipt.
+                        normal = int(batch.seq_lens_cpu[i].item())
                         actual_by_layer = (
                             [normal + int(layer.key.shape[1]) for layer in layers]
                             if layers else [normal] * int(self.token_to_kv_pool_allocator.get_kvcache().layer_num)
@@ -707,7 +710,9 @@ class SchedulerOutputProcessorMixin:
                         snapshot = getattr(req, "history_kv_eviction_report_snapshot", None)
                         if isinstance(snapshot, dict):
                             snapshot["tool_kv_eviction"] = dict(tool_receipt)
-                    paper_telemetry.mark_generation_start(req)
+                    paper_telemetry.mark_generation_start(
+                        req, normal_kv_tokens=int(batch.seq_lens_cpu[i].item())
+                    )
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)

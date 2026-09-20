@@ -436,7 +436,9 @@ class _PaperTelemetry:
                 "start_snapshot": end,
             }
 
-    def mark_generation_start(self, req: Any) -> None:
+    def mark_generation_start(
+        self, req: Any, *, normal_kv_tokens: Optional[int] = None
+    ) -> None:
         if not enabled():
             return
         with self._lock:
@@ -451,7 +453,12 @@ class _PaperTelemetry:
                 if whole_full is not None:
                     active["whole_full_kv_tokens"] = _as_int(whole_full)
             snapshot = self._snapshot("generation_start")
-            active_tokens = _as_int(getattr(req, "kv_committed_len", 0))
+            # The completed prefill batch excludes a decode slot that overlap
+            # scheduling may already have reserved on the mutable request.
+            active_tokens = _as_int(
+                getattr(req, "kv_committed_len", 0)
+                if normal_kv_tokens is None else normal_kv_tokens
+            )
             reference = self._reference_payload([req], include_snapshots=False)
             snapshot["request_active_kv_tokens"] = active_tokens + reference["tokens"]
             snapshot["request_active_kv_bytes"] = (

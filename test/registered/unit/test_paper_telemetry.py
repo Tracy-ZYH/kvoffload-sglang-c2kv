@@ -529,3 +529,32 @@ def test_reference_recovery_snapshot_is_resident_even_when_not_selected(monkeypa
                         tree_cache=SimpleNamespace(slots={"s": owner}))
     assert telemetry._kv_snapshot()["request_resident_kv_bytes"] == 2 * (64 + 16)
     assert telemetry._reference_payload([owner], include_snapshots=False)["bytes"] == 64 + 16
+
+
+def test_generation_start_excludes_overlap_decode_reservation(monkeypatch):
+    monkeypatch.setenv("C2KV_PAPER_TELEMETRY", "1")
+    monkeypatch.delenv("C2KV_PAPER_TELEMETRY_LOG", raising=False)
+    layer = SimpleNamespace(
+        key=torch.zeros(2, 3, 4), value=torch.zeros(2, 3, 4),
+        positions=torch.arange(3).expand(2, -1).clone(),
+    )
+    state = SimpleNamespace(layers={0: layer})
+    reference_bytes = layer.key.nbytes + layer.value.nbytes + layer.positions.nbytes
+    measured = []
+    for reserved_decode_tokens in (0, 1):
+        telemetry = _PaperTelemetry()
+        telemetry.configure(_Allocator(), None, bytes_per_kv_token=64)
+        telemetry.start(
+            server_request_id="r", outer_request_id="r",
+            phase="prefill", kind="generation",
+        )
+        req = SimpleNamespace(
+            rid="r", kv_committed_len=125 + reserved_decode_tokens,
+            history_kv_reference_state=state,
+        )
+        telemetry.mark_generation_start(req, normal_kv_tokens=125)
+        metrics = telemetry.finish(req=req, success=True)["metrics"]
+        measured.append((metrics["generation_active_kv_tokens"],
+                         metrics["generation_active_kv_bytes"]))
+        assert req.kv_committed_len == 125 + reserved_decode_tokens
+    assert measured == [(128, 125 * 64 + reference_bytes)] * 2
