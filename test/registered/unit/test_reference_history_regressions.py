@@ -109,10 +109,16 @@ def test_reference_attention_chunks_headwise_mask_without_changing_values(monkey
     normal_positions = torch.tensor([10, 11, 12])
     query_positions = torch.tensor([4, 5, 6, 7, 8, 10, 12])
     original = reference_module.F.scaled_dot_product_attention
-    mask_shapes = []
+    calls = []
 
     def checked(q, k, v, **kwargs):
-        mask_shapes.append(tuple(kwargs["attn_mask"].shape))
+        calls.append({
+            "q_shape": tuple(q.shape),
+            "k_shape": tuple(k.shape),
+            "mask_shape": tuple(kwargs["attn_mask"].shape),
+            "key_batch_stride": k.stride(0),
+            "value_batch_stride": v.stride(0),
+        })
         return original(q, k, v, **kwargs)
 
     monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
@@ -126,7 +132,13 @@ def test_reference_attention_chunks_headwise_mask_without_changing_values(monkey
         query_positions,
         scale=0.5,
     )
-    assert mask_shapes == [(1, 4, 2, 8)] * 3 + [(1, 4, 1, 8)]
+    assert [call["mask_shape"] for call in calls] == (
+        [(2, 1, 2, 8)] * 3 + [(2, 1, 1, 8)]
+    ) * 2
+    assert all(call["q_shape"][0:2] == (2, 1) for call in calls)
+    assert all(call["k_shape"] == (2, 1, 8, 4) for call in calls)
+    assert all(call["key_batch_stride"] == 0 for call in calls)
+    assert all(call["value_batch_stride"] == 0 for call in calls)
 
     expected = []
     for head in range(4):
