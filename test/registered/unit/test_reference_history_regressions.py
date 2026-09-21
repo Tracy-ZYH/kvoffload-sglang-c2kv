@@ -64,6 +64,98 @@ def test_reference_attention_uses_four_dimensional_sdpa(monkeypatch):
     assert observed == [(4, 4, 4, 4)]
 
 
+def test_reference_decode_grouped_kv_matches_causal_mask(monkeypatch):
+    torch.manual_seed(20260920)
+    history = ReferenceLayerKV(
+        key=torch.randn(2, 4, 8),
+        value=torch.randn(2, 4, 8),
+        positions=torch.tensor([[0, 2, 4, 6], [1, 3, 5, 7]]),
+    )
+    query = torch.randn(1, 4, 8)
+    normal_key = torch.randn(3, 2, 8)
+    normal_value = torch.randn(3, 2, 8)
+    normal_positions = torch.tensor([8, 9, 10])
+    query_positions = torch.tensor([10])
+    expected = reference_sdpa(
+        query, history, normal_key, normal_value, normal_positions,
+        query_positions, scale=0.5,
+    )
+    observed = []
+    original = reference_module.F.scaled_dot_product_attention
+
+    def checked(q, k, v, **kwargs):
+        observed.append((q.shape[1], k.shape[1], kwargs["attn_mask"], kwargs["enable_gqa"]))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
+    actual = reference_sdpa(
+        query, history, normal_key, normal_value, normal_positions,
+        query_positions, scale=0.5, decode_causal=True,
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    assert observed == [(4, 2, None, True)]
+
+
+def test_reference_attention_chunks_headwise_mask_without_changing_values(monkeypatch):
+    torch.manual_seed(20260920)
+    history = ReferenceLayerKV(
+        key=torch.randn(2, 5, 4),
+        value=torch.randn(2, 5, 4),
+        positions=torch.tensor([[0, 2, 4, 6, 8], [1, 3, 5, 7, 9]]),
+    )
+    query = torch.randn(7, 4, 4)
+    normal_key = torch.randn(3, 2, 4)
+    normal_value = torch.randn(3, 2, 4)
+    normal_positions = torch.tensor([10, 11, 12])
+    query_positions = torch.tensor([4, 5, 6, 7, 8, 10, 12])
+    original = reference_module.F.scaled_dot_product_attention
+    calls = []
+
+    def checked(q, k, v, **kwargs):
+        calls.append({
+            "q_shape": tuple(q.shape),
+            "k_shape": tuple(k.shape),
+            "mask_shape": tuple(kwargs["attn_mask"].shape),
+            "key_batch_stride": k.stride(0),
+            "value_batch_stride": v.stride(0),
+        })
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(reference_module.F, "scaled_dot_product_attention", checked)
+    monkeypatch.setattr(reference_module, "REFERENCE_SDPA_MAX_MASK_BYTES", 4 * 2 * 8)
+    actual = reference_sdpa(
+        query,
+        history,
+        normal_key,
+        normal_value,
+        normal_positions,
+        query_positions,
+        scale=0.5,
+    )
+    assert [call["mask_shape"] for call in calls] == (
+        [(2, 1, 2, 8)] * 3 + [(2, 1, 1, 8)]
+    ) * 2
+    assert all(call["q_shape"][0:2] == (2, 1) for call in calls)
+    assert all(call["k_shape"] == (2, 1, 8, 4) for call in calls)
+    assert all(call["key_batch_stride"] == 0 for call in calls)
+    assert all(call["value_batch_stride"] == 0 for call in calls)
+
+    expected = []
+    for head in range(4):
+        kv_head = head // 2
+        keys = torch.cat([history.key[kv_head], normal_key[:, kv_head]])
+        values = torch.cat([history.value[kv_head], normal_value[:, kv_head]])
+        key_positions = torch.cat([history.positions[kv_head], normal_positions])
+        logits = query[:, head] @ keys.T * 0.5
+        logits = logits.masked_fill(
+            key_positions[None, :] > query_positions[:, None], float("-inf")
+        )
+        expected.append(torch.softmax(logits, dim=-1) @ values)
+    torch.testing.assert_close(
+        actual, torch.stack(expected, dim=1), atol=1e-5, rtol=1e-5
+    )
+
+
 def test_two_turn_append_only_uses_previous_resident_kv_and_new_delta():
     source_key = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2, 1)
     source_value = source_key + 100

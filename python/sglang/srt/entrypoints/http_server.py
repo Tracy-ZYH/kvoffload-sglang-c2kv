@@ -2468,6 +2468,10 @@ async def v1_c2kv_repair_extract(
             history_kv_kernel_size=request.history_kv_kernel_size,
             history_kv_pooling=request.history_kv_pooling,
             history_kv_h2o_recent_fraction=request.history_kv_h2o_recent_fraction,
+            history_kv_selectable_relative_indices=(
+                request.history_kv_selectable_relative_indices),
+            history_kv_mandatory_relative_indices=(
+                request.history_kv_mandatory_relative_indices),
             history_kv_recovery_mode=request.history_kv_recovery_mode,
             history_kv_recovery_relative_indices=(
                 history_kv_recovery_relative_indices),

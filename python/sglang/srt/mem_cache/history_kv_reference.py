@@ -17,6 +17,11 @@ import torch
 import torch.nn.functional as F
 
 
+# A headwise causal mask needs Hq * Q * K bytes. Keep its peak bounded across
+# long extend requests without changing which keys any query can attend to.
+REFERENCE_SDPA_MAX_MASK_BYTES = 16 * 1024 * 1024
+
+
 @dataclass
 class ReferenceLayerKV:
     """One layer's headwise history, with already-rotated keys."""
@@ -532,11 +537,13 @@ def reference_sdpa(
     *,
     scale: float,
     validate_history: bool = True,
+    decode_causal: bool = False,
 ) -> torch.Tensor:
     """Attend over headwise history plus ordinary paged KV.
 
     ``query`` is ``[Q,Hq,D]`` and ordinary KV is ``[N,Hkv,D]``. Returned
     output is ``[Q,Hq,D]``. Keys in both inputs are already RoPE-rotated.
+    ``decode_causal`` requires one query after every supplied key position.
     """
 
     # Materialized serving states are validated at construction. Rechecking
@@ -554,23 +561,81 @@ def reference_sdpa(
         raise ValueError("query heads must be divisible by KV heads")
     if normal_positions.shape != (normal_len,) or query_positions.shape != (q_len,):
         raise ValueError("reference attention position lengths mismatch")
+    if q_len == 0:
+        return query.new_empty((0, q_heads, dim))
 
-    normal_k = normal_key.transpose(0, 1)
-    normal_v = normal_value.transpose(0, 1)
-    normal_pos = normal_positions.view(1, -1).expand(kv_heads, -1)
-    key = torch.cat([history.key, normal_k], dim=1)
-    value = torch.cat([history.value, normal_v], dim=1)
-    key_pos = torch.cat([history.positions, normal_pos], dim=1)
     groups = q_heads // kv_heads
-    key = key.repeat_interleave(groups, dim=0)
-    value = value.repeat_interleave(groups, dim=0)
-    key_pos = key_pos.repeat_interleave(groups, dim=0)
-    # SDPA's fused CUDA implementations expect [B,H,Q,D]. A rank-3 tensor
-    # sends this reference route through a slower fallback on every layer.
-    q = query.transpose(0, 1).unsqueeze(0)
-    mask = (key_pos.unsqueeze(1) <= query_positions.view(1, -1, 1)).unsqueeze(0)
-    output = F.scaled_dot_product_attention(
-        q, key.unsqueeze(0), value.unsqueeze(0),
-        attn_mask=mask, dropout_p=0.0, scale=float(scale)
+    if decode_causal:
+        normal_k = normal_key.transpose(0, 1)
+        normal_v = normal_value.transpose(0, 1)
+        key = torch.cat([history.key, normal_k], dim=1)
+        value = torch.cat([history.value, normal_v], dim=1)
+        # A decode request has one query at the current canonical position;
+        # its resident history and ordinary prefix are all earlier. The
+        # caller supplies this invariant. Avoid a per-head custom mask, which
+        # blocks fused CUDA SDPA, and let SDPA handle grouped KV heads without
+        # copying their entire history for every query head.
+        if q_len != 1:
+            raise ValueError("decode reference attention requires one query")
+        if query.device.type in {"cpu", "cuda"}:
+            # PyTorch's grouped-query SDPA handles Hq/Hkv on CPU and CUDA.
+            # Keep other backends on their established expanded-head layout.
+            attention_key, attention_value = key, value
+            sdpa_kwargs = {"enable_gqa": groups != 1}
+        else:
+            attention_key = key.repeat_interleave(groups, dim=0)
+            attention_value = value.repeat_interleave(groups, dim=0)
+            # Older torch_npu SDPA wrappers do not necessarily accept this
+            # optional PyTorch keyword, even when its value is False.
+            sdpa_kwargs = {}
+        output = F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            attention_key.unsqueeze(0),
+            attention_value.unsqueeze(0),
+            attn_mask=None,
+            dropout_p=0.0,
+            scale=float(scale),
+            **sdpa_kwargs,
+        )
+        return output.squeeze(0).transpose(0, 1).contiguous()
+    # Build only one KV head's candidate row at a time. A full-history
+    # repeat_interleave copies K/V once per query head, which can exceed the
+    # free memory on long AppWorld extends even with a bounded causal mask.
+    total_key_len = history.key.shape[1] + normal_len
+    query_chunk = max(
+        1,
+        min(
+            q_len,
+            REFERENCE_SDPA_MAX_MASK_BYTES // max(1, q_heads * total_key_len),
+        ),
     )
-    return output.squeeze(0).transpose(0, 1).contiguous()
+    output = torch.empty_like(query)
+    for kv_head in range(kv_heads):
+        head_start = kv_head * groups
+        head_stop = head_start + groups
+        key = history.key[kv_head]
+        value = history.value[kv_head]
+        key_pos = history.positions[kv_head]
+        if normal_len:
+            key = torch.cat([key, normal_key[:, kv_head]], dim=0)
+            value = torch.cat([value, normal_value[:, kv_head]], dim=0)
+            key_pos = torch.cat([key_pos, normal_positions], dim=0)
+        # Treat grouped query heads as the batch axis. The expanded K/V views
+        # share storage, so all heads see the same KV row without a full copy.
+        grouped_key = key.unsqueeze(0).unsqueeze(0).expand(groups, 1, -1, -1)
+        grouped_value = value.unsqueeze(0).unsqueeze(0).expand(groups, 1, -1, -1)
+        for start in range(0, q_len, query_chunk):
+            stop = min(start + query_chunk, q_len)
+            q = query[start:stop, head_start:head_stop].permute(1, 0, 2).unsqueeze(1)
+            mask = (
+                key_pos.view(1, 1, 1, -1)
+                <= query_positions[start:stop].view(1, 1, -1, 1)
+            ).expand(groups, -1, -1, -1)
+            attended = F.scaled_dot_product_attention(
+                q, grouped_key, grouped_value,
+                attn_mask=mask, dropout_p=0.0, scale=float(scale)
+            )
+            output[start:stop, head_start:head_stop] = (
+                attended.squeeze(1).permute(1, 0, 2)
+            )
+    return output.contiguous()
