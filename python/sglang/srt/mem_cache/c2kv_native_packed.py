@@ -81,10 +81,28 @@ def canonical_chunk_payload(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     token_ids = _token_ids(
         chunk.get("token_ids") or (), field="chunk.token_ids", allow_empty=False
     )
+    chunk_ratio = chunk.get("compression_ratio")
+    if chunk_ratio is not None:
+        if type(chunk_ratio) is not int or chunk_ratio <= 0:
+            raise ValueError("chunk.compression_ratio must be a positive integer")
+        compression_ratio = chunk_ratio
+    projection_set = chunk.get("projection_set")
+    if projection_set in (None, "", "history"):
+        projection_set = None
+    elif projection_set != "tool":
+        raise ValueError(
+            f"chunk.projection_set must be 'history' or 'tool', got {projection_set!r}"
+        )
+    elif not tool_binding or not tool_binding.get("enabled") or not tool_binding.get("identity"):
+        raise ValueError(
+            "C2KV_TOOL_GIST_UNAVAILABLE: a chunk requests projection_set='tool' "
+            "but the server has no --c2kv-tool-gist-weights set"
+        )
     source_indices = tuple(chunk.get("source_indices") or ())
     if any(type(index) is not int or index < 0 for index in source_indices):
         raise ValueError("chunk.source_indices must contain nonnegative integers")
@@ -107,7 +125,7 @@ def canonical_chunk_payload(
         raise ValueError(
             "chunk source token bounds must be nonnegative and match token_ids length"
         )
-    return {
+    payload = {
         "schema": NATIVE_CHUNK_HANDLE_SCHEMA,
         "model_binding": dict(model_binding),
         "packing_version": str(packing_version),
@@ -123,6 +141,14 @@ def canonical_chunk_payload(
             "token_ids": list(token_ids),
         },
     }
+    if projection_set is not None:
+        # Only tool-set chunks carry these keys, so every existing history
+        # handle stays byte-identical.
+        payload["chunk"]["projection_set"] = projection_set
+        payload["projection_identity"] = str(tool_binding["identity"])
+    if chunk_ratio is not None:
+        payload["chunk"]["compression_ratio"] = chunk_ratio
+    return payload
 
 
 def canonical_chunk_handle(
@@ -132,6 +158,7 @@ def canonical_chunk_handle(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> str:
     payload = canonical_chunk_payload(
         chunk,
@@ -139,6 +166,7 @@ def canonical_chunk_handle(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -153,6 +181,7 @@ def _normalize_chunk(
     packing_version: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = canonical_chunk_payload(
         chunk,
@@ -160,6 +189,7 @@ def _normalize_chunk(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     normalized = dict(payload["chunk"])
     handle = canonical_chunk_handle(
@@ -168,6 +198,7 @@ def _normalize_chunk(
         packing_version=packing_version,
         encoding_scope=encoding_scope,
         compression_ratio=compression_ratio,
+        tool_binding=tool_binding,
     )
     supplied_handle = chunk.get("handle")
     if supplied_handle is not None and supplied_handle != handle:
@@ -194,8 +225,16 @@ def plan_native_packed_request(
     raw_layout_profile: str,
     encoding_scope: str,
     compression_ratio: int,
+    tool_binding: Mapping[str, Any] | None = None,
+    raw_tool_segments: Sequence[Mapping[str, Any]] = (),
+    tool_gist_segments: Sequence[Mapping[str, Any]] = (),
 ) -> NativePackedPlan:
-    """Validate the native token frame and build existing C2KV segment spans."""
+    """Validate the native token frame and build existing C2KV segment spans.
+
+    ``tool_binding`` is the server's ``tool_gist`` capability; chunks that name
+    ``projection_set="tool"`` (compressed tool definitions, laid out before the
+    history chunks) bind their handles to it.
+    """
 
     if packing_version != PACKING_VERSION:
         raise ValueError(
@@ -224,6 +263,7 @@ def plan_native_packed_request(
             packing_version=packing_version,
             encoding_scope=encoding_scope,
             compression_ratio=compression_ratio,
+            tool_binding=tool_binding,
         )
         for chunk in encoder_chunks
     ]
@@ -234,6 +274,7 @@ def plan_native_packed_request(
             packing_version=packing_version,
             encoding_scope=encoding_scope,
             compression_ratio=compression_ratio,
+            tool_binding=tool_binding,
         )
         for chunk in compression_chunks
     ]
@@ -244,6 +285,7 @@ def plan_native_packed_request(
     gist_tokens = 0
     for chunk in selected:
         token_ids = tuple(chunk["token_ids"])
+        chunk_ratio = chunk.get("compression_ratio") or compression_ratio
         source_position_start = chunk.get("source_position_start")
         if source_position_start != cursor:
             raise ValueError(
@@ -252,8 +294,8 @@ def plan_native_packed_request(
                 f"expected {cursor}"
             )
         expected_positions = [
-            cursor + min(start + compression_ratio, len(token_ids)) - 1
-            for start in range(0, len(token_ids), compression_ratio)
+            cursor + min(start + chunk_ratio, len(token_ids)) - 1
+            for start in range(0, len(token_ids), chunk_ratio)
         ]
         if chunk.get("gist_position_ids") != expected_positions:
             raise ValueError(
@@ -267,6 +309,57 @@ def plan_native_packed_request(
         gist_tokens += len(expected_positions)
     logical_ids.extend(workspace_ids)
 
+    anchored_source_tokens = 0
+    anchored_gist_tokens = 0
+    anchored_encoder_tokens = 0
+    anchored_system_delta = 0
+    anchored_workspace_delta = 0
+    expanded_tool_segments = []
+    for segment in tool_gist_segments:
+        chunks = segment.get("chunks") or ([segment["chunk"]] if segment.get("chunk") else [])
+        if not chunks or (segment.get("chunks") and segment.get("chunk")):
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_CHUNKS_INVALID")
+        source_position = segment["token_start"]
+        for index, chunk in enumerate(chunks):
+            expanded_tool_segments.append({"token_start": segment["token_start"] if index == 0 else segment["token_end"],
+                                          "token_end": segment["token_end"], "chunk": chunk,
+                                          "encoder_position_start": source_position})
+            source_position += len(chunk.get("token_ids") or [])
+    for segment in expanded_tool_segments:
+        start, end = segment.get("token_start"), segment.get("token_end")
+        if (type(start) is not int or type(end) is not int
+                or not 0 <= start <= end <= len(logical_ids)):
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_SPAN_INVALID")
+        if any(start < right and left < end for left, right in segment_boundaries):
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_SPAN_OVERLAP")
+        chunk = _normalize_chunk(
+            segment["chunk"], model_binding=model_binding,
+            packing_version=packing_version, encoding_scope=encoding_scope,
+            compression_ratio=compression_ratio, tool_binding=tool_binding,
+        )
+        if chunk.get("projection_set") != "tool":
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_PROJECTION_REQUIRED")
+        # The T0 encoder consumes its trained document envelope. The placement
+        # span names the original visible source, which may use another format.
+        encoder_len = len(chunk["token_ids"])
+        ratio = chunk.get("compression_ratio") or compression_ratio
+        encoder_position = segment["encoder_position_start"]
+        expected = [encoder_position + min(offset + ratio, encoder_len) - 1
+                    for offset in range(0, encoder_len, ratio)]
+        if chunk.get("source_position_start") != encoder_position or chunk.get("gist_position_ids") != expected:
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_POSITION_MISMATCH")
+        selected.append(chunk)
+        segment_boundaries.append((start, end))
+        anchored_source_tokens += end - start
+        anchored_gist_tokens += len(expected)
+        anchored_encoder_tokens += encoder_len
+        if end <= len(system_ids):
+            anchored_system_delta -= end - start
+        elif start >= cursor:
+            anchored_workspace_delta -= end - start
+        else:
+            raise ValueError("C2KV_NATIVE_TOOL_GIST_CROSSES_REGION")
+
     unique: dict[str, Mapping[str, Any]] = {}
     # Match EventNativeGenerator's always-compress phase and keep selected
     # chunks most-recent in the bounded pool before packed generation.
@@ -277,7 +370,48 @@ def plan_native_packed_request(
         unique.setdefault(chunk["handle"], chunk)
 
     presented_encoder_tokens = sum(len(chunk["token_ids"]) for chunk in selected)
-    resident_tokens = len(system_ids) + len(workspace_ids) + gist_tokens
+    resident_tokens = (len(system_ids) + len(workspace_ids) + gist_tokens
+                       + anchored_gist_tokens - anchored_source_tokens)
+    gist_tokens += anchored_gist_tokens
+    raw_tool_source_tokens = 0
+    raw_tool_resident_tokens = 0
+    system_delta = anchored_system_delta
+    workspace_delta = anchored_workspace_delta
+    occupied = list(segment_boundaries)
+    for segment in raw_tool_segments:
+        start, end = segment.get("token_start"), segment.get("token_end")
+        token_len = segment.get("token_len")
+        if (type(start) is not int or type(end) is not int
+                or not 0 <= start < end <= len(logical_ids)):
+            raise ValueError("C2KV_NATIVE_RAW_TOOL_SPAN_INVALID")
+        if type(token_len) is not int or not 0 < token_len <= end - start:
+            raise ValueError("C2KV_NATIVE_RAW_TOOL_LENGTH_INVALID")
+        if not segment.get("repair_key_hashes"):
+            raise ValueError("C2KV_NATIVE_RAW_TOOL_KEYS_REQUIRED")
+        if any(start < right and left < end for left, right in occupied):
+            raise ValueError("C2KV_NATIVE_RAW_TOOL_SPAN_OVERLAP")
+        occupied.append((start, end))
+        raw_tool_source_tokens += end - start
+        raw_tool_resident_tokens += token_len
+        if end <= len(system_ids):
+            system_delta += token_len - (end - start)
+        elif start >= cursor:
+            workspace_delta += token_len - (end - start)
+        else:
+            raise ValueError("C2KV_NATIVE_RAW_TOOL_CROSSES_REGION")
+    resident_tokens += raw_tool_resident_tokens - raw_tool_source_tokens
+    extra_costs = {}
+    if raw_tool_segments or tool_gist_segments:
+        extra_costs = {
+            "raw_tool_source_tokens": raw_tool_source_tokens,
+            "raw_tool_resident_tokens": raw_tool_resident_tokens,
+            "system_prefix_kv_tokens": len(system_ids) + system_delta,
+            "workspace_resident_kv_tokens": len(workspace_ids) + workspace_delta,
+            "anchored_tool_source_tokens": anchored_source_tokens,
+            "anchored_tool_gist_tokens": anchored_gist_tokens,
+            "anchored_tool_encoder_tokens": anchored_encoder_tokens,
+            "canonical_position_tokens": len(logical_ids) + anchored_encoder_tokens - anchored_source_tokens,
+        }
     return NativePackedPlan(
         logical_input_ids=tuple(logical_ids),
         segment_boundaries=tuple(segment_boundaries),
@@ -295,6 +429,7 @@ def plan_native_packed_request(
             "gist_prefix_kv_tokens": gist_tokens,
             "raw_workspace_kv_tokens": len(workspace_ids),
             "resident_kv_tokens": resident_tokens,
+            **extra_costs,
         },
     )
 

@@ -135,8 +135,17 @@ class Session:
                 abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
-                _, last_req_node = self.req_nodes.popitem()
-                last_req = last_req_node.req
+                last_req_node = next(iter(self.req_nodes.values()))
+                if not last_req_node.req.finished():
+                    # The prior request still owns the live KV. Replacing its
+                    # node would detach it before SessionAwareCache can save
+                    # the slot, leaving the incoming continuation orphaned.
+                    abort = True
+                    abort_message = "Streaming session previous request has not finished."
+                    last_req_node = None
+                else:
+                    self.req_nodes.clear()
+                    last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
@@ -185,13 +194,39 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
+            session_output_ids = last_req.output_ids[
+                : last_req.sampling_params.max_new_tokens
+            ]
+            if (
+                persistent_history_session
+                and not session_params.drop_previous_output
+                and (hint or {}).get("persistent_session_computed_prefix_tokens")
+                is not None
+            ):
+                active_output_ids = getattr(
+                    last_req, "persistent_session_active_output_ids", None
+                )
+                if active_output_ids is None:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_ACTIVE_OUTPUT_UNAVAILABLE"
+                    )
+                session_output_ids = list(active_output_ids)
+            input_ids = last_req.origin_input_ids + session_output_ids
 
             if session_params.drop_previous_output:
                 input_ids = last_req.origin_input_ids[:]
+                drop_prefix = int(
+                    (hint or {}).get(
+                        "persistent_session_drop_generation_prefix_tokens"
+                    )
+                    or 0
+                )
+                if drop_prefix:
+                    if not persistent_history_session or not 0 < drop_prefix < len(input_ids):
+                        raise ValueError(
+                            "PERSISTENT_HISTORY_RECOVERY_INVALID_GENERATION_PREFIX"
+                        )
+                    input_ids = input_ids[:-drop_prefix]
 
             if session_params.offset and session_params.offset != 0:
                 input_ids = input_ids[: session_params.offset] + req.input_ids
@@ -199,11 +234,12 @@ class Session:
                 input_ids += req.input_ids
 
             input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+                last_req.origin_input_ids_unpadded + session_output_ids
             )
             if session_params.drop_previous_output:
                 input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+                if drop_prefix:
+                    input_ids_unpadded = input_ids_unpadded[:-drop_prefix]
 
             if session_params.offset and session_params.offset != 0:
                 input_ids_unpadded = (
@@ -244,6 +280,7 @@ class Session:
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
+            new_req.check_finished()
         elif self.streaming:
             if last_req is not None:
                 last_req.session = None
@@ -293,10 +330,12 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
+        active_req = None
         if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
+                active_req = req
                 req.session = None
 
         # Release multimodal features held by session requests.
@@ -311,7 +350,7 @@ class SessionController:
             node.req.multimodal_inputs = None
 
         if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(session_id)
+            self.tree_cache.release_session(session_id, active_req=active_req)
         del self.sessions[session_id]
 
     def maybe_reap(self, now: float, interval: float = 1.0):
@@ -319,7 +358,13 @@ class SessionController:
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
             timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
+                sid
+                for sid, session in self.sessions.items()
+                if session.is_timed_out()
+                and not (
+                    session.streaming
+                    and any(not node.req.finished() for node in session.req_nodes.values())
+                )
             ]
             for sid in timed_out:
                 logger.info(f"Session {sid} timed out, closing.")

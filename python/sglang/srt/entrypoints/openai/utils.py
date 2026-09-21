@@ -70,11 +70,16 @@ def process_hidden_states_from_ret(
 
     hidden_states = ret_item["meta_info"].get("hidden_states", None)
     if hidden_states is not None:
+        if getattr(request, "c2kv_return_full_hidden_states", False):
+            return hidden_states
         if getattr(request, "c2kv_prompt_last_hidden_only", False):
             # Scheduler storage is request -> captured rows -> hidden vector.
-            # Prompt-last mode has singleton outer dimensions; remove only
-            # those dimensions and preserve the numeric hidden vector.
-            prompt_last = hidden_states[-1] if isinstance(hidden_states, list) and hidden_states else hidden_states
+            # Remove only singleton container dimensions.
+            prompt_last = (
+                hidden_states[-1]
+                if isinstance(hidden_states, list) and hidden_states
+                else hidden_states
+            )
             while (
                 isinstance(prompt_last, list)
                 and len(prompt_last) == 1

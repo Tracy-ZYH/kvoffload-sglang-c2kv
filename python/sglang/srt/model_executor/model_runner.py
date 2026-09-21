@@ -256,6 +256,15 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def _requires_reference_attention_eager(forward_batch):
+    """Reference KV tensors and query capture are request-specific Python state."""
+    return any(
+        item is not None
+        for name in ("history_kv_reference_configs", "history_kv_reference_states")
+        for item in (getattr(forward_batch, name, None) or ())
+    )
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -1161,6 +1170,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            if getattr(self.server_args, "c2kv_tool_gist_weights", None):
+                # Second gist projection set (tool-definition compression).
+                # Loaded inside the weights region so it is accounted as model
+                # memory before the KV pool is sized.
+                if not hasattr(self.model, "load_c2kv_tool_gist_weights"):
+                    raise ValueError(
+                        "--c2kv-tool-gist-weights is only supported by C2KV "
+                        f"models with a tool gist loader, not {type(self.model).__name__}"
+                    )
+                self.model.load_c2kv_tool_gist_weights()
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -1170,9 +1189,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         elif self.device == "cuda":
-            # Release temporary loader/module cycles before sizing the KV pool.
-            # FP32 tensors converted to BF16 can otherwise survive until an
-            # unrelated Python garbage-collection cycle.
+            # Collect temporary loader/module cycles before sizing the KV pool.
+            # FP32 checkpoint tensors cast to BF16 may otherwise remain alive
+            # until a later, unrelated Python garbage-collection cycle.
             import gc
 
             gc.collect()
@@ -1248,6 +1267,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        if os.environ.get("C2KV_PAPER_TELEMETRY") == "1" and self.device == "cuda":
+            parameter_bytes = {}
+            for parameter in self.model.parameters():
+                dtype_name = str(parameter.dtype)
+                parameter_bytes[dtype_name] = (
+                    parameter_bytes.get(dtype_name, 0)
+                    + parameter.numel() * parameter.element_size()
+                )
+            buffer_storages = {}
+            for buffer in self.model.buffers():
+                storage = buffer.untyped_storage()
+                buffer_storages[(str(buffer.device), storage.data_ptr())] = (
+                    storage.nbytes()
+                )
+            logger.info(
+                "Paper model footprint: parameter_bytes=%s unique_buffer_storage_bytes=%s allocated_bytes=%s reserved_bytes=%s",
+                parameter_bytes,
+                sum(buffer_storages.values()),
+                torch.cuda.memory_allocated(self.gpu_id),
+                torch.cuda.memory_reserved(self.gpu_id),
+            )
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
@@ -2668,7 +2708,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
 
         can_run_graph = (
-            self.piecewise_cuda_graph_runner is not None
+            not _requires_reference_attention_eager(forward_batch)
+            and self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
 
@@ -2736,9 +2777,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         compression_ratio: int,
+        projection_set: str = "history",
     ):
         """
         Run C2KV extraction for one document.
+
+        ``projection_set`` selects the gist encoder: "history" is the served
+        checkpoint's own set, "tool" the optional --c2kv-tool-gist-weights set.
 
         Returns:
             key_values: List[(K, V)] per layer
@@ -2747,11 +2792,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         compression_ratio = self.get_c2kv_compression_ratio(compression_ratio)
         if getattr(self.model, "full_length_pic", False):
+            if projection_set != "history":
+                raise ValueError(
+                    "C2KV PIC extraction has no alternative projection set"
+                )
             return self.model.generate_pic(
                 input_ids, attention_mask, ratio=compression_ratio
             )
         return self.model.generate_gist(
-            input_ids, attention_mask, ratio=compression_ratio
+            input_ids,
+            attention_mask,
+            ratio=compression_ratio,
+            projection_set=projection_set,
         )
 
     def forward_c2kv_repair_extract(
@@ -2878,7 +2930,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            not _requires_reference_attention_eager(forward_batch)
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

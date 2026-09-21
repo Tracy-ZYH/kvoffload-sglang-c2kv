@@ -50,6 +50,18 @@ else:
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+    # Opt-in paper telemetry correlation. These fields are inert unless the
+    # scheduler process has C2KV_PAPER_TELEMETRY=1.
+    c2kv_outer_request_id: Optional[str] = field(default=None, kw_only=True)
+    c2kv_measurement_phase: Optional[str] = field(default=None, kw_only=True)
+    c2kv_paper_whole_full_kv_tokens: Optional[int] = field(default=None, kw_only=True)
+    c2kv_paper_whole_full_source: Optional[str] = field(default=None, kw_only=True)
+    c2kv_paper_history_full_kv_tokens: Optional[int] = field(default=None, kw_only=True)
+    c2kv_paper_history_active_kv_tokens: Optional[int] = field(default=None, kw_only=True)
+    c2kv_paper_canonical_full_source: bool = field(default=False, kw_only=True)
+    c2kv_paper_denominator_tokenization_duration_ns: Optional[int] = field(
+        default=None, kw_only=True
+    )
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -2061,6 +2073,10 @@ class C2KVSegmentInfo:
         repair_key_hashes: Optional[List[str]] = None,
         use_gist_projection: Optional[bool] = None,
         repair_placement: Optional[str] = None,
+        region: Optional[str] = None,
+        source_token_count: Optional[int] = None,
+        source_token_end: Optional[int] = None,
+        expected_token_len: Optional[int] = None,
     ):
         self.key_hash = key_hash
         self.token_start = token_start
@@ -2075,6 +2091,10 @@ class C2KVSegmentInfo:
         # (None = derive from the entry's repair_mode, legacy behaviour).
         # See c2kv/c2kv_serving_semantics.md, "Repair placement".
         self.repair_placement = repair_placement
+        self.region = region
+        self.source_token_count = source_token_count
+        self.source_token_end = source_token_end
+        self.expected_token_len = expected_token_len
 
 
 @dataclass
@@ -2087,6 +2107,9 @@ class TokenizedExtractReqInput(BaseReq):
     # A caller enforcing an extraction budget can still reuse an existing
     # entry while forbidding this request from launching a new encoder pass.
     allow_cache_miss: bool = True
+    # Gist encoder: "history" (served checkpoint) or "tool"
+    # (--c2kv-tool-gist-weights).  Part of the cache key when not "history".
+    projection_set: str = "history"
 
 
 @dataclass
@@ -2097,8 +2120,11 @@ class C2KVExtractReqOutput(BaseReq):
     gist_len: int = 0
     original_seq_len: int = 0
     cache_hit: bool = False
+    extraction_duration_ns: Optional[int] = None
+    gist_generation_duration_ns: Optional[int] = None
     error: str = ""
     success: bool = True
+    paper_measurement: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -2155,6 +2181,7 @@ class C2KVRepairExtractReqOutput(BaseReq):
     # effective_recomp_ratio, deviation stats, config echo.
     kv_reuse_method: Optional[str] = None
     cacheblend: Optional[Dict[str, Any]] = None
+    paper_measurement: Optional[Dict[str, Any]] = None
     # Rotation state of the STORED entry: True = K is post-RoPE at its native
     # absolute positions (can only be re-placed there); False = pre-RoPE and
     # therefore eligible for the append_tail placement.

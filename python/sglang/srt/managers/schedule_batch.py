@@ -559,17 +559,19 @@ class MultimodalInputs:
 class C2KVPrefillRound:
     """One round of C2KV multi-round prefill."""
 
-    __slots__ = ("tokens", "post_inject_seg_indices", "post_history_kv_eviction")
+    __slots__ = ("tokens", "post_inject_seg_indices", "post_history_kv_eviction", "collect_history_kv_scores")
 
     def __init__(
         self,
         tokens: List[int],
         post_inject_seg_indices: List[int],
         post_history_kv_eviction: bool = False,
+        collect_history_kv_scores: bool = False,
     ):
         self.tokens = tokens
         self.post_inject_seg_indices = post_inject_seg_indices
         self.post_history_kv_eviction = post_history_kv_eviction
+        self.collect_history_kv_scores = collect_history_kv_scores
 
 
 class Req(ReqDllmMixin):
@@ -923,6 +925,22 @@ class Req(ReqDllmMixin):
         self.history_kv_eviction_result = None
         self.history_kv_eviction_report_snapshot = None
         self.history_kv_selection_scores = None
+        # Method-owned, per-layer/per-KV-head history tensors used by the
+        # correctness-first reference attention route.  This cannot live in
+        # req_to_token because that table has one shared token axis.
+        self.history_kv_reference_state = None
+        self.history_kv_reference_config = None
+        self.history_kv_runtime_state = None
+        # Generation-start snapshots let a recovery append roll back only the
+        # just-generated token stream. Normal exact-token continuations keep
+        # the post-checkpoint state instead.
+        self.reference_decode_persistent_state = None
+        self.reference_decode_baseline_position_correction = None
+        self.reference_decode_baseline_resident_positions = None
+        self.reference_decode_baseline_kv_len = None
+        self.reference_decode_baseline_runtime_state = None
+        self.reference_decode_logical_start = None
+        self.persistent_session_active_output_ids = None
         self.c2kv_persistent_active_input_ids = None
         # Machine-readable reason for the last failed C2KV injection, so the
         # abort surfaced to the client can say WHY (e.g.
@@ -2575,15 +2593,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     isinstance(config, dict)
                     and getattr(r, "c2kv_rounds", None) is not None
                     and r.c2kv_round_idx < len(r.c2kv_rounds)
-                    and getattr(
+                    and (getattr(
                         r.c2kv_rounds[r.c2kv_round_idx],
                         "post_history_kv_eviction",
                         False,
-                    )
+                    ) or getattr(r.c2kv_rounds[r.c2kv_round_idx], "collect_history_kv_scores", False))
                 ):
                     c2kv_history_kv_eviction_configs.append(dict(config))
                 else:
                     c2kv_history_kv_eviction_configs.append(None)
+        history_kv_reference_states = [
+            getattr(r, "history_kv_reference_state", None) for r in self.reqs
+        ]
+        history_kv_reference_configs = [
+            getattr(r, "history_kv_reference_config", None) for r in self.reqs
+        ]
+        history_kv_runtime_states = [
+            getattr(r, "history_kv_runtime_state", None) for r in self.reqs
+        ]
+        history_kv_resident_positions = [
+            list(getattr(r, "history_kv_resident_positions", None) or [])
+            for r in self.reqs
+        ]
 
         if os.environ.get("C2KV_DEBUG_POSITIONS") == "1":
             print(
@@ -2659,6 +2690,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 c2kv_gist_projection_start_positions
             ),
             c2kv_history_kv_eviction_configs=c2kv_history_kv_eviction_configs,
+            history_kv_reference_states=history_kv_reference_states,
+            history_kv_reference_configs=history_kv_reference_configs,
+            history_kv_runtime_states=history_kv_runtime_states,
+            history_kv_resident_positions=history_kv_resident_positions,
         )
 
     def get_capture_hidden_mode(self) -> CaptureHiddenMode:
@@ -2881,3 +2916,7 @@ class ModelWorkerBatch:
     c2kv_use_gist_projection: Optional[List[bool]] = None
     c2kv_gist_projection_start_positions: Optional[List[int]] = None
     c2kv_history_kv_eviction_configs: Optional[List[Optional[Dict[str, Any]]]] = None
+    history_kv_reference_states: Optional[List[Any]] = None
+    history_kv_reference_configs: Optional[List[Optional[Dict[str, Any]]]] = None
+    history_kv_runtime_states: Optional[List[Any]] = None
+    history_kv_resident_positions: Optional[List[List[int]]] = None

@@ -661,6 +661,9 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        # A disabled radix cache can still be wrapped by SessionAwareCache.
+        # Its streaming continuation already owns a resident KV prefix.
+        prefix_len = len(req.prefix_indices)
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
@@ -728,7 +731,7 @@ class PrefillAdder:
             # Non-chunked prefill
             self.can_run_list.append(req)
             self._update_prefill_budget(
-                0,
+                prefix_len,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
@@ -740,10 +743,10 @@ class PrefillAdder:
             trunc_len = self.rem_chunk_tokens
 
             req.set_extend_input_len(trunc_len)
-            req.fill_ids = req.fill_ids[:trunc_len]
+            req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
 

@@ -598,6 +598,13 @@ class ServerArgs:
     # Changing it changes the served prompt. See
     # c2kv/c2kv_serving_semantics.md.
     c2kv_tools_dump: str = "full"
+    # Second, independent gist projection set used ONLY by extraction requests
+    # that ask for ``projection_set="tool"`` (tool-definition compression with a
+    # T0 checkpoint).  Points at a checkpoint directory or a gist export package
+    # (``c2kv-gist.safetensors`` + ``config.json``) whose base weights are the
+    # served model's.  Decode never touches it: ordinary tokens keep the base
+    # projections, so CUDA graphs and the history path are unaffected.
+    c2kv_tool_gist_weights: Optional[str] = None
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -802,6 +809,16 @@ class ServerArgs:
             raise ValueError(
                 "--c2kv-tools-dump must be 'full' or 'exclude_unset'."
             )
+        if self.c2kv_tool_gist_weights is not None:
+            if not self.enable_c2kv:
+                raise ValueError("--c2kv-tool-gist-weights requires --enable-c2kv.")
+            tool_dir = os.path.expanduser(self.c2kv_tool_gist_weights)
+            if not os.path.isfile(os.path.join(tool_dir, "config.json")):
+                raise ValueError(
+                    "--c2kv-tool-gist-weights must be a checkpoint or gist "
+                    f"package directory containing config.json: {tool_dir}"
+                )
+            self.c2kv_tool_gist_weights = tool_dir
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -5324,6 +5341,17 @@ class ServerArgs:
             "frame. Applies to /v1/chat/completions and the messages form of "
             "/v1/c2kv/repair_extract together. Changing it changes the served "
             "prompt. See c2kv/c2kv_serving_semantics.md.",
+        )
+        parser.add_argument(
+            "--c2kv-tool-gist-weights",
+            type=str,
+            default=ServerArgs.c2kv_tool_gist_weights,
+            help="Directory of a second gist checkpoint (full checkpoint or "
+            "c2kv-gist.safetensors export package) whose gist projections are "
+            "loaded next to the served checkpoint's as the 'tool' projection "
+            "set. Only /v1/c2kv/extract and native chunks that request "
+            "projection_set='tool' use it; decode always uses base "
+            "projections. See c2kv/c2kv_serving_semantics.md.",
         )
 
         # Ktransformer server args

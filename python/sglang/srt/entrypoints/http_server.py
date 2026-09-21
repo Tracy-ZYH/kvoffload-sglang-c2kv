@@ -84,6 +84,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     C2KVNativePackedGenerateRequest,
     C2KVRepairExtractRequest,
     C2KVRepairExtractResponse,
+    C2KVTokenizeRequest,
+    C2KVTokenizeResponse,
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
@@ -591,6 +593,11 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
+        "model_dimensions": {
+            key: getattr(model_config.hf_config, key, None)
+            for key in ("hidden_size", "intermediate_size", "num_hidden_layers",
+                        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size")
+        },
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         "c2kv_native_packed": _c2kv_native_capability(),
         # "hf_config": model_config.hf_config.to_dict(),
@@ -731,6 +738,40 @@ def _c2kv_dtype_nbytes(dtype_name: str) -> int:
     raise ValueError(f"Unsupported C2KV KV dtype for accounting: {dtype_name!r}")
 
 
+def _c2kv_tool_gist_capability(server_args) -> Dict[str, Any]:
+    """The optional second ("tool") gist set, as clients must bind to it.
+
+    ``identity`` is the same string the model process attaches to every
+    extraction key of that set (``c2kv_tool_gist_identity``), derived from
+    the checkpoint's on-disk metadata, so no model RPC is needed here.
+    """
+    source = getattr(server_args, "c2kv_tool_gist_weights", None)
+    if not source:
+        return {"enabled": False, "source": None, "identity": None, "metadata": None}
+    import json as _json
+    import hashlib as _hashlib
+
+    from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        config = _json.load(handle)
+    with open(os.path.join(source, "config.json"), "rb") as handle:
+        config_sha256 = _hashlib.sha256(handle.read()).hexdigest()
+    metadata = {
+        key: value
+        for key, value in config.items()
+        if key.startswith("history_memory_") or key.startswith("gist_")
+    }
+    return {
+        "enabled": True,
+        "source": str(source),
+        "identity": c2kv_tool_gist_identity(source),
+        "metadata": metadata,
+        "config_sha256": config_sha256,
+        "extract_projection_set": "tool",
+    }
+
+
 def _c2kv_native_capability() -> Dict[str, Any]:
     tokenizer_manager = _global_state.tokenizer_manager
     server_args = tokenizer_manager.server_args
@@ -787,6 +828,7 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "packing_version": C2KV_NATIVE_PACKING_VERSION,
         "raw_layout_profile": C2KV_NATIVE_RAW_LAYOUT_PROFILE,
         "model_binding": model_binding,
+        "tool_gist": _c2kv_tool_gist_capability(server_args),
         "parameter_version": model_binding["weight_version"],
         "kv_bytes_per_token": kv_bytes_per_token,
         "num_hidden_layers": num_layers,
@@ -799,10 +841,66 @@ def _c2kv_native_capability() -> Dict[str, Any]:
         "gist_parameter_dtype": "float32",
         "gist_compute_dtype": dtype_name,
         "base_query_enforced": True,
+        "sampling_profiles": ["greedy-v1", "acebench-agent-v1"],
         "server_default_query_projection": getattr(
             server_args, "c2kv_query_proj", "base"
         ),
     }
+
+
+def _c2kv_native_sampling_params(
+    request: C2KVNativePackedGenerateRequest,
+) -> Dict[str, Any]:
+    """Validate the named native sampler without changing accepted parameters."""
+
+    sampling_params = dict(request.sampling_params)
+    if sampling_params.get("n", 1) != 1:
+        raise ValueError("C2KV native packed generation supports only n=1")
+    if sampling_params.get("max_new_tokens", 0) <= 0:
+        raise ValueError("sampling_params.max_new_tokens must be positive")
+
+    if request.sampling_profile == "acebench-agent-v1":
+        allowed = {"max_new_tokens", "temperature", "top_p", "stop_token_ids", "n"}
+        unexpected = set(sampling_params) - allowed
+        if unexpected:
+            raise ValueError(
+                "ACEBench Agent native sampling profile disallows: "
+                + ", ".join(sorted(unexpected))
+            )
+        if (
+            type(sampling_params.get("temperature")) not in (int, float)
+            or float(sampling_params["temperature"]) != 0.001
+            or type(sampling_params.get("top_p")) not in (int, float)
+            or float(sampling_params["top_p"]) != 1.0
+        ):
+            raise ValueError(
+                "ACEBench Agent native sampling profile requires "
+                "temperature=0.001 and top_p=1"
+            )
+    elif request.sampling_profile == "greedy-v1":
+        sampling_params.setdefault("temperature", 0.0)
+        if float(sampling_params["temperature"]) != 0.0:
+            raise ValueError("C2KV native packed generation requires greedy decoding")
+    else:
+        raise ValueError("Unknown C2KV native sampling profile")
+    return sampling_params
+
+
+def _c2kv_native_whole_full_measurement(request, plan):
+    """Use the raw Full renderer count when tool KV changes the prompt frame."""
+    supplied = request.paper_whole_full_kv_tokens
+    if supplied is not None:
+        if type(supplied) is not int or supplied <= 0:
+            raise ValueError("paper_whole_full_kv_tokens must be a positive integer")
+        return supplied, "client_native_full_renderer"
+    has_tool_memory = bool(request.raw_tool_segments or request.tool_gist_segments)
+    has_tool_memory |= any(
+        chunk.projection_set == "tool"
+        for chunk in (*request.encoder_chunks, *request.compression_chunks)
+    )
+    if has_tool_memory:
+        return None, "unknown_missing_client_native_full_renderer"
+    return len(plan.logical_input_ids), "native_logical_input_ids"
 
 
 @app.post("/v1/c2kv/native_generate", response_class=SGLangORJSONResponse)
@@ -822,14 +920,9 @@ async def v1_c2kv_native_generate(
             )
         if request.max_extraction_calls < 0:
             raise ValueError("max_extraction_calls must be nonnegative")
-        sampling_params = dict(request.sampling_params)
-        if sampling_params.get("n", 1) != 1:
-            raise ValueError("C2KV native packed generation supports only n=1")
-        if sampling_params.get("max_new_tokens", 0) <= 0:
-            raise ValueError("sampling_params.max_new_tokens must be positive")
-        sampling_params.setdefault("temperature", 0.0)
-        if float(sampling_params["temperature"]) != 0.0:
-            raise ValueError("C2KV native packed generation requires greedy decoding")
+        if request.max_tool_extraction_calls is not None and request.max_tool_extraction_calls < 0:
+            raise ValueError("max_tool_extraction_calls must be nonnegative")
+        sampling_params = _c2kv_native_sampling_params(request)
 
         shadow_request = request.shadow_features
         shadow_enabled = bool(
@@ -869,21 +962,51 @@ async def v1_c2kv_native_generate(
             raw_layout_profile=request.raw_layout_profile,
             encoding_scope=request.encoding_scope,
             compression_ratio=request.compression_ratio,
+            # Absent on capability dicts built before the tool set existed:
+            # then only history chunks can be planned.
+            tool_binding=capability.get("tool_gist"),
+            raw_tool_segments=[item.model_dump() for item in request.raw_tool_segments],
+            tool_gist_segments=[item.model_dump() for item in request.tool_gist_segments],
+        )
+        paper_whole_full, paper_whole_full_source = (
+            _c2kv_native_whole_full_measurement(request, plan)
         )
 
         resolved: Dict[str, Dict[str, Any]] = {}
         cache_hits = 0
         cache_misses = 0
+        projection_misses = {"tool": 0, "history": 0}
         materialized_encoder_tokens = 0
         scope_reused_encoder_tokens = 0
         base_rid = request.rid or f"c2kv-native-{time.time_ns()}"
+        outer_request_id = (
+            raw_request.headers.get("X-C2KV-Measurement-Request-Id")
+            or request.generation_id
+            or base_rid
+        )
+        measurement_phase_prefix = (
+            raw_request.headers.get("X-C2KV-Measurement-Phase") or "c2kv_native"
+        )
+        extraction_phase = f"{measurement_phase_prefix}:extraction"
+        generation_phase = f"{measurement_phase_prefix}:generation"
+        extraction_telemetry = []
         for index, chunk in enumerate(plan.unique_chunks):
+            extraction_rid = f"{base_rid}:extract:{index}"
+            projection = chunk.get("projection_set") or "history"
+            if request.max_tool_extraction_calls is None:
+                allow_cache_miss = cache_misses < request.max_extraction_calls
+            else:
+                projection_budget = request.max_tool_extraction_calls if projection == "tool" else request.max_extraction_calls
+                allow_cache_miss = projection_misses[projection] < projection_budget
             result = await tokenizer_manager.c2kv_extract(
                 input_ids=list(chunk["token_ids"]),
                 input_text="",
-                compression_ratio=request.compression_ratio,
-                rid=f"{base_rid}:extract:{index}",
-                allow_cache_miss=cache_misses < request.max_extraction_calls,
+                compression_ratio=chunk.get("compression_ratio") or request.compression_ratio,
+                rid=extraction_rid,
+                allow_cache_miss=allow_cache_miss,
+                outer_request_id=outer_request_id,
+                measurement_phase=extraction_phase,
+                projection_set=chunk.get("projection_set") or "history",
             )
             if not result.success:
                 raise ValueError(result.error)
@@ -892,12 +1015,18 @@ async def v1_c2kv_native_generate(
                     "C2KV native extraction returned an inconsistent source length: "
                     f"{result.original_seq_len} != {len(chunk['token_ids'])}"
                 )
+            if projection == "tool":
+                ratio = chunk.get("compression_ratio") or request.compression_ratio
+                expected_gist_len = (len(chunk["token_ids"]) + ratio - 1) // ratio
+                if result.gist_len != expected_gist_len:
+                    raise ValueError("C2KV_NATIVE_TOOL_GIST_LENGTH_MISMATCH")
             cache_hit = bool(result.cache_hit)
             if cache_hit:
                 cache_hits += 1
                 scope_reused_encoder_tokens += len(chunk["token_ids"])
             else:
                 cache_misses += 1
+                projection_misses[projection] += 1
                 materialized_encoder_tokens += len(chunk["token_ids"])
             resolved[chunk["handle"]] = {
                 "chunk_id": chunk["chunk_id"],
@@ -906,9 +1035,30 @@ async def v1_c2kv_native_generate(
                 "cache_hit": cache_hit,
                 "gist_len": result.gist_len,
                 "original_seq_len": result.original_seq_len,
+                "request_id": extraction_rid,
+                "extraction_duration_ns": result.extraction_duration_ns,
+                "gist_generation_duration_ns": (
+                    result.gist_generation_duration_ns
+                ),
             }
+            extraction_telemetry.append(
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "handle": chunk["handle"],
+                    "outer_request_id": outer_request_id,
+                    "server_request_id": extraction_rid,
+                    "phase": extraction_phase,
+                    "cache_hit": cache_hit,
+                    "extraction_duration_ns": result.extraction_duration_ns,
+                    "gist_generation_duration_ns": (
+                        result.gist_generation_duration_ns
+                    ),
+                    "paper_measurement": result.paper_measurement,
+                }
+            )
 
         segments = []
+        chunks_by_handle = {item["handle"]: item for item in plan.unique_chunks}
         for handle, (token_start, token_end) in zip(
             plan.selected_handles, plan.segment_boundaries
         ):
@@ -918,8 +1068,30 @@ async def v1_c2kv_native_generate(
                     token_start=token_start,
                     token_end=token_end,
                     use_gist_projection=False,
+                    region="tool" if chunks_by_handle[handle].get("projection_set") == "tool" else None,
+                    source_token_count=len(chunks_by_handle[handle]["token_ids"]) if chunks_by_handle[handle].get("projection_set") == "tool" else None,
                 )
             )
+
+        for item in request.raw_tool_segments:
+            segments.append(C2KVSegmentInfo(
+                token_start=item.token_start,
+                token_end=item.token_end,
+                repair_key_hashes=list(item.repair_key_hashes),
+                repair_placement=item.repair_placement,
+                use_gist_projection=False,
+                region="tool",
+                source_token_count=item.token_end - item.token_start,
+                source_token_end=item.token_end,
+                expected_token_len=item.token_len,
+            ))
+        if request.tool_gist_segments or request.raw_tool_segments:
+            segments.sort(key=lambda segment: (segment.token_start, segment.token_end != segment.token_start))
+
+        history_chunks = [chunk for chunk in encoder_chunks if chunk.get("projection_set") != "tool"]
+        history_source_tokens = sum(len(chunk["token_ids"]) for chunk in history_chunks)
+        history_gist_tokens = sum((len(chunk["token_ids"]) + (chunk.get("compression_ratio") or request.compression_ratio) - 1)
+                                 // (chunk.get("compression_ratio") or request.compression_ratio) for chunk in history_chunks)
 
         generation_request = GenerateReqInput(
             rid=base_rid,
@@ -937,6 +1109,13 @@ async def v1_c2kv_native_generate(
             # The selected C1000 checkpoint contract uses ordinary/base query
             # projections after injected gist KV.
             c2kv_use_gist_projection=False,
+            c2kv_outer_request_id=outer_request_id,
+            c2kv_measurement_phase=generation_phase,
+            c2kv_paper_whole_full_kv_tokens=paper_whole_full,
+            c2kv_paper_whole_full_source=paper_whole_full_source,
+            c2kv_paper_history_full_kv_tokens=history_source_tokens,
+            c2kv_paper_history_active_kv_tokens=history_gist_tokens,
+            c2kv_paper_canonical_full_source=True,
         )
         generated = await tokenizer_manager.generate_request(
             generation_request, raw_request
@@ -965,12 +1144,11 @@ async def v1_c2kv_native_generate(
                 prefill_state = prefill_state[-1]
             if not isinstance(prefill_state, list) or not prefill_state:
                 raise ValueError("C2KV native prompt_last hidden state is malformed")
-            logical_position = (
+            logical_position = plan.costs.get("canonical_position_tokens", (
                 len(request.system_input_ids)
                 + sum(len(chunk.token_ids) for chunk in request.encoder_chunks)
                 + len(request.workspace_input_ids)
-                - 1
-            )
+            )) - 1
             shadow_features = {
                 "schema": "event-native-shadow-features-v1",
                 "status": "captured",
@@ -1005,13 +1183,13 @@ async def v1_c2kv_native_generate(
                 "materialized_encoder_tokens": materialized_encoder_tokens,
                 "scope_reused_encoder_tokens": scope_reused_encoder_tokens,
                 "system_prefix_kv_logical_bytes": (
-                    costs["system_tokens"] * kv_bytes_per_token
+                    costs.get("system_prefix_kv_tokens", costs["system_tokens"]) * kv_bytes_per_token
                 ),
                 "gist_prefix_kv_logical_bytes": (
                     costs["gist_prefix_kv_tokens"] * kv_bytes_per_token
                 ),
                 "raw_workspace_kv_logical_bytes": (
-                    costs["raw_workspace_kv_tokens"] * kv_bytes_per_token
+                    costs.get("workspace_resident_kv_tokens", costs["raw_workspace_kv_tokens"]) * kv_bytes_per_token
                 ),
                 "resident_kv_logical_bytes": (
                     costs["resident_kv_tokens"] * kv_bytes_per_token
@@ -1025,13 +1203,29 @@ async def v1_c2kv_native_generate(
             if isinstance(finish_reason_detail, dict)
             else finish_reason_detail
         )
+        kv_runtime_stats = meta_info.get("kv_runtime_stats")
+        generation_paper_measurement = (
+            kv_runtime_stats.get("paper_measurement")
+            if isinstance(kv_runtime_stats, dict)
+            else None
+        )
 
         return orjson_response(
             {
                 "schema": NATIVE_PACKED_RESPONSE_SCHEMA,
                 "rid": base_rid,
+                "native_request_id": base_rid,
+                "outer_request_id": outer_request_id,
+                "request_ids": {
+                    "outer_request_id": outer_request_id,
+                    "native_generation_request_id": base_rid,
+                    "native_extraction_request_ids": [
+                        item["server_request_id"] for item in extraction_telemetry
+                    ],
+                },
                 "session_id": request.session_id,
                 "generation_id": request.generation_id,
+                "sampling_profile": request.sampling_profile,
                 "output_ids": output_ids,
                 "text": generated.get("text", ""),
                 "token_logprobs": token_logprobs,
@@ -1045,17 +1239,33 @@ async def v1_c2kv_native_generate(
                 ],
                 "extraction": {
                     "requested_chunks": len(request.encoder_chunks)
-                    + len(request.compression_chunks),
+                    + len(request.compression_chunks)
+                    + sum(len(item.chunks) if item.chunks else 1 for item in request.tool_gist_segments),
                     "unique_chunks": len(plan.unique_chunks),
                     "cache_hits": cache_hits,
                     "cache_misses": cache_misses,
                     "model_calls": cache_misses,
                     "max_extraction_calls": request.max_extraction_calls,
+                    **({"history_model_calls": projection_misses["history"],
+                        "tool_model_calls": projection_misses["tool"],
+                        "max_tool_extraction_calls": request.max_tool_extraction_calls}
+                       if request.max_tool_extraction_calls is not None else {}),
                 },
                 "costs": costs,
                 "shadow_features": shadow_features,
                 "allocator": meta_info.get("kv_memory_report"),
-                "sglang_runtime": meta_info.get("sglang_runtime"),
+                "sglang_runtime": kv_runtime_stats,
+                "paper_measurement": generation_paper_measurement,
+                "telemetry": {
+                    "outer_request_id": outer_request_id,
+                    "extractions": extraction_telemetry,
+                    "generation": {
+                        "outer_request_id": outer_request_id,
+                        "server_request_id": base_rid,
+                        "phase": generation_phase,
+                        "paper_measurement": generation_paper_measurement,
+                    },
+                },
             }
         )
     except ValueError as error:
@@ -1857,35 +2067,28 @@ async def v1_c2kv_extract(
     try:
         tokenizer_manager = _global_state.tokenizer_manager
         tokenizer = tokenizer_manager.tokenizer
-        chat_template_kwargs = request.chat_template_kwargs or {}
-
-        if request.role:
-            # Tokenize the same way the HF training code does
-            # (tokenize_for_reuse): apply chat template to get a string,
-            # then tokenize the string.  The two-step approach avoids BPE
-            # boundary differences that arise when subtracting token-ID
-            # prefixes from a jointly-tokenized multi-message sequence.
-            extract_template_kwargs = dict(chat_template_kwargs)
-            if request.tools:
-                # Render tool schemas through the SAME helper and the SAME
-                # --c2kv-tools-dump flag as the chat path, so
-                # original_seq_len measures the system block this server
-                # actually serves. Passing request.tools verbatim here made
-                # extract short by ~4 tokens per tool whenever the flag is
-                # "full" (the default), which is exactly the offset
-                # c2kv/c2kv_serving_semantics.md section 2 fixed.
-                extract_template_kwargs["tools"] = _c2kv_flat_tools(request.tools)
-            text_str = tokenizer.apply_chat_template(
-                [{"role": request.role, "content": request.text}],
-                tokenize=False,
-                add_generation_prompt=False,
-                **extract_template_kwargs,
+        if request.projection_set not in ("history", "tool"):
+            raise ValueError(
+                f"projection_set must be 'history' or 'tool', got {request.projection_set!r}"
             )
-            if tokenizer.bos_token and text_str.startswith(tokenizer.bos_token):
-                text_str = text_str[len(tokenizer.bos_token):]
-            input_ids = tokenizer.encode(text_str, add_special_tokens=False)
-            if not isinstance(input_ids, list):
-                input_ids = list(input_ids)
+        if request.token_ids is not None:
+            # Exact encoder input: the caller owns tokenization and chunking.
+            input_ids = [int(token_id) for token_id in request.token_ids]
+            if not input_ids or any(token_id < 0 for token_id in input_ids):
+                return C2KVExtractResponse(
+                    key_hash="",
+                    gist_len=0,
+                    original_seq_len=0,
+                    success=False,
+                    error="token_ids must be a non-empty list of token ids",
+                )
+        elif request.role:
+            input_ids = _c2kv_template_ids(
+                tokenizer,
+                [{"role": request.role, "content": request.text}],
+                request.tools,
+                request.chat_template_kwargs,
+            )
             if not input_ids:
                 return C2KVExtractResponse(
                     key_hash="",
@@ -1905,13 +2108,22 @@ async def v1_c2kv_extract(
             input_ids=input_ids,
             input_text=request.text,
             compression_ratio=request.compression_ratio,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
+            projection_set=request.projection_set,
         )
         return C2KVExtractResponse(
             key_hash=result.key_hash,
             gist_len=result.gist_len,
             original_seq_len=result.original_seq_len,
+            cache_hit=result.cache_hit,
+            extraction_duration_ns=result.extraction_duration_ns,
+            gist_generation_duration_ns=result.gist_generation_duration_ns,
             success=result.success,
             error=result.error or None,
+            paper_measurement=result.paper_measurement,
         )
     except Exception as e:
         return C2KVExtractResponse(
@@ -1937,6 +2149,35 @@ def _c2kv_template_ids(tokenizer, messages, tools, chat_template_kwargs):
         text_str = text_str[len(tokenizer.bos_token):]
     ids = tokenizer.encode(text_str, add_special_tokens=False)
     return list(ids)
+
+
+@app.post("/v1/c2kv/tokenize")
+async def v1_c2kv_tokenize(
+    request: C2KVTokenizeRequest,
+) -> C2KVTokenizeResponse:
+    """Count the exact extractor input tokens without scheduling model work."""
+    try:
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+        if request.role:
+            input_ids = _c2kv_template_ids(
+                tokenizer,
+                [{"role": request.role, "content": request.text}],
+                request.tools,
+                request.chat_template_kwargs,
+            )
+        else:
+            input_ids = tokenizer.encode(request.text)
+            if not isinstance(input_ids, list):
+                input_ids = list(input_ids)
+        if not input_ids:
+            return C2KVTokenizeResponse(
+                token_count=0,
+                success=False,
+                error="The message contributes no tokens after applying the chat template.",
+            )
+        return C2KVTokenizeResponse(token_count=len(input_ids))
+    except Exception as e:
+        return C2KVTokenizeResponse(token_count=0, success=False, error=str(e))
 
 
 def _render_c2kv_repair_span(tokenizer, messages, target_index, tools, chat_template_kwargs):
@@ -2232,6 +2473,10 @@ async def v1_c2kv_repair_extract(
                 history_kv_recovery_relative_indices),
             kv_reuse_method=kv_reuse_method,
             cacheblend=cacheblend_cfg,
+            outer_request_id=raw_request.headers.get(
+                "X-C2KV-Measurement-Request-Id"
+            ),
+            measurement_phase=raw_request.headers.get("X-C2KV-Measurement-Phase"),
         )
         return C2KVRepairExtractResponse(
             key_hash=result.key_hash,
@@ -2247,6 +2492,7 @@ async def v1_c2kv_repair_extract(
                 if result.serving_kv_buffer_shape is not None
                 else None
             ),
+            paper_measurement=result.paper_measurement,
             history_kv_method=result.history_kv_method,
             requested_span_tokens=result.requested_span_tokens,
             selected_token_count=result.selected_token_count,

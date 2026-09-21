@@ -512,6 +512,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
     # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
     c2kv_repair_placement: Optional[str] = None
+    c2kv_region: Optional[Literal["tool", "history"]] = None
+    c2kv_source_token_count: Optional[int] = None
+    c2kv_source_token_end: Optional[int] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -540,6 +543,9 @@ class ChatCompletionMessageUserParam(BaseModel):
     # "in_place" | "append_keep_ledger" | "append_tail"; None = legacy
     # (derived from repair_mode). See c2kv/c2kv_serving_semantics.md.
     c2kv_repair_placement: Optional[str] = None
+    c2kv_region: Optional[Literal["tool", "history"]] = None
+    c2kv_source_token_count: Optional[int] = None
+    c2kv_source_token_end: Optional[int] = None
 
 
 ChatCompletionMessageParam = Union[
@@ -644,7 +650,7 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
-    # Racer feature capture and speculative-draft session control.
+    c2kv_return_full_hidden_states: bool = False
     c2kv_prompt_last_hidden_only: bool = False
     racer_draft: bool = False
     return_routed_experts: bool = False
@@ -653,6 +659,11 @@ class ChatCompletionRequest(BaseModel):
     # Request-wide projection override. This takes precedence over message-level
     # values; None leaves resolution to the messages and --c2kv-query-proj.
     c2kv_use_gist_projection: Optional[bool] = None
+    # False = keep ``tools`` for tool-call parsing and validation but do NOT
+    # render them into the chat template: the client supplies the tool
+    # definitions itself (C2KV tool memory: gist segments after an explicit
+    # protocol block in the system message).  None/True = ordinary rendering.
+    c2kv_tools_in_prompt: Optional[bool] = None
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1570,7 +1581,7 @@ class TranscriptionStreamResponse(BaseModel):
 class C2KVExtractRequest(BaseModel):
     """Request to extract and store gist KV for a document."""
 
-    text: str
+    text: str = ""
     compression_ratio: int = Field(default=4)
     role: Optional[str] = None
     chat_template_kwargs: Optional[Dict] = None
@@ -1579,6 +1590,28 @@ class C2KVExtractRequest(BaseModel):
     # block), so original_seq_len measures the TRUE system-block length —
     # required for callers computing repair position offsets
     tools: Optional[List[Dict]] = None
+    # Exact encoder input.  When given, ``text``/``role``/``tools`` are not
+    # rendered: the caller already tokenized the document (e.g. a T0
+    # tool-definition chunk cut at the training chunk boundary).
+    token_ids: Optional[List[int]] = None
+    # "history" (served checkpoint's gist set, default) or "tool"
+    # (--c2kv-tool-gist-weights).  The set is part of the cache key.
+    projection_set: str = "history"
+
+
+class C2KVTokenizeRequest(BaseModel):
+    """Token-count-only form of C2KV document rendering (no model work)."""
+
+    text: str
+    role: Optional[str] = None
+    chat_template_kwargs: Optional[Dict] = None
+    tools: Optional[List[Dict]] = None
+
+
+class C2KVTokenizeResponse(BaseModel):
+    token_count: int = 0
+    success: bool = True
+    error: Optional[str] = None
 
 
 class C2KVNativePackedChunk(BaseModel):
@@ -1595,6 +1628,28 @@ class C2KVNativePackedChunk(BaseModel):
     # Required only when the chunk is selected for injection.
     source_position_start: Optional[int] = None
     gist_position_ids: Optional[List[int]] = None
+    # None/"history" = the served checkpoint's gist set; "tool" = the
+    # --c2kv-tool-gist-weights set (tool-definition chunks).  Part of the
+    # chunk handle when set.
+    projection_set: Optional[str] = None
+    compression_ratio: Optional[int] = None
+
+
+class C2KVNativeRawToolSegment(BaseModel):
+    """A query-conditioned tool KV selection in the native source token frame."""
+
+    token_start: int
+    token_end: int
+    repair_key_hashes: List[str]
+    token_len: int
+    repair_placement: Literal["in_place"] = "in_place"
+
+
+class C2KVNativeToolGistSegment(BaseModel):
+    token_start: int
+    token_end: int
+    chunk: Optional[C2KVNativePackedChunk] = None
+    chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
 
 
 class C2KVNativePackedGenerateRequest(BaseModel):
@@ -1613,10 +1668,15 @@ class C2KVNativePackedGenerateRequest(BaseModel):
     encoding_scope: str
     compression_ratio: int = 8
     max_extraction_calls: int
+    max_tool_extraction_calls: Optional[int] = None
     system_input_ids: List[int] = Field(default_factory=list)
     workspace_input_ids: List[int]
     encoder_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
     compression_chunks: List[C2KVNativePackedChunk] = Field(default_factory=list)
+    raw_tool_segments: List[C2KVNativeRawToolSegment] = Field(default_factory=list)
+    tool_gist_segments: List[C2KVNativeToolGistSegment] = Field(default_factory=list)
+    paper_whole_full_kv_tokens: Optional[int] = Field(default=None, gt=0, strict=True)
+    sampling_profile: Literal["greedy-v1", "acebench-agent-v1"] = "greedy-v1"
     sampling_params: Dict[str, Any]
     shadow_features: Optional[Dict[str, Any]] = None
 
@@ -1627,8 +1687,12 @@ class C2KVExtractResponse(BaseModel):
     key_hash: str
     gist_len: int
     original_seq_len: int
+    cache_hit: bool = False
+    extraction_duration_ns: Optional[int] = None
+    gist_generation_duration_ns: Optional[int] = None
     success: bool = True
     error: Optional[str] = None
+    paper_measurement: Optional[Dict[str, Any]] = None
 
 
 class C2KVRepairExtractRequest(BaseModel):
@@ -1710,6 +1774,7 @@ class C2KVRepairExtractResponse(BaseModel):
     # recomputed_relative_indices, effective_recomp_ratio, config).
     kv_reuse_method: Optional[str] = None
     cacheblend: Optional[Dict[str, Any]] = None
+    paper_measurement: Optional[Dict[str, Any]] = None
     # True when K was captured post-RoPE (serving_cache source, or the
     # "rotated" storage form) and can only be placed at its original
     # positions; False = pre-RoPE, re-rotatable (required by append_tail).

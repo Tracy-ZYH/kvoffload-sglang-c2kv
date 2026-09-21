@@ -51,7 +51,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import CloseSessionReqInput, GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -129,9 +129,19 @@ class OpenAIServingChat(OpenAIServingBase):
         # request into an exact streaming-session delta. This stores token ids
         # only; KV ownership stays in SessionAwareCache.
         self._persistent_history_sessions: Dict[str, List[int]] = {}
+        self._persistent_history_generation_prefixes: Dict[str, List[int]] = {}
+        self._persistent_history_generation_bases: Dict[str, List[int]] = {}
+        self._persistent_history_computed_prefixes: Dict[str, int] = {}
+        self._persistent_history_exact_output: Dict[str, bool] = {}
+        self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
 
     def release_persistent_history_session(self, session_id: str) -> None:
         self._persistent_history_sessions.pop(session_id, None)
+        self._persistent_history_generation_prefixes.pop(session_id, None)
+        self._persistent_history_generation_bases.pop(session_id, None)
+        self._persistent_history_computed_prefixes.pop(session_id, None)
+        self._persistent_history_exact_output.pop(session_id, None)
+        self._persistent_history_tool_segments.pop(session_id, None)
 
     @staticmethod
     def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
@@ -142,10 +152,100 @@ class OpenAIServingChat(OpenAIServingBase):
             and hint["persistent_history_session"].get("enabled")
         )
 
+    def _reconcile_exact_generated_prefix(
+        self,
+        previous: List[int],
+        full_prompt_ids: List[int],
+        mismatch_at: int,
+        hint: Dict[str, Any],
+        c2kv_segments: Optional[List] = None,
+    ) -> List[int]:
+        """Keep generated token IDs when chat re-tokenization changes their BPE.
+
+        The prior output is already resident in KV. Its decoded text must be
+        precisely the prefix of the new rendered prompt, and that text must end
+        on a canonical token boundary. Message boundaries are then translated
+        into the actual, generated-token frame before the scheduler sees them.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+
+        def decode(ids: List[int]) -> str:
+            return tokenizer.decode(
+                ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+            )
+
+        previous_text = decode(previous)
+        if not decode(full_prompt_ids).startswith(previous_text):
+            raise ValueError("exact generated prefix text changed")
+        canonical_previous = tokenizer.encode(
+            previous_text, add_special_tokens=False
+        )
+        canonical_prefix_len = len(canonical_previous)
+        if (
+            full_prompt_ids[:canonical_prefix_len] != canonical_previous
+            or decode(canonical_previous) != previous_text
+        ):
+            raise ValueError("exact generated prefix has no canonical token boundary")
+
+        delta = full_prompt_ids[canonical_prefix_len:]
+        actual_prompt_ids = previous + delta
+        shift = len(previous) - canonical_prefix_len
+
+        def remap(index: int) -> int:
+            if not 0 <= index <= len(full_prompt_ids):
+                raise ValueError("history boundary is outside the rendered prompt")
+            if index <= mismatch_at:
+                return index
+            if index >= canonical_prefix_len:
+                return index + shift
+            # Earlier generated actions can have different BPE lengths too.
+            # Match their completed-message boundaries by decoded text, not by
+            # a single shift from the most recent action.
+            target = decode(full_prompt_ids[:index])
+            low, high = 0, len(previous)
+            while low < high:
+                middle = (low + high) // 2
+                if len(decode(previous[:middle])) < len(target):
+                    low = middle + 1
+                else:
+                    high = middle
+            if decode(previous[:low]) != target:
+                raise ValueError("history boundary bisects changed tokenization")
+            return low
+
+        updates = []
+        for config_name in ("history_kv_eviction", "paper_measurement"):
+            config = hint.get(config_name)
+            if isinstance(config, dict):
+                for key in ("history_start", "history_end"):
+                    if key in config:
+                        updates.append((config, key, remap(int(config[key]))))
+        for span in hint.get("history_kv_event_token_spans") or []:
+            for key in ("start", "end"):
+                updates.append((span, key, remap(int(span[key]))))
+        for segment in hint.get("tool_memory_segments") or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(segment[key]))))
+        for segment in c2kv_segments or []:
+            for key in ("token_start", "token_end"):
+                updates.append((segment, key, remap(int(getattr(segment, key)))))
+        suffix_key = "history_kv_event_generation_suffix_start"
+        if suffix_key in hint:
+            updates.append((hint, suffix_key, remap(int(hint[suffix_key]))))
+        for config, key, value in updates:
+            if isinstance(config, dict):
+                config[key] = value
+            else:
+                setattr(config, key, value)
+        hint["persistent_session_retokenization_reconciled"] = True
+        hint["persistent_session_retokenization_token_shift"] = shift
+        return actual_prompt_ids
+
     def _prepare_persistent_history_delta(
         self,
         request: ChatCompletionRequest,
         full_prompt_ids: List[int],
+        c2kv_segments: Optional[List] = None,
     ) -> tuple[List[int], Optional[str], Optional[List[int]]]:
         """Return the exact append delta for a streaming history session."""
         if not self._is_persistent_history_request(request):
@@ -159,15 +259,23 @@ class OpenAIServingChat(OpenAIServingBase):
         expected_id = (request.c2kv_kv_memory_hint.get("persistent_history_session") or {}).get("session_id")
         if expected_id and expected_id != session_id:
             raise ValueError("PERSISTENT_HISTORY_SESSION_ID_MISMATCH")
-        # Store the canonical prompt *before* decode, not raw generated IDs.
-        # Tool parsers may return a structured assistant/tool-call message whose
-        # next-turn chat-template serialization differs from the raw completion.
-        # That completion suffix is deliberately discarded from the physical
-        # session cache and is re-prefilled in its canonical serialized form.
+        # Exact reference checkpoints keep generated K/V across turns. Their
+        # next prompt must therefore reproduce the raw generated token prefix;
+        # ordinary methods retain the canonical pre-decode prompt contract.
         previous = self._persistent_history_sessions.get(session_id)
         hint = request.c2kv_kv_memory_hint
         config = hint.get("history_kv_eviction") if isinstance(hint, dict) else None
+        recovery_append = (hint.get("persistent_history_session") or {}).get(
+            "recovery_append"
+        )
+        recovery_append = bool(
+            isinstance(recovery_append, dict) and recovery_append.get("enabled")
+        )
+        # This is server-owned state, never a caller-selected truncation length.
+        hint.pop("persistent_session_drop_generation_prefix_tokens", None)
         if previous is None:
+            if recovery_append:
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_REQUIRES_RESIDENT_SESSION")
             if isinstance(config, dict):
                 config["persistent_session"] = True
                 config["persistent_continuation"] = False
@@ -176,10 +284,33 @@ class OpenAIServingChat(OpenAIServingBase):
                 hint["persistent_session_delta_tokens"] = len(full_prompt_ids)
                 hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
             params["drop_previous_output"] = True
+            self._translate_tool_session_coordinates(request, 0, len(full_prompt_ids))
             return full_prompt_ids, session_id, full_prompt_ids
 
-        common = min(len(previous), len(full_prompt_ids))
-        if full_prompt_ids[:common] != previous[:common] or len(full_prompt_ids) < len(previous):
+        logical_prefix = len(previous)
+        exact_output = bool(
+            getattr(self, "_persistent_history_exact_output", {}).get(session_id)
+        )
+        if recovery_append:
+            if exact_output:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_RECOVERY_EXACT_OUTPUT_UNSUPPORTED"
+                )
+            generation_prefix = getattr(
+                self, "_persistent_history_generation_prefixes", {}
+            ).get(session_id)
+            if not generation_prefix or previous[-len(generation_prefix):] != generation_prefix:
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_GENERATION_PREFIX_UNAVAILABLE")
+            logical_prefix -= len(generation_prefix)
+            if (
+                len(full_prompt_ids) <= logical_prefix
+                or full_prompt_ids[:logical_prefix] != previous[:logical_prefix]
+            ):
+                raise ValueError("PERSISTENT_HISTORY_RECOVERY_BODY_PREFIX_MISMATCH")
+            hint["persistent_session_drop_generation_prefix_tokens"] = len(generation_prefix)
+
+        common = min(logical_prefix, len(full_prompt_ids))
+        if full_prompt_ids[:common] != previous[:common] or len(full_prompt_ids) < logical_prefix:
             mismatch = next(
                 (
                     i
@@ -188,13 +319,26 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 common,
             )
-            raise ValueError(
-                "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
-                f"session_id={session_id}, previous_tokens={len(previous)}, "
-                f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
-            )
+            if exact_output and not recovery_append:
+                try:
+                    full_prompt_ids = self._reconcile_exact_generated_prefix(
+                        previous, full_prompt_ids, mismatch, hint, c2kv_segments
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                        f"session_id={session_id}, previous_tokens={len(previous)}, "
+                        f"full_prompt_tokens={len(full_prompt_ids)}, "
+                        f"mismatch_at={mismatch}, reason={exc}"
+                    ) from exc
+            else:
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_PREFIX_MISMATCH: "
+                    f"session_id={session_id}, previous_tokens={len(previous)}, "
+                    f"full_prompt_tokens={len(full_prompt_ids)}, mismatch_at={mismatch}"
+                )
 
-        delta = full_prompt_ids[len(previous) :]
+        delta = full_prompt_ids[logical_prefix :]
         if not delta and isinstance(config, dict):
             from sglang.srt.mem_cache.history_kv_lifecycle import (
                 ATTENTION_SELECTION_METHODS,
@@ -206,12 +350,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     "PERSISTENT_HISTORY_SELECTION_REQUIRES_NEW_QUERY: "
                     f"method={method}, session_id={session_id}"
                 )
-        # Session.create_req must not append last_req.output_ids. Those raw
-        # decode tokens are not necessarily the canonical serialization of an
-        # OpenAI tool call; the delta above contains that serialization.
-        params["drop_previous_output"] = True
+        params["drop_previous_output"] = recovery_append or not exact_output
         if isinstance(hint, dict):
-            hint["persistent_session_logical_prefix_tokens"] = len(previous)
+            hint["persistent_session_logical_prefix_tokens"] = logical_prefix
+            if exact_output and not recovery_append:
+                computed_prefix = int(
+                    getattr(self, "_persistent_history_computed_prefixes", {}).get(
+                        session_id, logical_prefix
+                    )
+                )
+                if not 0 <= computed_prefix <= logical_prefix:
+                    raise ValueError(
+                        "PERSISTENT_HISTORY_SESSION_COMPUTED_PREFIX_INVALID"
+                    )
+                hint["persistent_session_computed_prefix_tokens"] = computed_prefix
             hint["persistent_session_delta_tokens"] = len(delta)
             hint["persistent_session_canonical_prompt_tokens"] = len(full_prompt_ids)
         if isinstance(config, dict):
@@ -226,14 +378,10 @@ class OpenAIServingChat(OpenAIServingBase):
             config["persistent_session"] = True
             config["persistent_continuation"] = True
             config["persistent_protected_prefix_tokens"] = history_start
-            config["persistent_delta_history_tokens"] = max(0, history_end - len(previous))
+            config["persistent_delta_history_tokens"] = max(0, history_end - logical_prefix)
             config["persistent_canonical_history_end"] = history_end
             config["persistent_canonical_prompt_tokens"] = len(full_prompt_ids)
-            canonical_scopes = config.get("semantic_scopes")
-            if isinstance(canonical_scopes, list):
-                config["persistent_canonical_scopes"] = [
-                    dict(scope) for scope in canonical_scopes
-                ]
+        self._translate_tool_session_coordinates(request, logical_prefix, len(full_prompt_ids))
         return delta, session_id, full_prompt_ids
 
     @staticmethod
@@ -243,8 +391,11 @@ class OpenAIServingChat(OpenAIServingBase):
         ).hexdigest()
 
     def _attach_parity_debug(
-        self, request: ChatCompletionRequest, adapted_request: GenerateReqInput,
-        full_prompt_ids: Optional[List[int]], input_ids: Optional[List[int]],
+        self,
+        request: ChatCompletionRequest,
+        adapted_request: GenerateReqInput,
+        full_prompt_ids: Optional[List[int]],
+        input_ids: Optional[List[int]],
     ) -> None:
         hint = request.c2kv_kv_memory_hint
         if not isinstance(hint, dict) or not hint.get("parity_debug"):
@@ -263,6 +414,35 @@ class OpenAIServingChat(OpenAIServingBase):
             "canonical_reconstruction_matches": full[:prefix_len] + delta == full,
         }
 
+    def _translate_tool_session_coordinates(self, request, input_prefix, input_len):
+        """Keep token-prefix matching separate from the expanded source ledger."""
+        from sglang.srt.mem_cache.c2kv_composition import source_boundary
+
+        hint = request.c2kv_kv_memory_hint
+        segments = hint.get("tool_memory_segments") or []
+        session_id = (request.session_params or {}).get("id")
+        previous = getattr(self, "_persistent_history_tool_segments", {}).get(session_id, [])
+        if not segments and not previous:
+            return
+        old_prefix = [segment for segment in segments if segment["token_start"] < input_prefix]
+        if previous != old_prefix and input_prefix:
+            raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+        hint["tool_memory_input_prefix_tokens"] = input_prefix
+        for key in ("persistent_session_logical_prefix_tokens",
+                    "persistent_session_computed_prefix_tokens",
+                    "persistent_session_canonical_prompt_tokens"):
+            if key in hint:
+                applicable = segments if key == "persistent_session_canonical_prompt_tokens" else old_prefix
+                hint[key] = source_boundary(hint[key], applicable)
+        config = hint.get("history_kv_eviction")
+        if isinstance(config, dict):
+            for key in ("persistent_protected_prefix_tokens",
+                        "persistent_canonical_history_end",
+                        "persistent_canonical_prompt_tokens"):
+                if key in config:
+                    config[key] = source_boundary(config[key], segments)
+        hint["tool_memory_canonical_prompt_tokens"] = source_boundary(input_len, segments)
+
     def _commit_persistent_history_session(
         self,
         adapted_request: GenerateReqInput,
@@ -277,16 +457,64 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids = ret[0].get("output_ids") or []
         if not isinstance(output_ids, list):
             raise ValueError("PERSISTENT_HISTORY_SESSION_OUTPUT_IDS_MISSING")
-        # The next request is compared against the pre-decode canonical prompt.
-        # Raw output IDs are never assumed to be equivalent to the API's
-        # structured assistant/tool-call serialization.
-        self._persistent_history_sessions[session_id] = list(canonical_prompt_ids)
+        hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+        if hint.get("tool_memory_segments"):
+            self._persistent_history_tool_segments[session_id] = [
+                dict(item) for item in hint["tool_memory_segments"]
+            ]
+        reference_config = hint.get("history_kv_reference_config") or {}
+        method = str(reference_config.get("method") or "").lower()
+        exact_output = method in {"agentkv", "commitkv"}
+        self._persistent_history_generation_bases[session_id] = list(
+            canonical_prompt_ids
+        )
+        if exact_output:
+            next_prefix = list(canonical_prompt_ids) + list(output_ids)
+            report = (ret[0].get("meta_info") or {}).get("kv_memory_report") or {}
+            computed_prefix = int(
+                report.get("persistent_session_computed_logical_horizon")
+                or len(canonical_prompt_ids)
+            )
+            if not len(canonical_prompt_ids) <= computed_prefix <= len(next_prefix):
+                raise ValueError(
+                    "PERSISTENT_HISTORY_SESSION_COMPUTED_PREFIX_INVALID"
+                )
+            self._persistent_history_sessions[session_id] = next_prefix
+            self._persistent_history_computed_prefixes[session_id] = computed_prefix
+        else:
+            self._persistent_history_sessions[session_id] = list(canonical_prompt_ids)
+            self._persistent_history_computed_prefixes[session_id] = len(
+                canonical_prompt_ids
+            )
+        self._persistent_history_exact_output[session_id] = exact_output
+        generation_prefix_ids = getattr(
+            adapted_request, "_persistent_history_generation_prefix_ids", None
+        )
+        if generation_prefix_ids is not None:
+            self._persistent_history_generation_prefixes[session_id] = list(generation_prefix_ids)
         ret[0].setdefault("meta_info", {})["persistent_history_session"] = {
             "session_id": session_id,
             "canonical_prompt_tokens": len(canonical_prompt_ids),
             "generated_tokens": len(output_ids),
-            "next_prefix_tokens": len(canonical_prompt_ids),
-            "generated_suffix_reprefill_required": True,
+            "next_prefix_tokens": len(self._persistent_history_sessions[session_id]),
+            "computed_prefix_tokens": self._persistent_history_computed_prefixes[
+                session_id
+            ],
+            "generated_suffix_reprefill_required": not exact_output,
+            "exact_output_prefix_required": exact_output,
+            "continuation_mode": (
+                "exact_generated_prefix" if exact_output else "canonical_reprefill"
+            ),
+            "generated_text": str(ret[0].get("text") or ""),
+            "generated_token_ids": list(output_ids),
+            "retokenization_reconciled": bool(
+                hint.get("persistent_session_retokenization_reconciled", False)
+            ),
+            "retokenization_token_shift": int(
+                hint.get("persistent_session_retokenization_token_shift", 0)
+            ),
+            "generation_prefix_tokens": len(generation_prefix_ids or []),
+            "recovery_append_supported": not exact_output,
         }
 
     def _handle_last_assistant_message(
@@ -425,6 +653,13 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: "ChatCompletionRequest"
     ) -> Optional[List[Dict]]:
         if not request.tools or request.tool_choice == "none":
+            return None
+        if getattr(request, "c2kv_tools_in_prompt", None) is False:
+            # C2KV tool memory: the client renders its own explicit tool
+            # protocol and supplies the schemas as gist segments; the served
+            # prompt must not carry a second copy.  Every token frame this
+            # class measures (segments, history span, repair offsets) goes
+            # through this one accessor, so all of them agree.
             return None
         exclude_unset = self._c2kv_tools_dump_exclude_unset()
         if not isinstance(request.tool_choice, str):
@@ -735,8 +970,30 @@ class OpenAIServingChat(OpenAIServingBase):
                         msg, "c2kv_use_gist_projection", None
                     ),
                     repair_placement=getattr(msg, "c2kv_repair_placement", None),
+                    region=getattr(msg, "c2kv_region", None),
+                    source_token_count=getattr(msg, "c2kv_source_token_count", None),
+                    source_token_end=getattr(msg, "c2kv_source_token_end", None),
                 )
             )
+
+        tool_segments = [segment for segment in segments if segment.region == "tool"]
+        if tool_segments:
+            from sglang.srt.mem_cache.c2kv_composition import remap_message_metadata
+
+            hint = request.c2kv_kv_memory_hint
+            if not isinstance(hint, dict):
+                hint = request.c2kv_kv_memory_hint = {}
+            remap_message_metadata(hint, annotated, len(request.messages))
+            for segment in tool_segments:
+                if segment.source_token_count is None or segment.source_token_count <= 0:
+                    raise ValueError("C2KV_TOOL_SOURCE_TOKEN_COUNT_REQUIRED")
+            hint["tool_memory_segments"] = [
+                {"token_start": segment.token_start, "token_end": segment.token_end,
+                 "source_tokens": segment.source_token_count,
+                 "key_hash": segment.key_hash,
+                 "repair_key_hashes": list(segment.repair_key_hashes)}
+                for segment in tool_segments
+            ]
 
         # Remove annotated messages so _process_messages omits their tokens from
         # origin_input_ids; the gist injection fills each insertion point at
@@ -834,7 +1091,8 @@ class OpenAIServingChat(OpenAIServingBase):
             start_count = int(start_count)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Invalid history_start_message_count: {start_count!r}") from exc
+                f"Invalid history_start_message_count: {start_count!r}"
+            ) from exc
         if not (0 <= start_count < count):
             raise ValueError(
                 "Invalid physical history start boundary: "
@@ -842,10 +1100,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"history_message_count={count}"
             )
 
+        tools = self._chat_template_tools(request)
         completed = list(request.messages[:count])
         protected = list(request.messages[:start_count])
         completed_ids = self._c2kv_chat_template_input_ids(
-            request, completed, tools)
+            request, completed, tools
+        )
         if not completed_ids:
             raise ValueError("Cannot resolve an empty completed-history prefix")
 
@@ -859,7 +1119,8 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         if protected:
             protected_ids = self._c2kv_chat_template_input_ids(
-                request, protected, tools)
+                request, protected, tools
+            )
             if completed_ids[: len(protected_ids)] != protected_ids:
                 raise ValueError(
                     "Protected system/tool prefix is not a prefix of completed "
@@ -868,17 +1129,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             history_relative_start = len(protected_ids)
         else:
-            # No explicit protected messages: retain any template-generated
-            # tool/system prologue and begin at the first real message.
             history_relative_start = self._c2kv_first_message_start_offset(
-                request, completed[0], tools)
+                request, completed[0], tools
+            )
         history_start = prefix_start + history_relative_start
         history_end = prefix_start + len(completed_ids)
         if not (history_start < history_end <= len(prompt_ids)):
             raise ValueError(
-                "Resolved physical history range is empty/outside the server "
-                f"prompt: start={history_start}, end={history_end}, "
-                f"prompt={len(prompt_ids)}"
+                "Resolved physical history range is empty/outside the server prompt: "
+                f"start={history_start}, end={history_end}, prompt={len(prompt_ids)}"
             )
         span_tokens = history_end - history_start
         if config.get("target_tokens") is None:
@@ -894,44 +1153,263 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise ValueError(
                     f"Invalid physical history retention_ratio: {ratio!r}"
                 )
-            history_target = max(
+            target_tokens = max(
                 1, min(span_tokens, int(math.ceil(span_tokens * ratio)))
             )
             target_source = "server_tokenized_retention_ratio"
         else:
-            history_target = max(
+            target_tokens = max(
                 1, min(span_tokens, int(config["target_tokens"]))
             )
             target_source = "absolute_request_budget"
-        scopes.append({
-            "kind": "history", "start": history_start, "end": history_end,
-            "target_tokens": history_target,
-            "retention_ratio": config.get("retention_ratio"),
-            "boundary_source": "native_chat_template_message_prefix",
-        })
-        ordered_scopes = sorted(scopes, key=lambda scope: int(scope["start"]))
-        for previous, current in zip(ordered_scopes, ordered_scopes[1:]):
-            if int(previous["end"]) > int(current["start"]):
-                raise ValueError(
-                    "JOINT_KV_OVERLAPPING_CANONICAL_SCOPES: "
-                    f"{previous['kind']}=[{previous['start']},{previous['end']}), "
-                    f"{current['kind']}=[{current['start']},{current['end']})"
-                )
-        scopes = ordered_scopes
-        config["semantic_scopes"] = scopes
-        config["history_start"] = min(s["start"] for s in scopes)
-        config["history_end"] = max(s["end"] for s in scopes)
-        config["joint_canonical_prompt_tokens"] = len(prompt_ids)
-        config["joint_current_full_tokens"] = max(
-            0, len(prompt_ids) - int(config["history_end"]))
-        config["target_tokens"] = sum(s["target_tokens"] for s in scopes)
+        config["history_start"] = history_start
+        config["history_end"] = history_end
+        config["target_tokens"] = target_tokens
         config["target_tokens_source"] = target_source
         config["server_tokenized"] = True
         # The server owns the final chat template, so this is the only exact
         # full-history token count used by persistent physical accounting.
         hint["full_equivalent_history_tokens"] = span_tokens
-        hint["full_equivalent_tool_tokens"] = sum(
-            s["end"] - s["start"] for s in scopes if s["kind"] == "tool")
+        if scopes:
+            scopes.append({
+                "kind": "history", "start": history_start, "end": history_end,
+                "target_tokens": target_tokens,
+                "retention_ratio": config.get("retention_ratio"),
+                "boundary_source": "native_chat_template_message_prefix",
+            })
+            ordered_scopes = sorted(scopes, key=lambda scope: int(scope["start"]))
+            for previous, current in zip(ordered_scopes, ordered_scopes[1:]):
+                if int(previous["end"]) > int(current["start"]):
+                    raise ValueError(
+                        "JOINT_KV_OVERLAPPING_CANONICAL_SCOPES: "
+                        f"{previous['kind']}=[{previous['start']},{previous['end']}), "
+                        f"{current['kind']}=[{current['start']},{current['end']})"
+                    )
+            config["semantic_scopes"] = ordered_scopes
+            config["history_start"] = min(s["start"] for s in ordered_scopes)
+            config["history_end"] = max(s["end"] for s in ordered_scopes)
+            config["joint_canonical_prompt_tokens"] = len(prompt_ids)
+            config["joint_current_full_tokens"] = max(
+                0, len(prompt_ids) - int(config["history_end"])
+            )
+            config["target_tokens"] = sum(s["target_tokens"] for s in ordered_scopes)
+            hint["full_equivalent_tool_tokens"] = sum(
+                s["end"] - s["start"] for s in ordered_scopes if s["kind"] == "tool"
+            )
+
+    def _resolve_tool_kv_schema_spans(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("tool_kv_eviction") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return
+        if request.c2kv_tools_in_prompt is not False:
+            raise ValueError("TOOL_KV_REQUIRES_EXPLICIT_PROTOCOL")
+        if self.template_manager.chat_template_name is not None or self.use_dpsk_v32_encoding:
+            raise ValueError("TOOL_KV_REQUIRES_JINJA_TEXT_TEMPLATE")
+        if getattr(request, "continue_final_message", False):
+            raise ValueError("TOOL_KV_CONTINUE_FINAL_MESSAGE_UNSUPPORTED")
+        tokenizer = self.tokenizer_manager.tokenizer
+        messages = self._openai_messages_for_chat_template(list(request.messages))
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=None,
+            **self._chat_template_extra_kwargs(request),
+        )
+        from sglang.srt.mem_cache.tool_kv_spans import resolve_schema_token_spans
+
+        config["resolved_schema_token_spans"] = resolve_schema_token_spans(
+            rendered_prompt=rendered,
+            prompt_ids=prompt_ids,
+            message_contents=[item.get("content") for item in messages],
+            schema_spans=config.get("schema_spans") or [],
+            tokenizer=tokenizer,
+        )
+        protocol_span = config.get("tool_protocol_span")
+        if protocol_span is not None:
+            resolved = resolve_schema_token_spans(
+                rendered_prompt=rendered,
+                prompt_ids=prompt_ids,
+                message_contents=[item.get("content") for item in messages],
+                schema_spans=[{"schema_index": -1, **protocol_span}],
+                tokenizer=tokenizer,
+                boundary_policy="overlap",
+            )
+            config["resolved_tool_protocol_token_span"] = resolved[0]
+        config["server_tokenized"] = True
+        config["full_prompt_tokens"] = len(prompt_ids)
+
+    def _resolve_history_kv_event_token_spans(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> None:
+        """Resolve proxy message events into server-tokenized canonical spans."""
+
+        hint = request.c2kv_kv_memory_hint
+        if not isinstance(hint, dict):
+            return
+        events = hint.get("history_kv_event_messages")
+        if events is None:
+            return
+        if not isinstance(events, list) or len(events) != len(request.messages):
+            raise ValueError(
+                "history_kv_event_messages must align one-to-one with "
+                "assembled request messages"
+            )
+        tools = self._chat_template_tools(request)
+        prefix_ids = []
+        for end in range(1, len(request.messages) + 1):
+            ids = self._c2kv_chat_template_input_ids(
+                request, list(request.messages[:end]), tools
+            )
+            if len(ids) > len(prompt_ids) or prompt_ids[: len(ids)] != ids:
+                raise ValueError(
+                    "HISTORY_KV_EVENT_TEMPLATE_PREFIX_MISMATCH: "
+                    f"message_index={end - 1}, prefix_tokens={len(ids)}, "
+                    f"prompt_tokens={len(prompt_ids)}"
+                )
+            prefix_ids.append(ids)
+        from sglang.srt.mem_cache.history_kv_events import (
+            resolve_history_kv_event_token_spans,
+        )
+
+        first_start = self._c2kv_first_message_start_offset(
+            request, request.messages[0], tools
+        )
+        completed_end = len(prefix_ids[-1])
+        spans = resolve_history_kv_event_token_spans(
+            total_tokens=completed_end,
+            message_prefix_token_counts=[first_start]
+            + [len(item) for item in prefix_ids],
+            event_messages=events,
+        )
+        # The final prompt may append an assistant-generation scaffold.  It is
+        # intentionally outside every completed-message event span.
+        hint["history_kv_event_token_spans"] = spans
+        hint["history_kv_event_generation_suffix_start"] = completed_end
+        reference_config = hint.get("history_kv_reference_config")
+        if isinstance(reference_config, dict) and str(
+            reference_config.get("method") or ""
+        ).lower() == "agentkv":
+            tokenizer = self.tokenizer_manager.tokenizer
+            marker_stages = {
+                "<think>": 1,
+                "</think>": 1,
+                "<tool_call>": 2,
+                "</tool_call>": 2,
+            }
+            resolved_markers = []
+            for marker, stage in marker_stages.items():
+                token_ids = tokenizer.encode(
+                    marker, add_special_tokens=False
+                )
+                if token_ids:
+                    resolved_markers.append(
+                        {"token_ids": list(token_ids), "stage": stage}
+                    )
+            reference_config["agentkv_marker_stage_sequences"] = resolved_markers
+
+    def _resolve_paper_history_token_count(
+        self,
+        request: "ChatCompletionRequest",
+        prompt_ids: List[int],
+    ) -> Optional[int]:
+        """Resolve the common history denominator in the server token frame."""
+
+        hint = request.c2kv_kv_memory_hint
+        config = hint.get("paper_measurement") if isinstance(hint, dict) else None
+        if not isinstance(config, dict):
+            return None
+        count = config.get("history_message_count")
+        start_count = config.get("history_start_message_count", 0)
+        try:
+            count = int(count)
+            start_count = int(start_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid paper measurement history boundary") from exc
+        if count == 0 and start_count == 0:
+            config.update(
+                history_start=0,
+                history_end=0,
+                history_full_kv_tokens=0,
+                server_tokenized=True,
+            )
+            return 0
+        if not (0 <= start_count < count <= len(request.messages)):
+            raise ValueError(
+                "Invalid paper measurement history boundary: "
+                f"start={start_count}, end={count}, messages={len(request.messages)}"
+            )
+        tools = self._chat_template_tools(request)
+        completed = list(request.messages[:count])
+        protected = list(request.messages[:start_count])
+        completed_ids = self._c2kv_chat_template_input_ids(request, completed, tools)
+        prefix_start = 0
+        if prompt_ids[: len(completed_ids)] != completed_ids:
+            prefix_start = self._find_token_subsequence(prompt_ids, completed_ids)
+        if prefix_start < 0:
+            raise ValueError(
+                "Paper measurement history prefix is absent from the final prompt"
+            )
+        if protected:
+            protected_ids = self._c2kv_chat_template_input_ids(
+                request, protected, tools
+            )
+            if completed_ids[: len(protected_ids)] != protected_ids:
+                raise ValueError(
+                    "Paper measurement protected prefix is not a history prefix"
+                )
+            relative_start = len(protected_ids)
+        else:
+            relative_start = self._c2kv_first_message_start_offset(
+                request, completed[0], tools
+            )
+        history_start = prefix_start + relative_start
+        history_end = prefix_start + len(completed_ids)
+        if not (history_start < history_end <= len(prompt_ids)):
+            raise ValueError("Paper measurement history range is empty or invalid")
+        config.update(
+            history_start=history_start,
+            history_end=history_end,
+            history_full_kv_tokens=history_end - history_start,
+            server_tokenized=True,
+        )
+        return history_end - history_start
+
+    @staticmethod
+    def _paper_source_request(request, measurement_config):
+        """Validate the original source solely for denominator tokenization."""
+        messages = measurement_config.get("canonical_source_messages")
+        tools = measurement_config.get("canonical_source_tools")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_MESSAGES_AND_TOOLS_REQUIRED")
+        payload = request.model_dump()
+        payload.update(messages=copy.deepcopy(messages), tools=copy.deepcopy(tools))
+        return type(request).model_validate(payload)
+
+    @staticmethod
+    def _paper_history_request(request):
+        """Exclude transport carriers from the independent history denominator."""
+        result = copy.deepcopy(request)
+        removed = [index for index, message in enumerate(result.messages)
+                   if getattr(message, "c2kv_region", None) == "tool"
+                   and (getattr(message, "c2kv_key_hash", None)
+                        or getattr(message, "c2kv_repair_only_key_hashes", None)
+                        or getattr(message, "c2kv_repair_key_hashes", None))]
+        if removed:
+            measurement = result.c2kv_kv_memory_hint["paper_measurement"]
+            for key in ("history_start_message_count", "history_message_count"):
+                if key in measurement:
+                    count = int(measurement[key])
+                    measurement[key] = count - sum(index < count for index in removed)
+            result.messages = [message for index, message in enumerate(result.messages) if index not in removed]
+        return result
 
     def _convert_to_internal_request(
         self,
@@ -954,18 +1432,88 @@ class OpenAIServingChat(OpenAIServingBase):
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
+        # Resolve measurement denominators before _compute_c2kv_segments removes
+        # annotated history messages. This copy follows the same server chat
+        # template and therefore gives every arm one canonical full-history
+        # token frame, independent of its active compressed representation.
+        paper_whole_full_kv_tokens = None
+        paper_history_full_kv_tokens = None
+        paper_history_active_kv_tokens = None
+        paper_canonical_full_source = False
+        paper_denominator_tokenization_duration_ns = None
+        paper_hint = request.c2kv_kv_memory_hint
+        if (
+            not is_multimodal
+            and isinstance(paper_hint, dict)
+            and isinstance(paper_hint.get("paper_measurement"), dict)
+        ):
+            measurement_config = paper_hint["paper_measurement"]
+            paper_canonical_full_source = bool(
+                measurement_config.get("canonical_full_source", False)
+            )
+            denominator_start_ns = time.monotonic_ns()
+            canonical_request = self._paper_history_request(request)
+            canonical_processed = self._process_messages(canonical_request, False)
+            if isinstance(canonical_processed.prompt_ids, list):
+                resolved_history_tokens = self._resolve_paper_history_token_count(
+                    canonical_request, canonical_processed.prompt_ids
+                )
+                if paper_canonical_full_source:
+                    paper_whole_full_kv_tokens = len(canonical_processed.prompt_ids)
+                    paper_history_full_kv_tokens = resolved_history_tokens
+                else:
+                    paper_history_active_kv_tokens = resolved_history_tokens
+            source_messages = measurement_config.get("canonical_source_messages")
+            if source_messages is not None:
+                source_request = self._paper_source_request(request, measurement_config)
+                source_processed = self._process_messages(source_request, False)
+                if not isinstance(source_processed.prompt_ids, list):
+                    raise ValueError("C2KV_PAPER_CANONICAL_SOURCE_TOKENIZATION_FAILED")
+                paper_whole_full_kv_tokens = len(source_processed.prompt_ids)
+                paper_canonical_full_source = True
+                measurement_config["canonical_source_whole_tokens"] = paper_whole_full_kv_tokens
+                measurement_config["canonical_source_server_tokenized"] = True
+                # Retain the token-count receipt, not a copy of the source
+                # conversation in scheduler logs and allocator responses.
+                measurement_config.pop("canonical_source_messages", None)
+                measurement_config.pop("canonical_source_tools", None)
+            paper_denominator_tokenization_duration_ns = (
+                time.monotonic_ns() - denominator_start_ns
+            )
+
         # Compute C2KV segment boundaries before the chat template is applied
         c2kv_segments = self._compute_c2kv_segments(request)
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
         if not is_multimodal and isinstance(processed_messages.prompt_ids, list):
+            self._resolve_tool_kv_schema_spans(
+                request, processed_messages.prompt_ids
+            )
+            self._resolve_history_kv_event_token_spans(
+                request, processed_messages.prompt_ids
+            )
             self._resolve_history_kv_eviction_range(request, processed_messages.prompt_ids)
+            if paper_history_full_kv_tokens is None and isinstance(
+                request.c2kv_kv_memory_hint, dict
+            ):
+                paper_history_full_kv_tokens = request.c2kv_kv_memory_hint.get(
+                    "full_equivalent_history_tokens"
+                )
             input_ids, persistent_session_id, canonical_prompt_ids = (
                 self._prepare_persistent_history_delta(
-                    request, list(processed_messages.prompt_ids)
+                    request, list(processed_messages.prompt_ids), c2kv_segments
                 )
             )
+            if persistent_session_id is not None and c2kv_segments:
+                hint = request.c2kv_kv_memory_hint
+                input_prefix = int(hint.get("tool_memory_input_prefix_tokens") or 0)
+                if input_prefix:
+                    c2kv_segments = [segment for segment in c2kv_segments
+                                     if segment.token_start >= input_prefix]
+                    for segment in c2kv_segments:
+                        segment.token_start -= input_prefix
+                        segment.token_end -= input_prefix
         else:
             input_ids = processed_messages.prompt_ids
             persistent_session_id = None
@@ -1025,6 +1573,25 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
+            c2kv_outer_request_id=(
+                raw_request.headers.get("X-C2KV-Measurement-Request-Id")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_measurement_phase=(
+                raw_request.headers.get("X-C2KV-Measurement-Phase")
+                if raw_request is not None
+                else None
+            ),
+            c2kv_paper_whole_full_kv_tokens=(
+                paper_whole_full_kv_tokens
+            ),
+            c2kv_paper_history_full_kv_tokens=paper_history_full_kv_tokens,
+            c2kv_paper_history_active_kv_tokens=paper_history_active_kv_tokens,
+            c2kv_paper_canonical_full_source=paper_canonical_full_source,
+            c2kv_paper_denominator_tokenization_duration_ns=(
+                paper_denominator_tokenization_duration_ns
+            ),
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
@@ -1048,10 +1615,25 @@ class OpenAIServingChat(OpenAIServingBase):
         if persistent_session_id is not None:
             adapted_request._persistent_history_session_id = persistent_session_id
             adapted_request._persistent_history_canonical_prompt_ids = canonical_prompt_ids
+            # Derive the removable suffix from the same template and options.
+            # A client may request a recovery append, but cannot nominate raw
+            # history tokens to truncate or replay.
+            body_ids = self._c2kv_chat_template_input_ids(
+                request, list(request.messages), self._chat_template_tools(request)
+            )
+            if canonical_prompt_ids[:len(body_ids)] == body_ids:
+                adapted_request._persistent_history_generation_prefix_ids = (
+                    canonical_prompt_ids[len(body_ids):]
+                )
+            else:
+                adapted_request._persistent_history_generation_prefix_ids = []
+
         self._attach_parity_debug(
-            request, adapted_request,
+            request,
+            adapted_request,
             list(processed_messages.prompt_ids)
-            if isinstance(processed_messages.prompt_ids, list) else None,
+            if isinstance(processed_messages.prompt_ids, list)
+            else None,
             input_ids if isinstance(input_ids, list) else None,
         )
 
@@ -1078,7 +1660,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = self._chat_template_tools(request)
-        if tools is not None:
+        # Tool-call parsing follows request.tools even when the schemas are
+        # kept out of the prompt (c2kv_tools_in_prompt=False).
+        parse_tool_calls = tools is not None or bool(
+            request.tools
+            and request.tool_choice != "none"
+            and getattr(request, "c2kv_tools_in_prompt", None) is False
+        )
+        if parse_tool_calls:
             request.skip_special_tokens = False
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
@@ -1154,7 +1743,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if request.tools and tools is not None:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
             real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
@@ -1656,6 +2245,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ).__anext__()
         except ValueError as e:
+            hint = getattr(adapted_request, "c2kv_kv_memory_hint", None) or {}
+            if hint.get("persistent_session_drop_generation_prefix_tokens"):
+                # A recovery splice is intentionally destructive only to the
+                # generation scaffold. If the replacement request fails after
+                # scheduler admission, its request node and physical slot can
+                # no longer be proven equivalent to the old canonical prompt.
+                # Fail closed instead of allowing a later append or fallback.
+                session_id = getattr(
+                    adapted_request, "_persistent_history_session_id", None
+                )
+                if session_id:
+                    try:
+                        await self.tokenizer_manager.close_session(
+                            CloseSessionReqInput(session_id=session_id), raw_request
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to close an aborted persistent recovery session %s",
+                            session_id,
+                        )
+                    self.release_persistent_history_session(session_id)
             return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
@@ -1790,6 +2400,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # BFCL uses this to distinguish measured physical KV residency
             # from client-side history-token estimates.
             "kv_memory_report": kv_memory_report,
+            "persistent_history_session": ret[0]["meta_info"].get(
+                "persistent_history_session"
+            ),
         }
         parity_debug = ret[0]["meta_info"].get("parity_debug")
         if isinstance(parity_debug, dict):

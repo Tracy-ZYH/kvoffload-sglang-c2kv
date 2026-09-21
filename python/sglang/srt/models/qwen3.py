@@ -46,7 +46,12 @@ from sglang.srt.mem_cache.history_kv_selection import (
     select_streamingllm_indices,
     summarize_headwise_indices,
 )
+from sglang.srt.mem_cache.history_kv_reference import (
+    ReferenceLayerKV,
+    reference_sdpa,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -112,6 +117,16 @@ def _npu_fusion_attention_output(
     return candidates[0]
 
 
+def _requires_reference_runtime_qkv(forward_batch: ForwardBatch) -> bool:
+    """Keep explicit Q/K/V available for reference selection and attention."""
+
+    return any(
+        item is not None
+        for name in ("history_kv_reference_configs", "history_kv_reference_states")
+        for item in (getattr(forward_batch, name, None) or [])
+    )
+
+
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
@@ -130,6 +145,7 @@ class Qwen3Attention(nn.Module):
         pic_param: str = "qkv",
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        tool_gist_uses_served_t0: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -223,6 +239,29 @@ class Qwen3Attention(nn.Module):
                 prefix=add_prefix(c2kv_proj_name, prefix),
             )
             setattr(self, c2kv_proj_name, c2kv_proj)
+            # Tool extraction uses the served T0 projection directly when both
+            # names identify that same checkpoint.  A distinct tool checkpoint
+            # keeps its own FP32 projection set.
+            self.c2kv_tool_gist_enabled = False
+            if not pic_enabled and getattr(
+                get_global_server_args(), "c2kv_tool_gist_weights", None
+            ):
+                if tool_gist_uses_served_t0:
+                    self.tool_gist_qkv_proj = c2kv_proj
+                else:
+                    self.tool_gist_qkv_proj = QKVParallelLinear(
+                        hidden_size,
+                        self.head_dim,
+                        self.total_num_heads,
+                        self.total_num_kv_heads,
+                        bias=attention_bias,
+                        params_dtype=torch.float32,
+                        quant_config=None,
+                        tp_rank=attn_tp_rank,
+                        tp_size=attn_tp_size,
+                        prefix=add_prefix("tool_gist_qkv_proj", prefix),
+                    )
+                self.c2kv_tool_gist_enabled = True
             if not pic_enabled:
                 # PIC/residual_qkv_proj is excluded by construction: there is no
                 # gist_qkv_proj to switch to.
@@ -330,10 +369,30 @@ class Qwen3Attention(nn.Module):
         ]
         return torch.cat(merged, dim=-1)
 
-    def _c2kv_project_gist_qkv(self, hidden_states):
+    def _c2kv_gist_projection(self, projection_set: str = "history"):
+        """The fused gist QKV linear of one projection set.
+
+        ``history`` is the served checkpoint's own set (``gist_qkv_proj``);
+        ``tool`` is the optional --c2kv-tool-gist-weights set.  Requesting a
+        set that was not loaded is a hard error, never a silent fallback to the
+        other set (the two encoders are trained on different corpora).
+        """
+        if projection_set == "history":
+            return self.gist_qkv_proj
+        if projection_set == "tool":
+            projection = getattr(self, "tool_gist_qkv_proj", None)
+            if projection is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNAVAILABLE: projection_set='tool' needs "
+                    "a server started with --c2kv-tool-gist-weights"
+                )
+            return projection
+        raise ValueError(f"Unknown C2KV projection set {projection_set!r}")
+
+    def _c2kv_project_gist_qkv(self, hidden_states, projection_set: str = "history"):
         """Apply FP32-stored gist weights in the base compute dtype."""
 
-        projection = self.gist_qkv_proj
+        projection = self._c2kv_gist_projection(projection_set)
         if projection.weight.dtype == hidden_states.dtype:
             return projection(hidden_states)
         with torch.autocast(
@@ -393,24 +452,25 @@ class Qwen3Attention(nn.Module):
             history_start = int(config.get("history_start") or 0)
             history_end = int(config.get("history_end") or 0)
             available_end = prefix_len + extend_len
-            if not (0 <= history_start < history_end <= available_end):
+            tool_kv_eviction = bool(config.get("tool_kv_eviction"))
+            if not (0 <= history_start < history_end) or (
+                not tool_kv_eviction and history_end > available_end
+            ):
                 continue
 
             method = str(config.get("method") or "").strip().lower()
             if method in {"", "streamingllm"}:
                 continue
             recent_window = max(1, int(config.get("history_kv_recent_window") or 64))
-            # On the first prefill, history may end inside the extend input;
-            # do not use current-turn rows that precede no completed history.
-            # On a persistent continuation the completed history is already
-            # wholly resident in the prefix, so score it with the RECENT NEW
-            # query window. The old max(1, history_end-prefix_len) silently
-            # reduced every later turn to its first new query token.
-            if prefix_len > 0 and history_end <= prefix_len:
+            if tool_kv_eviction:
+                q_start = max(0, int(config["selection_query_start"]) - prefix_len)
+                q_end = min(extend_len, int(config["selection_query_end"]) - prefix_len)
+            elif prefix_len > 0 and history_end <= prefix_len:
                 q_end = extend_len
+                q_start = max(0, q_end - recent_window)
             else:
                 q_end = min(extend_len, max(1, history_end - prefix_len))
-            q_start = max(0, q_end - recent_window)
+                q_start = max(0, q_end - recent_window)
             if q_start >= q_end:
                 continue
 
@@ -437,51 +497,129 @@ class Qwen3Attention(nn.Module):
                     raise RuntimeError("HISTORY_KV_UNSUPPORTED_KEY_BUFFER_LAYOUT")
                 cached = key_buffer.reshape(-1, self.num_kv_heads, self.head_dim)[slots]
                 k_req = torch.cat([cached.to(k_req.dtype), k_req], dim=0)
+            # Keep this construction local: lifecycle unit tests extract this
+            # method in isolation, and production needs the same canonical
+            # ledger fallback as the reference attention helper.
+            normal_seq_len = prefix_len + extend_len
+            ledgers = getattr(
+                forward_batch, "history_kv_resident_positions", None
+            )
+            ledger = (
+                list(ledgers[batch_idx])
+                if ledgers and batch_idx < len(ledgers)
+                else list(config.get("resident_logical_positions") or [])
+            )
+            if len(ledger) >= normal_seq_len:
+                normal_positions = torch.tensor(
+                    ledger[:normal_seq_len],
+                    dtype=torch.long,
+                    device=flat_positions.device,
+                )
+            else:
+                query_position_list = [
+                    int(item)
+                    for item in flat_positions[token_start:token_end].tolist()
+                ]
+                known = ledger[:prefix_len]
+                missing = prefix_len - len(known)
+                if missing:
+                    start = (
+                        query_position_list[0] - missing
+                        if query_position_list
+                        else (known[-1] + 1 if known else 0)
+                    )
+                    known.extend(range(start, start + missing))
+                normal_positions = torch.tensor(
+                    known + query_position_list,
+                    dtype=torch.long,
+                    device=flat_positions.device,
+                )
             k_req = k_req.transpose(0, 1).contiguous()
+            reference_state = None
+            states = getattr(forward_batch, "history_kv_reference_states", None)
+            if states and batch_idx < len(states) and states[batch_idx] is not None:
+                reference_state = states[batch_idx].layer(self.attn.layer_id)
+            reference_len = 0
+            if reference_state is not None:
+                reference_state.validate()
+                reference_len = int(reference_state.key.shape[1])
             if self.num_heads != self.num_kv_heads:
                 groups = self.num_heads // self.num_kv_heads
                 k_score = k_req.repeat_interleave(groups, dim=0)
             else:
                 k_score = k_req
 
-            q_window = q_req[:, q_start:q_end, :]
-            # Normalize over every key visible to the query, including an
-            # already-cached current prefix and the query's own key.  Only
-            # slice to history candidates after softmax.  Normalizing over
-            # history alone overstates heads that mostly attend to current
-            # content and can change H2O/SnapKV selection.
+            # The query may follow an already-cached history boundary. Include
+            # the resident current prefix and query's own key in the softmax;
+            # only slice to history candidates after normalization. Otherwise
+            # heads attending to current content get overstated history scores.
             key_end = prefix_len + q_end
             k_all = k_score[:, :key_end, :]
-            logits = torch.matmul(
-                q_window.float(),
-                k_all.transpose(-2, -1).float(),
-            ) * self.scaling
-            q_pos = flat_positions[token_start + q_start : token_start + q_end].to(
-                logits.device
-            ).view(1, -1, 1)
-            ledger = config.get("resident_logical_positions")
-            if ledger is not None:
-                # The persistent ledger describes only the already-resident
-                # physical prefix.  Keys appended by this extend round use
-                # the model's actual logical positions and must be included
-                # in the same causal mask frame.
-                prefix_positions = list(ledger[:prefix_len])
-                extend_positions = flat_positions[
-                    token_start : token_start + q_end
-                ].tolist()
-                key_positions = torch.tensor(
-                    prefix_positions + extend_positions,
-                    device=logits.device,
+            if reference_state is not None:
+                reference_keys = reference_state.key.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=0
                 )
-            elif prefix_len:
-                # First-request chunked prefill has not evicted anything yet.
-                key_positions = torch.arange(key_end, device=logits.device)
+                k_all = torch.cat(
+                    [reference_keys.to(k_all.dtype), k_all], dim=1
+                )
+            key_positions = normal_positions[:key_end].to(k_all.device)
+            if reference_state is not None:
+                reference_positions = reference_state.positions.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=0
+                )
+                k_pos = torch.cat(
+                    [
+                        reference_positions.to(k_all.device),
+                        key_positions.view(1, -1).expand(self.num_heads, -1),
+                    ],
+                    dim=1,
+                ).unsqueeze(1)
             else:
-                key_positions = flat_positions[token_start : token_start + key_end].to(logits.device)
-            k_pos = key_positions.view(1, 1, -1)
-            logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
-            probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            layer_score = probs[:, :, history_start:history_end].sum(dim=(0, 1))
+                k_pos = key_positions.view(1, 1, -1)
+            groups = self.num_heads // self.num_kv_heads
+            headwise_probs = torch.zeros(
+                self.num_kv_heads,
+                reference_len + key_end,
+                dtype=torch.float32,
+                device=k_all.device,
+            )
+            # H2O scores every prompt query.  Bound the temporary attention
+            # matrix instead of materializing [heads, prompt, prompt].
+            for query_left in range(q_start, q_end, 64):
+                query_right = min(q_end, query_left + 64)
+                logits = torch.matmul(
+                    q_req[:, query_left:query_right, :].float(),
+                    k_all.transpose(-2, -1).float(),
+                ) * self.scaling
+                q_pos = flat_positions[
+                    token_start + query_left : token_start + query_right
+                ].to(logits.device).view(1, -1, 1)
+                logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
+                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                headwise_probs += probs.view(
+                    self.num_kv_heads, groups, query_right - query_left, -1
+                ).sum(dim=(1, 2))
+            candidate_end = min(history_end, key_end)
+            selected_probs = headwise_probs[
+                :, reference_len + history_start : reference_len + candidate_end
+            ]
+            if tool_kv_eviction and candidate_end < history_end:
+                padded = torch.zeros(
+                    self.num_kv_heads,
+                    history_end - history_start,
+                    device=selected_probs.device,
+                    dtype=selected_probs.dtype,
+                )
+                padded[:, : candidate_end - history_start] = selected_probs
+                selected_probs = padded
+            layer_score = selected_probs.sum(dim=0)
+            headwise_layer_score = torch.cat(
+                [
+                    headwise_probs[:, :reference_len],
+                    selected_probs,
+                ],
+                dim=1,
+            )
 
             req_pool_idx = int(forward_batch.req_pool_indices[batch_idx].item())
             entry = score_store.setdefault(
@@ -492,17 +630,376 @@ class Qwen3Attention(nn.Module):
                     "history_end": history_end,
                     "history_len": history_end - history_start,
                     "query_tokens": q_end - q_start,
-                    "selection_query_start": config.get(
-                        "selection_query_start"
-                    ),
+                    "selection_query_start": config.get("selection_query_start"),
                     "selection_query_end": config.get("selection_query_end"),
-                    "selection_query_phase": config.get(
-                        "selection_query_phase"
-                    ),
+                    "selection_query_phase": config.get("selection_query_phase"),
                     "layers": [],
+                    "headwise_layers": [],
+                    "layer_ids": [],
                 },
             )
             entry["layers"].append(layer_score.detach().cpu())
+            entry["headwise_layers"].append(
+                headwise_layer_score.detach().cpu()
+            )
+            entry["layer_ids"].append(int(self.attn.layer_id))
+
+    def _capture_history_kv_runtime_queries(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Persist method query observations, including first-turn decode."""
+
+        configs = getattr(forward_batch, "history_kv_reference_configs", None)
+        states = getattr(forward_batch, "history_kv_runtime_states", None)
+        if not configs or not states or q is None or positions is None:
+            return
+        if forward_batch.forward_mode.is_decode():
+            query_lens = [1] * int(forward_batch.batch_size)
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            if forward_batch.extend_seq_lens_cpu is None:
+                return
+            query_lens = [int(item) for item in forward_batch.extend_seq_lens_cpu]
+        else:
+            return
+        query = q.view(-1, self.num_heads, self.head_dim)
+        flat_positions = positions.reshape(-1)
+        flat_token_ids = forward_batch.input_ids.reshape(-1)
+        offset = 0
+        for batch_idx, query_len in enumerate(query_lens):
+            token_query = query[offset : offset + query_len]
+            token_positions = flat_positions[offset : offset + query_len].to(
+                dtype=torch.long
+            )
+            token_ids = flat_token_ids[offset : offset + query_len]
+            offset += query_len
+            config = configs[batch_idx] if batch_idx < len(configs) else None
+            state = states[batch_idx] if batch_idx < len(states) else None
+            if not isinstance(config, dict) or state is None:
+                continue
+            method = str(config.get("method") or "").lower()
+            if method == "commitkv":
+                from sglang.srt.mem_cache.history_kv_reference import (
+                    CommitKVServingState,
+                )
+
+                if not isinstance(state, CommitKVServingState):
+                    raise RuntimeError("COMMITKV_RUNTIME_STATE_TYPE_MISMATCH")
+                if self.attn.layer_id != state.policy.config.measurement_layer_id:
+                    continue
+                state.configure_events(config.get("event_token_spans") or [])
+                if not forward_batch.forward_mode.is_decode():
+                    continue
+                if k is None or v is None or query_len != 1:
+                    raise RuntimeError("COMMITKV_DECODE_CAPTURE_REQUIRES_EXPLICIT_KV")
+                seq_len = int(forward_batch.seq_lens[batch_idx].item())
+                req_pool_idx = int(
+                    forward_batch.req_pool_indices[batch_idx].item()
+                )
+                prefix_slots = forward_batch.req_to_token_pool.req_to_token[
+                    req_pool_idx, : max(0, seq_len - 1)
+                ].long()
+                key_buffer, value_buffer = (
+                    forward_batch.token_to_kv_pool.get_kv_buffer(
+                        self.attn.layer_id
+                    )
+                )
+                key_buffer = key_buffer.reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                value_buffer = value_buffer.reshape(
+                    -1, self.num_kv_heads, self.head_dim
+                )
+                normal_key = torch.cat(
+                    [
+                        key_buffer[prefix_slots].to(token_query.dtype),
+                        k[offset - query_len : offset].view(
+                            query_len, self.num_kv_heads, self.head_dim
+                        ),
+                    ],
+                    dim=0,
+                )
+                normal_value = torch.cat(
+                    [
+                        value_buffer[prefix_slots].to(token_query.dtype),
+                        v[offset - query_len : offset].view(
+                            query_len, self.num_kv_heads, self.head_dim
+                        ),
+                    ],
+                    dim=0,
+                )
+                normal_positions = self._reference_normal_positions(
+                    forward_batch,
+                    batch_idx,
+                    seq_len,
+                    token_positions,
+                )
+                reference_layer = None
+                reference_states = getattr(
+                    forward_batch, "history_kv_reference_states", None
+                ) or []
+                if (
+                    batch_idx < len(reference_states)
+                    and reference_states[batch_idx] is not None
+                ):
+                    reference_layer = reference_states[batch_idx].layer(
+                        self.attn.layer_id
+                    )
+                key = normal_key.transpose(0, 1)
+                value = normal_value.transpose(0, 1)
+                key_positions = normal_positions
+                if reference_layer is not None:
+                    reference_layer.validate()
+                    if not torch.equal(
+                        reference_layer.positions,
+                        reference_layer.positions[:1].expand_as(
+                            reference_layer.positions
+                        ),
+                    ):
+                        raise RuntimeError(
+                            "COMMITKV_REQUIRES_COMMON_HEADWISE_POSITIONS"
+                        )
+                    key = torch.cat([reference_layer.key, key], dim=1)
+                    value = torch.cat([reference_layer.value, value], dim=1)
+                    key_positions = torch.cat(
+                        [reference_layer.positions[0], normal_positions], dim=0
+                    )
+                state.record_decode_window(
+                    token_query,
+                    token_positions,
+                    key,
+                    value,
+                    key_positions,
+                    scale=self.scaling,
+                )
+                continue
+            if method != "agentkv":
+                # CommitKV captures paired pre/post windows at explicit action
+                # boundaries; ordinary prompt queries must not enter them.
+                continue
+            from sglang.srt.mem_cache.agentkv import (
+                AGENTKV_STAGE_THINK,
+                AgentKVQueryRing,
+                agentkv_stage_for_event,
+            )
+
+            if not isinstance(state, AgentKVQueryRing):
+                raise RuntimeError("AGENTKV_RUNTIME_STATE_TYPE_MISMATCH")
+            stage_ids = torch.full(
+                (query_len,),
+                AGENTKV_STAGE_THINK,
+                dtype=torch.int32,
+                device=token_query.device,
+            )
+            for span in config.get("event_token_spans") or []:
+                if not isinstance(span, dict):
+                    continue
+                start = int(span.get("start", -1))
+                end = int(span.get("end", -1))
+                if end <= start:
+                    continue
+                stage = agentkv_stage_for_event(
+                    str(span.get("role") or ""),
+                    str(span.get("phase") or "others"),
+                )
+                mask = (token_positions >= start) & (token_positions < end)
+                stage_ids[mask] = stage
+            marker_reassignments = []
+            if forward_batch.forward_mode.is_decode():
+                tails = getattr(state, "_decode_marker_tails", None)
+                stages = getattr(state, "_decode_marker_stages", None)
+                if tails is None:
+                    tails = state._decode_marker_tails = {}
+                if stages is None:
+                    stages = state._decode_marker_stages = {}
+                tail = list(tails.get(self.attn.layer_id, []))
+                current_stage = int(
+                    stages.get(self.attn.layer_id, AGENTKV_STAGE_THINK)
+                )
+                markers = sorted(
+                    [
+                        (
+                            tuple(int(x) for x in item.get("token_ids") or []),
+                            int(item.get("stage")),
+                        )
+                        for item in config.get(
+                            "agentkv_marker_stage_sequences", []
+                        )
+                        if item.get("token_ids")
+                    ],
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                )
+                max_marker = max((len(item[0]) for item in markers), default=1)
+                for local_idx, (token_id, token_position) in enumerate(
+                    zip(token_ids.tolist(), token_positions.tolist())
+                ):
+                    tail.append((int(token_id), int(token_position)))
+                    tail = tail[-max_marker:]
+                    for sequence, marker_stage in markers:
+                        if tuple(item[0] for item in tail[-len(sequence) :]) == sequence:
+                            current_stage = marker_stage
+                            marker_reassignments.append(
+                                (
+                                    [item[1] for item in tail[-len(sequence) :]],
+                                    marker_stage,
+                                )
+                            )
+                            break
+                    stage_ids[local_idx] = current_stage
+                tails[self.attn.layer_id] = tail
+                stages[self.attn.layer_id] = current_stage
+            state.write_layer(
+                layer_id=self.attn.layer_id,
+                query=token_query,
+                positions=token_positions,
+                stage_ids=stage_ids,
+            )
+            for marker_positions, marker_stage in marker_reassignments:
+                state.reassign_positions(
+                    layer_id=self.attn.layer_id,
+                    positions=marker_positions,
+                    stage=marker_stage,
+                )
+
+    @staticmethod
+    def _reference_normal_positions(
+        forward_batch: ForwardBatch,
+        batch_idx: int,
+        seq_len: int,
+        query_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return canonical positions for the ordinary paged sequence."""
+
+        device = query_positions.device
+        ledgers = getattr(forward_batch, "history_kv_resident_positions", None)
+        ledger = list(ledgers[batch_idx]) if ledgers and batch_idx < len(ledgers) else []
+        if len(ledger) >= seq_len:
+            return torch.tensor(ledger[:seq_len], dtype=torch.long, device=device)
+        q_positions = query_positions.reshape(-1).to(dtype=torch.long)
+        prefix_len = seq_len - q_positions.numel()
+        known = ledger[:prefix_len]
+        missing = prefix_len - len(known)
+        if missing:
+            if q_positions.numel():
+                start = q_positions[:1] - missing
+            else:
+                start = torch.tensor(
+                    [known[-1] + 1 if known else 0],
+                    dtype=torch.long,
+                    device=device,
+                )
+            missing_positions = start + torch.arange(
+                missing, dtype=torch.long, device=device
+            )
+        else:
+            missing_positions = q_positions.new_empty(0)
+        positions = torch.cat(
+            [torch.tensor(known, dtype=torch.long, device=device),
+             missing_positions, q_positions]
+        )
+        if positions.numel() != seq_len:
+            raise RuntimeError("REFERENCE_HISTORY_POSITION_LENGTH_MISMATCH")
+        return positions
+
+    def _reference_history_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Correctness route for per-layer/per-head persistent history."""
+
+        if k is None or v is None:
+            raise RuntimeError("REFERENCE_HISTORY_REQUIRES_EXPLICIT_KV")
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            self.attn.k_scale,
+            self.attn.v_scale,
+        )
+        key_buffer, value_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+            self.attn.layer_id
+        )
+        if key_buffer.ndim not in (3, 4) or tuple(key_buffer.shape[-2:]) != (
+            self.num_kv_heads,
+            self.head_dim,
+        ):
+            raise RuntimeError("REFERENCE_HISTORY_UNSUPPORTED_KV_BUFFER_LAYOUT")
+        key_buffer = key_buffer.reshape(-1, self.num_kv_heads, self.head_dim)
+        value_buffer = value_buffer.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        if forward_batch.forward_mode.is_decode():
+            query_lens = [1] * int(forward_batch.batch_size)
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            if forward_batch.extend_seq_lens_cpu is None:
+                raise RuntimeError("REFERENCE_HISTORY_EXTEND_LENGTHS_REQUIRED")
+            query_lens = [int(item) for item in forward_batch.extend_seq_lens_cpu]
+        else:
+            raise RuntimeError("REFERENCE_HISTORY_FORWARD_MODE_UNSUPPORTED")
+
+        states = getattr(forward_batch, "history_kv_reference_states", None) or []
+        outputs = []
+        offset = 0
+        flat_positions = positions.reshape(-1)
+        for batch_idx, query_len in enumerate(query_lens):
+            query = q[offset : offset + query_len]
+            query_pos = flat_positions[offset : offset + query_len]
+            offset += query_len
+            seq_len = int(forward_batch.seq_lens[batch_idx].item())
+            req_pool_idx = int(forward_batch.req_pool_indices[batch_idx].item())
+            slots = forward_batch.req_to_token_pool.req_to_token[
+                req_pool_idx, :seq_len
+            ].long()
+            normal_key = key_buffer[slots].to(query.dtype)
+            normal_value = value_buffer[slots].to(query.dtype)
+            normal_positions = self._reference_normal_positions(
+                forward_batch, batch_idx, seq_len, query_pos
+            )
+            layer = None
+            if batch_idx < len(states) and states[batch_idx] is not None:
+                layer = states[batch_idx].layer(self.attn.layer_id)
+            if layer is None:
+                layer = ReferenceLayerKV(
+                    key=normal_key.new_empty(
+                        self.num_kv_heads, 0, self.head_dim
+                    ),
+                    value=normal_value.new_empty(
+                        self.num_kv_heads, 0, self.head_dim
+                    ),
+                    positions=torch.empty(
+                        self.num_kv_heads,
+                        0,
+                        dtype=torch.long,
+                        device=normal_key.device,
+                    ),
+                )
+            outputs.append(
+                reference_sdpa(
+                    query,
+                    layer,
+                    normal_key,
+                    normal_value,
+                    normal_positions,
+                    query_pos,
+                    scale=self.scaling,
+                    validate_history=False,
+                ).reshape(query_len, -1)
+            )
+        if offset != q.shape[0]:
+            raise RuntimeError("REFERENCE_HISTORY_BATCH_LENGTH_MISMATCH")
+        return torch.cat(outputs, dim=0)
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         if split_qkv_rmsnorm_rope is None:
@@ -602,11 +1099,20 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
+        reference_states = getattr(
+            forward_batch, "history_kv_reference_states", None
+        ) or []
+        use_reference_attention = any(
+            state is not None and state.layer(self.attn.layer_id) is not None
+            for state in reference_states
+        )
+        use_reference_runtime = _requires_reference_runtime_qkv(forward_batch)
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
             and getattr(forward_batch, "c2kv_use_gist_projection", None) is None
             and get_global_server_args().rl_on_policy_target is None
+            and not use_reference_runtime
         )
 
         if use_aiter_fused:
@@ -616,6 +1122,8 @@ class Qwen3Attention(nn.Module):
             save_kv_cache = False
         elif (
             getattr(forward_batch, "c2kv_use_gist_projection", None) is not None
+            or
+            use_reference_runtime
             or
             not _is_npu
             or split_qkv_rmsnorm_rope is None
@@ -638,6 +1146,9 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         self._collect_history_kv_eviction_scores(q, k, positions, forward_batch)
+        self._capture_history_kv_runtime_queries(
+            q, k, v, positions, forward_batch
+        )
 
         # ---------------------------------------------------------
         # C2KV_LAYER0_DIFF_DUMP
@@ -716,13 +1227,18 @@ class Qwen3Attention(nn.Module):
                 "scaling": float(self.scaling),
             }
 
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache=save_kv_cache,
-        )
+        if use_reference_attention:
+            attn_output = self._reference_history_attention(
+                q, k, v, positions, forward_batch
+            )
+        else:
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
 
         if _c2kv_do_dump:
             # self.attn() has now written current query K/V into cache.
@@ -871,6 +1387,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,        # (1, total_len) int64
         attention_mask,                 # BlockMask or None
         apply_gist_residual,
+        projection_set: str = "history",
         **kwargs,
     ):
 
@@ -888,7 +1405,7 @@ class Qwen3Attention(nn.Module):
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
 
-        qkv_gist, _ = self._c2kv_project_gist_qkv(gist_hidden)
+        qkv_gist, _ = self._c2kv_project_gist_qkv(gist_hidden, projection_set)
         q_gist, k_gist, v_gist = qkv_gist.split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
@@ -1052,6 +1569,9 @@ class Qwen3DecoderLayer(nn.Module):
             pic_param=getattr(config, "pic_param", "qkv"),
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            tool_gist_uses_served_t0=_c2kv_tool_gist_uses_served_t0(
+                config, get_global_server_args()
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -1217,6 +1737,119 @@ class Qwen3Model(Qwen2Model):
         self.prepare_gist_input = get_prepare_gist_input_func(gist_cfg)
         return gist_cfg
 
+    def _init_c2kv_tool_set(self, config, tool_config, server_args) -> GistConfig:
+        """Gist embedding and mask/position builder of the second ("tool") set.
+
+        The layout constants come from the tool checkpoint's own config.json;
+        the projection weights are loaded afterwards by
+        ``Qwen3ForCausalLM.load_c2kv_tool_gist_weights``.  Nothing here is
+        consulted by the ordinary decode path.
+        """
+        gist_cfg = GistConfig(
+            gist_type=server_args.c2kv_gist_type,
+            gist_param=server_args.c2kv_gist_param,
+            gist_extra_embed_num=int(tool_config.get("gist_extra_embed_num", 1)),
+            gist_token_id=tool_config.get("gist_token_id"),
+            gist_residual_type=tool_config.get("gist_residual_type", "none"),
+            gist_overlap=int(tool_config.get("gist_overlap", 0)),
+            hidden_size=config.hidden_size,
+            attention_bias=bool(tool_config.get("attention_bias", False)),
+        )
+        self.tool_gist_embed_tokens = nn.Embedding(
+            gist_cfg.gist_extra_embed_num,
+            config.hidden_size,
+            dtype=torch.float32,
+        )
+        self.prepare_tool_gist_input = get_prepare_gist_input_func(gist_cfg)
+        return gist_cfg
+
+
+# Architecture fields the tool gist checkpoint must share with the served
+# model: its gist projections are applied to the served model's hidden states.
+_C2KV_TOOL_GIST_SHAPE_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+)
+
+
+def _load_c2kv_tool_gist_config(source: str, config, server_args) -> Dict[str, Any]:
+    """Read and validate ``<source>/config.json`` of the tool gist set."""
+    import json
+
+    with open(os.path.join(source, "config.json"), "r", encoding="utf-8") as handle:
+        tool_config = json.load(handle)
+    if tool_config.get("pic_enabled"):
+        raise ValueError("--c2kv-tool-gist-weights must be a gist checkpoint, not PIC")
+    gist_type = tool_config.get("gist_type")
+    if gist_type is not None and gist_type != server_args.c2kv_gist_type:
+        raise ValueError(
+            "C2KV tool gist set declares gist_type "
+            f"{gist_type!r} but the server runs {server_args.c2kv_gist_type!r}"
+        )
+    gist_param = tool_config.get("gist_param")
+    if gist_param is not None and str(gist_param) != str(server_args.c2kv_gist_param):
+        raise ValueError(
+            "C2KV tool gist set declares gist_param "
+            f"{gist_param!r} but the server runs {server_args.c2kv_gist_param!r}"
+        )
+    for field in _C2KV_TOOL_GIST_SHAPE_FIELDS:
+        expected = getattr(config, field, None)
+        actual = tool_config.get(field)
+        if expected is not None and actual is not None and int(actual) != int(expected):
+            raise ValueError(
+                f"C2KV tool gist set {field}={actual} does not match the served "
+                f"model ({expected})"
+            )
+    return tool_config
+
+
+def _c2kv_tool_gist_uses_served_t0(config, server_args) -> bool:
+    """Reuse the served FP32 gist Parameters only for one physical T0 source."""
+    source = getattr(server_args, "c2kv_tool_gist_weights", None)
+    served = getattr(server_args, "model_path", None)
+    if (
+        not source
+        or not served
+        or getattr(config, "history_memory_compression_domain", None) != "tool"
+        or getattr(config, "history_memory_variant", None) != "T0"
+    ):
+        return False
+    try:
+        return os.path.samefile(
+            os.path.expanduser(source), os.path.expanduser(served)
+        )
+    except OSError:
+        return False
+
+
+def _c2kv_gist_weight_files(source: str) -> List[str]:
+    """Safetensors files of ``source`` that can hold gist tensors."""
+    import json
+
+    package = os.path.join(source, "c2kv-gist.safetensors")
+    if os.path.isfile(package):
+        return [package]
+    index = os.path.join(source, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index, "r", encoding="utf-8") as handle:
+            weight_map = json.load(handle).get("weight_map") or {}
+        files = sorted(
+            {name for key, name in weight_map.items() if "gist_" in key}
+        )
+        if not files:
+            raise ValueError(f"No gist tensors listed in {index}")
+        return [os.path.join(source, name) for name in files]
+    single = os.path.join(source, "model.safetensors")
+    if os.path.isfile(single):
+        return [single]
+    raise ValueError(
+        "--c2kv-tool-gist-weights needs c2kv-gist.safetensors, "
+        f"model.safetensors or model.safetensors.index.json under {source}"
+    )
+
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -1287,6 +1920,42 @@ class Qwen3ForCausalLM(nn.Module):
                 )
             else:
                 self.gist_cfg = self.model._init_c2kv(config, _server_args)
+            # Optional second gist projection set for tool-definition
+            # compression (T0).  Weights are loaded by the model runner right
+            # after the served checkpoint, see load_c2kv_tool_gist_weights.
+            self.tool_gist_cfg = None
+            self.c2kv_tool_gist_source = getattr(
+                _server_args, "c2kv_tool_gist_weights", None
+            )
+            self.c2kv_tool_gist_identity = None
+            self.c2kv_tool_gist_metadata = None
+            self.c2kv_tool_gist_uses_served_t0 = False
+            if self.c2kv_tool_gist_source:
+                if self.full_length_pic:
+                    raise ValueError(
+                        "--c2kv-tool-gist-weights is not supported with PIC"
+                    )
+                tool_config = _load_c2kv_tool_gist_config(
+                    self.c2kv_tool_gist_source, config, _server_args
+                )
+                self.c2kv_tool_gist_uses_served_t0 = (
+                    _c2kv_tool_gist_uses_served_t0(config, _server_args)
+                )
+                if self.c2kv_tool_gist_uses_served_t0:
+                    self.tool_gist_cfg = self.gist_cfg
+                    self.model.tool_gist_embed_tokens = self.model.gist_embed_tokens
+                    self.model.prepare_tool_gist_input = (
+                        self.model.prepare_gist_input
+                    )
+                else:
+                    self.tool_gist_cfg = self.model._init_c2kv_tool_set(
+                        config, tool_config, _server_args
+                    )
+                self.c2kv_tool_gist_metadata = {
+                    key: value
+                    for key, value in tool_config.items()
+                    if key.startswith("history_memory_") or key.startswith("gist_")
+                }
             shadow_layer = getattr(_server_args, "c2kv_shadow_feature_layer", None)
             if shadow_layer is not None:
                 num_layers = int(config.num_hidden_layers)
@@ -1399,7 +2068,35 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     @torch.no_grad()
-    def generate_gist(self, input_ids, attention_mask, ratio=4, **kwargs):
+    def _c2kv_gist_set(self, projection_set: str):
+        """(gist_cfg, gist embedding, prepare_gist_input) of one projection set."""
+        if projection_set == "history":
+            return (
+                self.gist_cfg,
+                self.model.gist_embed_tokens,
+                self.model.prepare_gist_input,
+            )
+        if projection_set == "tool":
+            if getattr(self, "tool_gist_cfg", None) is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNAVAILABLE: projection_set='tool' needs "
+                    "a server started with --c2kv-tool-gist-weights"
+                )
+            if self.c2kv_tool_gist_identity is None:
+                raise RuntimeError(
+                    "C2KV_TOOL_GIST_UNLOADED: the tool gist weights were not "
+                    "loaded before extraction"
+                )
+            return (
+                self.tool_gist_cfg,
+                self.model.tool_gist_embed_tokens,
+                self.model.prepare_tool_gist_input,
+            )
+        raise ValueError(f"Unknown C2KV projection set {projection_set!r}")
+
+    def generate_gist(
+        self, input_ids, attention_mask, ratio=4, projection_set="history", **kwargs
+    ):
         """
         Run the gist extraction pass for one document.
 
@@ -1407,6 +2104,8 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids:       (1, seq_len) int64 on GPU
             attention_mask:  (1, seq_len) bool on GPU
             ratio:           compression ratio; gist_len = ceil(seq_len / ratio)
+            projection_set:  "history" (the served checkpoint's gist set) or
+                             "tool" (--c2kv-tool-gist-weights)
 
         Returns:
             gist_key_values: List[(K, V)] per layer, each (gist_len, kv_size) float,
@@ -1415,8 +2114,11 @@ class Qwen3ForCausalLM(nn.Module):
             gist_position_ids: (1, gist_len) int64
         """
         autocast_active = bool(kwargs.pop("_c2kv_fp32_autocast_active", False))
+        gist_cfg, gist_embed_tokens, prepare_gist_input = self._c2kv_gist_set(
+            projection_set
+        )
         base_dtype = self.model.embed_tokens.weight.dtype
-        gist_dtype = self.model.gist_embed_tokens.weight.dtype
+        gist_dtype = gist_embed_tokens.weight.dtype
         if gist_dtype != base_dtype and not autocast_active:
             with torch.autocast(
                 device_type=input_ids.device.type,
@@ -1426,17 +2128,18 @@ class Qwen3ForCausalLM(nn.Module):
                     input_ids,
                     attention_mask,
                     ratio=ratio,
+                    projection_set=projection_set,
                     _c2kv_fp32_autocast_active=True,
                     **kwargs,
                 )
 
-        block_mask, gist_mask, position_ids = self.model.prepare_gist_input(
+        block_mask, gist_mask, position_ids = prepare_gist_input(
             input_ids, attention_mask, ratio=ratio
         )
         gist_len = gist_mask.shape[1]
         device = input_ids.device
 
-        gist_embed = self.model.gist_embed_tokens(
+        gist_embed = gist_embed_tokens(
             torch.zeros((1, gist_len), dtype=torch.long, device=device)
         ).to(dtype=self.model.embed_tokens.weight.dtype)
         inputs_embeds = torch.cat(
@@ -1446,16 +2149,25 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states = inputs_embeds
         gist_key_values = []
         for layer_idx, layer in enumerate(self.model.layers):
-            layer_residual = get_apply_gist_residual_func(self.gist_cfg, layer_idx)
+            layer_residual = get_apply_gist_residual_func(gist_cfg, layer_idx)
             hidden_states, layer_kv = layer.forward_with_gist(
                 hidden_states,
                 gist_mask,
                 positions=position_ids.squeeze(0),
                 attention_mask=block_mask,
                 apply_gist_residual=layer_residual,
+                projection_set=projection_set,
                 ratio=ratio,
             )
             gist_key_values.append(layer_kv)
+            # These are cloned K/V payload tensors. Logical bytes therefore
+            # exclude the fused QKV backing storage; CUDA allocator peaks still
+            # account for the full Q/K/V workspace separately.
+            paper_telemetry.sample(
+                "forward_with_gist",
+                tensors=gist_key_values,
+                temporary_kv=True,
+            )
 
         gist_position_ids = position_ids[:, -gist_len:].contiguous()
 
@@ -1642,6 +2354,11 @@ class Qwen3ForCausalLM(nn.Module):
                 else k[span_start:span_end].contiguous().clone()
             )
             raw_key_values.append((repair_k_span, v_span))
+            paper_telemetry.sample(
+                "forward_repair_kv",
+                tensors=raw_key_values,
+                temporary_kv=True,
+            )
 
             q = q.view(1, seq_len, layer.self_attn.num_heads, layer.self_attn.head_dim)
             k_attn = k.view(
@@ -2337,6 +3054,105 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def load_c2kv_tool_gist_weights(self) -> Dict[str, Any]:
+        """Load the second ("tool") gist set from --c2kv-tool-gist-weights.
+
+        Reads only the ``gist_*`` tensors of the source (a full checkpoint or a
+        ``c2kv-gist.safetensors`` export package) and maps them onto
+        ``tool_gist_qkv_proj`` / ``tool_gist_embed_tokens``.  Every fused
+        projection must receive all three shards, otherwise loading fails
+        instead of serving a partially initialised encoder.
+        """
+        from safetensors import safe_open
+
+        from sglang.srt.mem_cache.c2kv_semantics import c2kv_tool_gist_identity
+
+        source = getattr(self, "c2kv_tool_gist_source", None)
+        if not source or getattr(self, "tool_gist_cfg", None) is None:
+            raise RuntimeError("No C2KV tool gist set is configured on this model")
+        if getattr(self, "c2kv_tool_gist_uses_served_t0", False):
+            self.c2kv_tool_gist_identity = c2kv_tool_gist_identity(source)
+            summary = {
+                "source": source,
+                "identity": self.c2kv_tool_gist_identity,
+                "variant": "T0",
+                "compression_domain": "tool",
+                "parameter_source": "served_checkpoint",
+            }
+            logger.info("C2KV tool gist set aliases served T0: %s", summary)
+            return summary
+        params_dict = dict(self.named_parameters())
+        stacked = [
+            ("tool_gist_qkv_proj", "gist_q_proj", "q"),
+            ("tool_gist_qkv_proj", "gist_k_proj", "k"),
+            ("tool_gist_qkv_proj", "gist_v_proj", "v"),
+        ]
+        expected = {("model.tool_gist_embed_tokens.weight", None)}
+        for name in params_dict:
+            if ".tool_gist_qkv_proj." in name:
+                expected.update((name, shard) for shard in "qkv")
+        loaded = set()
+        files = _c2kv_gist_weight_files(source)
+        for path in files:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    if "gist_" not in name:
+                        continue
+                    target = name if name.startswith("model.") else add_prefix(name, "model")
+                    if target.startswith("model.gist_embed_tokens."):
+                        target = target.replace(
+                            "model.gist_embed_tokens.", "model.tool_gist_embed_tokens."
+                        )
+                        param = params_dict[target]
+                        default_weight_loader(param, handle.get_tensor(name))
+                        loaded.add((target, None))
+                        continue
+                    layer_id = get_layer_id(target)
+                    if (
+                        layer_id is not None
+                        and hasattr(self.model, "start_layer")
+                        and (
+                            layer_id < self.model.start_layer
+                            or layer_id >= self.model.end_layer
+                        )
+                    ):
+                        continue
+                    for param_name, weight_name, shard_id in stacked:
+                        if weight_name not in target:
+                            continue
+                        target = target.replace(weight_name, param_name)
+                        if target not in params_dict:
+                            raise ValueError(
+                                f"C2KV tool gist tensor {name} has no parameter {target}"
+                            )
+                        param = params_dict[target]
+                        param.weight_loader(param, handle.get_tensor(name), shard_id)
+                        loaded.add((target, shard_id))
+                        break
+                    else:
+                        raise ValueError(
+                            f"Unexpected gist tensor {name} in C2KV tool gist source {source}"
+                        )
+        missing = sorted(f"{name}[{shard}]" for name, shard in expected - loaded)
+        if missing:
+            raise ValueError(
+                "C2KV tool gist source is incomplete; missing "
+                f"{len(missing)} shards, e.g. {missing[:3]}"
+            )
+        self.c2kv_tool_gist_identity = c2kv_tool_gist_identity(source)
+        summary = {
+            "source": source,
+            "files": [os.path.basename(path) for path in files],
+            "shards": len(loaded),
+            "identity": self.c2kv_tool_gist_identity,
+            "variant": (self.c2kv_tool_gist_metadata or {}).get("history_memory_variant"),
+            "compression_domain": (self.c2kv_tool_gist_metadata or {}).get(
+                "history_memory_compression_domain"
+            ),
+        }
+        logger.info("C2KV tool gist set loaded: %s", summary)
+        return summary
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -246,15 +246,7 @@ def pool_snapkv_scores_by_position(
     kernel_size: int,
     pooling: str,
 ) -> torch.Tensor:
-    """Pool retained SnapKV scores over canonical token neighborhoods.
-
-    Retained KV rows remain sorted by their original token position, but after
-    persistent eviction adjacent rows need not have been adjacent in the source
-    prompt. Missing canonical positions therefore contribute padding (zero for
-    average pooling and negative infinity for max pooling), rather than allowing
-    a physically adjacent retained row to cross the gap.
-    """
-
+    """Pool SnapKV scores without bridging gaps left by persistent eviction."""
     positions = [int(position) for position in canonical_positions]
     if len(positions) != scores.shape[-1]:
         raise ValueError(
@@ -272,10 +264,6 @@ def pool_snapkv_scores_by_position(
         )
     if kernel_size == 1 or scores.shape[-1] <= 1:
         return scores
-
-    # Preserve the existing native pooling path exactly when no canonical gaps
-    # exist. The sparse path below avoids allocating a tensor spanning every
-    # position between the first and last retained token.
     if all(right == left + 1 for left, right in zip(positions, positions[1:])):
         return _pool_snapkv_scores(scores, kernel_size, pooling)
 

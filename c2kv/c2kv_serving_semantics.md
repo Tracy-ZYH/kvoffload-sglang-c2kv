@@ -30,6 +30,7 @@ The C2KV-specific flags are:
 | `--c2kv-max-tokens` | `65536` | Upper bound for the C2KV pool. |
 | `--c2kv-query-proj` | `base` | Default projection for ordinary tokens after injected C2KV KV. `gist` is an explicit alternate mode. |
 | `--c2kv-tools-dump` | `full` | Tool-schema serialization used by chat and extraction. `exclude_unset` is also accepted. All clients in one comparison must use the same value. |
+| `--c2kv-tool-gist-weights` | unset | Directory of a second gist checkpoint (full checkpoint or `c2kv-gist.safetensors` package with `config.json`) loaded as the `tool` projection set. Only extraction requests that name `projection_set="tool"` use it; decode never does. See "Tool projection set". |
 
 Requests without C2KV annotations follow the ordinary SGLang path. C2KV chat
 requests must contain one generation at a time; batched request shapes are
@@ -77,6 +78,43 @@ The server replaces the annotated message's ordinary history KV with the
 stored gist KV while advancing the logical position cursor by
 `original_seq_len`. A missing or evicted key fails the C2KV injection instead
 of silently serving the uncompressed prompt.
+
+## Tool projection set
+
+`--c2kv-tool-gist-weights <dir>` loads a second, independent set of gist
+parameters (`tool_gist_qkv_proj` per layer and `tool_gist_embed_tokens`) from
+a checkpoint that shares the served base weights, e.g. a T0 tool-definition
+encoder. The directory must contain `config.json`; `gist_type` and
+`gist_param` there must equal the server flags, `pic_enabled` must be off, and
+the architecture fields must match the served model. Loading is all-or-nothing:
+a missing shard aborts startup instead of serving a partial encoder.
+
+The set is addressed per extraction, never per decode token:
+
+* `POST /v1/c2kv/extract` accepts `projection_set` (`history`, the default, or
+  `tool`) and `token_ids` (an exact encoder input; when given, `text`, `role`
+  and `tools` are not rendered). The cache key of a `tool` entry additionally
+  carries `projection_set` and the tool checkpoint identity, so it can never
+  alias a `history` entry; `history` keys are unchanged.
+* `POST /v1/c2kv/native_generate` chunks accept `projection_set`; a `tool`
+  chunk's handle binds the `tool_gist.identity` reported by the capability
+  block, and such chunks are laid out like any other chunk (typically before
+  the history chunks, right after `system_input_ids`).
+* Ordinary tokens keep their base projections; the per-token gist mask and the
+  CUDA-graph buffers are untouched by the second set.
+
+The chat endpoint can keep `tools` for tool-call parsing while omitting them
+from the prompt: `c2kv_tools_in_prompt: false`. The client then supplies the
+tool definitions itself, as an explicit protocol block in the system message
+plus gist carrier messages (the `c2kv` harness `--tool-memory` axis). Every
+token frame the server measures (segment insertion points, history span,
+repair offsets) is computed without the `tools` prologue in that mode, so the
+frames agree.
+
+`GET` of the native capability reports `tool_gist: {enabled, source, identity,
+metadata}`; `identity` is derived from the tool checkpoint's on-disk metadata
+(`config.json` gist/history_memory fields, `trainer_state.json` step, package
+manifest) and is the same string the extraction cache keys use.
 
 ## Query projection
 

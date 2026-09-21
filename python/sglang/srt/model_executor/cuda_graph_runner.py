@@ -680,7 +680,6 @@ class CudaGraphRunner:
             enable_c2kv_query_projection=(
                 getattr(model_runner.server_args, "enable_c2kv", False)
                 and not getattr(model_runner.model, "full_length_pic", False)
-                and os.environ.get("C2KV_USE_GIST_QUERY_PROJECTION", "1") != "0"
             ),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None

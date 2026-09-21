@@ -59,6 +59,11 @@ class SessionSlot:
     c2kv_position_correction: int = 0
     history_kv_resident_positions: Any = None
     history_kv_score_state: Any = None
+    history_kv_reference_state: Any = None
+    history_kv_reference_config: Any = None
+    history_kv_runtime_state: Any = None
+    c2kv_tool_source_spans: Any = None
+    c2kv_tool_kv_accounting: Any = None
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -85,6 +90,19 @@ class SessionSlot:
         resident = set(self.history_kv_resident_positions)
         self.history_kv_score_state = {layer: {p: s for p, s in scores.items() if p in resident}
                                      for layer, scores in (getattr(req, "history_kv_score_state", {}) or {}).items()}
+        self.history_kv_reference_state = getattr(
+            req, "history_kv_reference_state", None
+        )
+        self.history_kv_reference_config = getattr(
+            req, "history_kv_reference_config", None
+        )
+        self.history_kv_runtime_state = getattr(
+            req, "history_kv_runtime_state", None
+        )
+        self.c2kv_tool_source_spans = list(getattr(req, "c2kv_tool_source_spans", []) or [])
+        report = getattr(req, "kv_memory_report", None) or {}
+        self.c2kv_tool_kv_accounting = {key: int(report.get(key) or 0) for key in (
+            "active_tool_kv_tokens", "active_tool_gist_tokens", "active_tool_repair_tokens", "tool_encoder_source_tokens")}
 
         if is_first:
             self.last_node = req.last_node
@@ -99,6 +117,10 @@ class SessionSlot:
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.history_kv_reference_state = None
+        req.history_kv_runtime_state = None
+        req.reference_decode_persistent_state = None
+        req.reference_decode_baseline_runtime_state = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -107,7 +129,26 @@ class SessionSlot:
         req.kv_allocated_len = self.kv_allocated_len
         req.swa_evicted_seqlen = self.swa_evicted_seqlen
         req.c2kv_position_correction = self.c2kv_position_correction
+        req.history_kv_resident_positions = list(
+            self.history_kv_resident_positions or []
+        )
         req.history_kv_score_state = self.history_kv_score_state
+        req.history_kv_reference_state = self.history_kv_reference_state
+        incoming_reference_config = getattr(
+            req, "history_kv_reference_config", None
+        )
+        if incoming_reference_config is None:
+            req.history_kv_reference_config = self.history_kv_reference_config
+        elif self.history_kv_reference_config is not None and str(
+            incoming_reference_config.get("method") or ""
+        ).lower() != str(
+            self.history_kv_reference_config.get("method") or ""
+        ).lower():
+            raise RuntimeError("PERSISTENT_HISTORY_REFERENCE_METHOD_CHANGED")
+        req.history_kv_runtime_state = self.history_kv_runtime_state
+        req.c2kv_tool_source_spans = list(self.c2kv_tool_source_spans or [])
+        if self.c2kv_tool_source_spans and isinstance(getattr(req, "kv_memory_report", None), dict):
+            req.kv_memory_report.update(self.c2kv_tool_kv_accounting or {})
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -144,7 +185,9 @@ class SessionAwareCache(BasePrefixCache):
     @staticmethod
     def owns_finished_request(req: Req) -> bool:
         """Streaming KV belongs to the session, even without radix insertion."""
-        return _is_streaming(req)
+        return _is_streaming(req) or bool(
+            getattr(req, "session_cache_closed_during_request", False)
+        )
 
     @property
     def req_to_token_pool(self):
@@ -194,6 +237,21 @@ class SessionAwareCache(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
+        if getattr(req, "session_cache_closed_during_request", False):
+            # A retry after explicit close still owns the restored KV row. Do
+            # not match its possibly compacted physical indices as a radix key.
+            prefix_len = min(
+                req.kv_committed_len, max(len(params.key.token_ids) - 1, 0)
+            )
+            device_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :prefix_len
+            ].to(dtype=torch.int64)
+            return MatchResult(
+                device_indices=device_indices,
+                last_device_node=req.last_node,
+                last_host_node=req.last_node,
+                cache_protected_len=req.cache_protected_len,
+            )
         if not _is_streaming(req):
             return self.inner.match_prefix(params)
 
@@ -207,6 +265,31 @@ class SessionAwareCache(BasePrefixCache):
             ):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING")
             return self.inner.match_prefix(params)
+
+        # A persistent arm can follow a legacy streaming turn that did not
+        # carry the persistent hint (the first turn has no history to evict).
+        # That turn may have left decode KV in the session slot. Adopt only
+        # the canonical prompt prefix before restoring the slot, otherwise the
+        # old decode suffix becomes allocator-owned but unaccounted after the
+        # next persistent request overwrites the slot metadata.
+        config = getattr(req, "history_kv_eviction", None)
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        if (
+            isinstance(config, dict)
+            and config.get("persistent_continuation_pending")
+            and not slot.history_kv_resident_positions
+        ):
+            logical_prefix = int(
+                hint.get("persistent_session_logical_prefix_tokens") or 0
+            )
+            if logical_prefix > 0:
+                self._adopt_legacy_persistent_prefix(slot, logical_prefix)
+
+        drop_generation_prefix = int(
+            hint.get("persistent_session_drop_generation_prefix_tokens") or 0
+        )
+        if drop_generation_prefix:
+            self._trim_persistent_generation_prefix(slot, req)
 
         slot.restore_to_req(req)
 
@@ -241,11 +324,31 @@ class SessionAwareCache(BasePrefixCache):
             )
             hint = req.c2kv_kv_memory_hint or {}
             logical_prefix = int(hint["persistent_session_logical_prefix_tokens"])
+            computed_prefix = int(
+                hint.get("persistent_session_computed_prefix_tokens", logical_prefix)
+            )
             canonical_len = int(hint["persistent_session_canonical_prompt_tokens"])
             prior_positions = list(slot.history_kv_resident_positions or [])
             if len(prior_positions) != int(req.kv_committed_len):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_LEDGER_LENGTH_MISMATCH")
-            positions = append_resident_positions(prior_positions, logical_prefix, canonical_len)
+            descriptors = getattr(req, "c2kv_composition_pending", None)
+            if descriptors:
+                from sglang.srt.mem_cache.c2kv_composition import resident_positions, split_rounds_at_query, raw_query_window
+                positions = resident_positions(len(req.origin_input_ids), descriptors, prior_positions, computed_prefix)
+                cursor = len(prior_positions)
+                source_cursor = computed_prefix
+                for descriptor in descriptors:
+                    source_cursor += descriptor["token_start"] - cursor
+                    if descriptor.get("region") == "tool":
+                        req.c2kv_tool_source_spans.append((source_cursor, source_cursor + descriptor["source_tokens"]))
+                    source_cursor += descriptor["source_tokens"]
+                    cursor = descriptor["token_end"]
+                if positions and positions[-1] >= canonical_len:
+                    raise RuntimeError("PERSISTENT_HISTORY_TOOL_CANONICAL_LENGTH_MISMATCH")
+            else:
+                positions = append_resident_positions(
+                    prior_positions, computed_prefix, canonical_len
+                )
             req.history_kv_resident_positions = positions
             canonical_scopes = config.get("persistent_canonical_scopes")
             if isinstance(canonical_scopes, list) and canonical_scopes:
@@ -275,7 +378,7 @@ class SessionAwareCache(BasePrefixCache):
                     int(config["persistent_canonical_history_end"]))
             delta_history = int(config.get("persistent_delta_history_tokens") or 0)
             prefix_len = int(req.kv_committed_len)
-            origin_len = len(req.origin_input_ids)
+            origin_len = len(req.c2kv_virtual_input_ids) if descriptors else len(req.origin_input_ids)
             if not (0 <= protected <= history_end <= origin_len and len(positions) == origin_len):
                 req.set_finish_with_abort(
                     "PERSISTENT_HISTORY_SESSION_RANGE_INVALID: "
@@ -290,7 +393,16 @@ class SessionAwareCache(BasePrefixCache):
                     origin_len,
                     config.get("history_kv_recent_window"),
                 )
-                if query_window is None:
+                if descriptors:
+                    if query_window is None:
+                        query_window = (max(prefix_len, history_end - 1), max(prefix_len + 1, history_end))
+                    query_start, query_end = raw_query_window(req.c2kv_rounds, descriptors, query_window)
+                    rounds = split_rounds_at_query(req.c2kv_rounds, descriptors, query_start, query_end, C2KVPrefillRound)
+                    config.update(selection_query_start=query_start, selection_query_end=query_end,
+                                  selection_query_tokens=query_end - query_start,
+                                  selection_query_phase="new_tail_prefill_before_eviction")
+                    req.c2kv_composition_pending = None
+                elif query_window is None:
                     rounds = [
                         C2KVPrefillRound(
                             list(
@@ -324,8 +436,6 @@ class SessionAwareCache(BasePrefixCache):
                             req.origin_input_ids[query_start:query_end]
                         )
                     else:
-                        # The first active round must include the resident
-                        # prefix so prepare_c2kv_round_input can consume it.
                         query_tokens = list(req.origin_input_ids[:query_end])
                     rounds.append(
                         C2KVPrefillRound(
@@ -347,11 +457,15 @@ class SessionAwareCache(BasePrefixCache):
                 req.c2kv_rounds = rounds
                 req.c2kv_round_idx = 0
                 req.c2kv_round_start_len = 0
-                req.c2kv_virtual_input_ids = list(req.origin_input_ids)
+                if not descriptors:
+                    req.c2kv_virtual_input_ids = list(req.origin_input_ids)
                 config["history_start"] = protected
                 config["history_end"] = history_end
                 config["persistent_prior_physical_tokens"] = prefix_len
                 config["resident_logical_positions"] = positions
+                if req.c2kv_tool_source_spans:
+                    from sglang.srt.mem_cache.c2kv_composition import protected_history_indices
+                    config["protected_history_indices"] = protected_history_indices(positions, protected, history_end, req.c2kv_tool_source_spans)
                 config["previous_resident_position_summary"] = position_summary(prior_positions)
                 if isinstance(report, dict):
                     report["persistent_session_history_start"] = protected
@@ -383,6 +497,10 @@ class SessionAwareCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        if getattr(req, "session_cache_closed_during_request", False):
+            # The orphaned request owns the row transferred by release_session.
+            # Its physical KV can no longer be inserted under canonical tokens.
+            return self.inner.cache_finished_req(req, is_insert=False, **kwargs)
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
@@ -400,25 +518,81 @@ class SessionAwareCache(BasePrefixCache):
                     int(hint.get("persistent_session_logical_prefix_tokens", 0)),
                     int(hint.get("persistent_session_canonical_prompt_tokens", len(req.origin_input_ids))))
                 req.history_kv_resident_positions = positions
-            if len(positions) != len(req.origin_input_ids):
+            reference_config = getattr(req, "history_kv_reference_config", None)
+            exact_generated_prefix = bool(
+                isinstance(reference_config, dict)
+                and str(reference_config.get("method") or "").lower()
+                in {"agentkv", "commitkv"}
+            )
+            if (
+                not exact_generated_prefix
+                and len(positions) != len(req.origin_input_ids)
+            ):
                 raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
             self._discard_persistent_decode_suffix(req)
+            positions = list(req.history_kv_resident_positions or [])
+            # Ordinary persistent methods discard every decode KV token before
+            # saving the session. The validated resident ledger is therefore
+            # all prompt, even if overlap advanced the mutable decode length.
+            protected_prompt_len = (
+                int(getattr(req, "reference_decode_protected_len", len(positions)) or 0)
+                if exact_generated_prefix
+                else len(positions)
+            )
+            if not 0 <= protected_prompt_len <= len(positions):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_PROTECTED_PROMPT_LENGTH_MISMATCH"
+                )
             if isinstance(getattr(req, "kv_memory_report", None), dict):
                 req.kv_memory_report["persistent_session_saved_position_summary"] = position_summary(positions)
                 old_slot = self.slots.get(req.session.session_id)
                 prior = list(old_slot.history_kv_resident_positions or []) if old_slot else []
                 event = req.kv_memory_report.setdefault("history_kv_lifecycle", {})
+                reference_method = str(
+                    (reference_config or {}).get("method") or ""
+                ).lower()
+                if exact_generated_prefix:
+                    computed_prefix = int(
+                        hint.get("persistent_session_computed_prefix_tokens", 0)
+                        or 0
+                    )
+                    canonical_prompt = int(
+                        hint.get(
+                            "persistent_session_canonical_prompt_tokens",
+                            len(req.origin_input_ids),
+                        )
+                        or 0
+                    )
+                    appended_physical_tokens = canonical_prompt - computed_prefix
+                else:
+                    appended_physical_tokens = int(
+                        hint.get("persistent_session_delta_tokens", 0)
+                    )
+                if appended_physical_tokens < 0:
+                    raise RuntimeError(
+                        "PERSISTENT_HISTORY_SESSION_APPEND_COUNT_INVALID"
+                    )
+                resident_after_append = len(prior) + appended_physical_tokens
+                prompt_positions = positions[:protected_prompt_len]
                 event.update({
                     **{k: hint.get(k) for k in ("episode_id", "turn_id", "step_id")},
                     "event": "session_prompt_saved", "session_id": req.session.session_id,
-                    "history_kv_backend": "physical_eviction", "persistent_session_enabled": True,
+                    "history_kv_backend": (
+                        "reference_attention"
+                        if reference_method in {"pyramid", "pyramidkv", "agentkv", "commitkv"}
+                        else "physical_eviction"
+                    ), "persistent_session_enabled": True,
                     "resident_tokens_before_append": len(prior),
                     "new_turn_tokens": int(hint.get("persistent_session_delta_tokens", 0)),
-                    "resident_tokens_after_append": len(prior) + int(hint.get("persistent_session_delta_tokens", 0)),
-                    "resident_tokens_after_eviction": len(positions),
-                    "evicted_tokens_this_turn": len(prior) + int(hint.get("persistent_session_delta_tokens", 0)) - len(positions),
+                    "physical_tokens_appended": appended_physical_tokens,
+                    "resident_tokens_after_append": resident_after_append,
+                    "resident_tokens_after_eviction": protected_prompt_len,
+                    "evicted_tokens_this_turn": resident_after_append - protected_prompt_len,
+                    "resident_stream_tokens_after_decode": len(positions),
+                    "resident_decode_normal_tokens": len(positions) - protected_prompt_len,
                     "previous_resident_position_summary": position_summary(prior),
-                    "resident_position_summary": position_summary(positions),
+                    "resident_position_summary": position_summary(prompt_positions),
+                    "resident_stream_position_summary": position_summary(positions),
                     "full_history_reprefill_performed": False,
                     "history_prefill_tokens": int((getattr(req, "history_kv_eviction", None) or {}).get("persistent_delta_history_tokens", 0)),
                     "canonical_delta_prefill_tokens": int(hint.get("persistent_session_delta_tokens", 0)),
@@ -453,6 +627,145 @@ class SessionAwareCache(BasePrefixCache):
         session may start at any page in the pool; comparing a physical page
         ID with ceil(prompt_len/page_size) can free the prompt itself.
         """
+        reference_config = getattr(req, "history_kv_reference_config", None)
+        reference_method = (
+            str(reference_config.get("method") or "").lower()
+            if isinstance(reference_config, dict)
+            else ""
+        )
+        if reference_method in {"agentkv", "commitkv"}:
+            # These methods checkpoint generated KV during decode. Persist the
+            # exact raw token stream instead of rolling back and re-prefilling
+            # a structured serialization, which would revive evicted tokens.
+            committed_len = int(req.kv_committed_len)
+            allocated_len = int(req.kv_allocated_len)
+            if not 0 <= committed_len <= allocated_len:
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_INVALID_FINISHED_LENGTHS"
+                )
+            correction = int(getattr(req, "c2kv_position_correction", 0) or 0)
+            ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+            if len(ledger) > committed_len:
+                raise RuntimeError("PERSISTENT_HISTORY_SESSION_FINISHED_LEDGER_MISMATCH")
+            if len(ledger) < committed_len:
+                start = len(ledger) + correction
+                ledger.extend(range(start, start + committed_len - len(ledger)))
+            logical_start = getattr(req, "reference_decode_logical_start", None)
+            if logical_start is None:
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_GENERATION_START_UNAVAILABLE"
+                )
+            logical_start = int(logical_start)
+            computed_horizon = committed_len + correction
+            output_ids = list(getattr(req, "output_ids", None) or [])
+            computed_output_tokens = computed_horizon - logical_start
+            if not 0 <= computed_output_tokens <= len(output_ids):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_OUTPUT_HORIZON_MISMATCH"
+                )
+            normal_output_ids = []
+            for position in ledger:
+                if logical_start <= position < computed_horizon:
+                    output_index = position - logical_start
+                    if not 0 <= output_index < computed_output_tokens:
+                        raise RuntimeError(
+                            "PERSISTENT_HISTORY_SESSION_OUTPUT_POSITION_MISMATCH"
+                        )
+                    normal_output_ids.append(output_ids[output_index])
+            req.persistent_session_active_output_ids = (
+                normal_output_ids + output_ids[computed_output_tokens:]
+            )
+            if (
+                len(req.origin_input_ids) + len(normal_output_ids)
+                != committed_len
+            ):
+                raise RuntimeError(
+                    "PERSISTENT_HISTORY_SESSION_ACTIVE_STREAM_LENGTH_MISMATCH"
+                )
+            req.history_kv_resident_positions = ledger
+
+            row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+            keep_slots = row[:committed_len].long()
+            keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+            tail_slots = row[committed_len:allocated_len].long()
+            explicit = getattr(req, "persistent_decode_cache_locs", None) or []
+            if explicit:
+                tail_slots = torch.cat(
+                    [
+                        tail_slots,
+                        torch.stack([slot.reshape(()) for slot in explicit])
+                        .long()
+                        .to(row.device),
+                    ]
+                )
+            tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+            free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+            if free_pages.numel():
+                self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+            row[committed_len:allocated_len] = 0
+            req.persistent_decode_cache_locs = []
+            req.kv_allocated_len = committed_len
+            req.already_computed = committed_len
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                state = getattr(req, "history_kv_reference_state", None)
+                if state is not None and hasattr(state, "layers"):
+                    slots = sum(
+                        int(layer.key.shape[0] * layer.key.shape[1])
+                        for layer in state.layers.values()
+                    )
+                    denominator = sum(
+                        int(layer.key.shape[0])
+                        for layer in state.layers.values()
+                    )
+                    active = (slots + max(1, denominator) - 1) // max(
+                        1, denominator
+                    )
+                    report.update(
+                        active_history_kv_tokens=active,
+                        active_full_raw_tokens=active,
+                        active_history_kv_tokens_source=(
+                            "reference_history_physical_token_equivalent"
+                        ),
+                        history_kv_backend="reference_attention",
+                        reference_attention_backend="torch_sdpa",
+                        history_kv_runtime_status="reference_attention_ok",
+                        reference_history_token_slots=slots,
+                        reference_history_resident_bytes=int(state.resident_bytes),
+                        reference_history_layer_count=len(state.layers),
+                        reference_history_selection_metadata=dict(
+                            state.selection_metadata
+                        ),
+                    )
+                report.update(
+                    persistent_session_continuation_mode="exact_generated_prefix",
+                    persistent_session_computed_logical_horizon=computed_horizon,
+                    persistent_session_uncomputed_output_tokens=(
+                        len(output_ids) - computed_output_tokens
+                    ),
+                    persistent_session_active_output_tokens=len(
+                        req.persistent_session_active_output_ids
+                    ),
+                    persistent_session_discarded_decode_kv_tokens=0,
+                    persistent_session_reclaimed_decode_kv_tokens=(
+                        int(free_pages.numel()) * self.page_size
+                    ),
+                    persistent_session_prompt_physical_tokens=committed_len,
+                    persistent_session_decode_page_free_scope=(
+                        "overallocated_pages_excluding_committed_stream"
+                    ),
+                )
+            return
+
+        # Periodic decode checkpoints may hold raw generated K/V in a
+        # transient reference state for same-generation attention. The next
+        # turn reserializes that output canonically, so transfer only the
+        # state that existed at generation start into the persistent slot.
+        if hasattr(req, "reference_decode_persistent_state"):
+            req.history_kv_reference_state = (
+                req.reference_decode_persistent_state
+            )
+            req.reference_decode_persistent_state = None
         prompt_len = len(req.origin_input_ids)
         committed_len = int(req.kv_committed_len)
         allocated_len = int(req.kv_allocated_len)
@@ -479,26 +792,122 @@ class SessionAwareCache(BasePrefixCache):
         req.already_computed = prompt_len
         report = getattr(req, "kv_memory_report", None)
         if isinstance(report, dict):
+            state = getattr(req, "history_kv_reference_state", None)
+            if state is not None:
+                slots = sum(
+                    int(layer.key.shape[0] * layer.key.shape[1])
+                    for layer in state.layers.values()
+                )
+                denominator = sum(
+                    int(layer.key.shape[0])
+                    for layer in state.layers.values()
+                )
+                active = (slots + max(1, denominator) - 1) // max(
+                    1, denominator
+                )
+                report.update(
+                    active_history_kv_tokens=active,
+                    active_full_raw_tokens=active,
+                    reference_history_token_slots=slots,
+                    reference_history_resident_bytes=int(state.resident_bytes),
+                    reference_history_layer_count=len(state.layers),
+                    reference_history_selection_metadata=dict(
+                        state.selection_metadata
+                    ),
+                )
+            else:
+                physical_eviction = report.get("history_kv_physical_eviction")
+                physical_eviction_succeeded = (
+                    isinstance(physical_eviction, dict)
+                    and physical_eviction.get("success") is True
+                )
+                measured_history = (
+                    int(physical_eviction["kept_history_tokens"])
+                    if physical_eviction_succeeded
+                    else 0
+                )
+                report.update(
+                    active_history_kv_tokens=measured_history,
+                    active_full_raw_tokens=measured_history,
+                    reference_history_token_slots=0,
+                    reference_history_resident_bytes=0,
+                    reference_history_layer_count=0,
+                )
+                if physical_eviction_succeeded:
+                    report["active_history_kv_tokens_source"] = "physical_eviction_measured"
             report["persistent_session_discarded_decode_kv_tokens"] = allocated_len - prompt_len
             report["persistent_session_reclaimed_decode_kv_tokens"] = int(free_pages.numel()) * self.page_size
             report["persistent_session_prompt_physical_tokens"] = prompt_len
             report["persistent_session_decode_page_free_scope"] = "request_owned_pages_excluding_prompt_pages"
 
-    def _rollback_failed_persistent_request(self, req: Req) -> None:
-        """Drop this turn's partial KV while preserving the prior session.
+    def _trim_persistent_generation_prefix(self, slot: SessionSlot, req: Req) -> None:
+        """Replace only the verified generation scaffold for an evidence append.
 
-        Selection can fail after the persistent slot was restored and some
-        delta tokens were prefetched.  The normal finished-request path uses
-        the full canonical prompt length and must not run in that state.  The
-        prior slot still owns the valid prefix, so free only pages exclusively
-        used by the appended suffix and detach the failed request.
+        Canonical body positions missing after compression remain missing.
+        Page reclamation uses physical ownership, including partial tail pages.
+        The logical horizon and physical length shrink together, so the RoPE
+        correction for older evicted positions does not change.
         """
+        hint = req.c2kv_kv_memory_hint or {}
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict) and isinstance(
+            report.get("persistent_session_generation_prefix_splice"), dict
+        ):
+            return
+        rollback_free_pages = torch.empty(0, dtype=torch.long)
+        rollback_generated = 0
+        logical_prefix = int(hint["persistent_session_logical_prefix_tokens"])
+        drop = int(hint["persistent_session_drop_generation_prefix_tokens"])
+        positions = list(slot.history_kv_resident_positions or [])
+        tail = [p for p in positions if p >= logical_prefix]
+        if tail and tail != list(range(logical_prefix, logical_prefix + drop)):
+            raise RuntimeError("PERSISTENT_HISTORY_RECOVERY_GENERATION_PREFIX_LEDGER_MISMATCH")
+        # match_prefix can run repeatedly while a request waits for admission.
+        trim = len(tail)
+        old_len = int(slot.kv_allocated_len)
+        if len(positions) != old_len or int(slot.kv_committed_len) != old_len:
+            raise RuntimeError("PERSISTENT_HISTORY_RECOVERY_SLOT_LENGTH_MISMATCH")
+        keep_len = old_len - trim
+        row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+        keep_slots = row[:keep_len].long()
+        tail_slots = row[keep_len:old_len].long()
+        keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+        tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+        free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+        if free_pages.numel():
+            self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+        row[keep_len:old_len] = 0
+        slot.kv_committed_len = keep_len
+        slot.kv_allocated_len = keep_len
+        slot.history_kv_resident_positions = positions[:keep_len]
+        resident = set(slot.history_kv_resident_positions)
+        slot.history_kv_score_state = {
+            layer: {p: score for p, score in scores.items() if p in resident}
+            for layer, scores in (slot.history_kv_score_state or {}).items()
+        }
+        if isinstance(report, dict):
+            report["persistent_session_generation_prefix_splice"] = {
+                "enabled": True,
+                "session_id": req.session.session_id,
+                "generation_prefix_tokens": drop,
+                "retained_body_physical_tokens": keep_len,
+                "retained_body_resident_page_tokens": (
+                    int(keep_pages.numel()) * self.page_size
+                ),
+                "freed_physical_page_tokens": int(free_pages.numel()) * self.page_size,
+                "rolled_back_generated_tokens": rollback_generated,
+                "rollback_freed_physical_page_tokens": (
+                    int(rollback_free_pages.numel()) * self.page_size
+                ),
+                "full_history_reprefill_performed": False,
+                "scope": "verified_generation_prefix_only",
+            }
 
+    def _rollback_failed_persistent_request(self, req: Req) -> None:
+        """Drop a failed turn's partial suffix while preserving prior session KV."""
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         if slot is None or slot.req_pool_idx is None:
-            # First-turn failure has no reusable prior state.  Delegate normal
-            # non-session cleanup and make sure no broken session is retained.
             self.slots.pop(session_id, None)
             self.inner.cache_finished_req(req, is_insert=False)
             return
@@ -520,17 +929,79 @@ class SessionAwareCache(BasePrefixCache):
             report["persistent_session_failed_turn_rolled_back"] = True
             report["persistent_session_rollback_kept_tokens"] = keep_len
             report["persistent_session_rollback_freed_pages"] = int(
-                free_pages.numel())
-        # SessionSlot retains ownership of the valid prefix.  Prevent generic
-        # request cleanup from freeing or re-saving the same pool row.
+                free_pages.numel()
+            )
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.history_kv_reference_state = None
+        req.history_kv_runtime_state = None
+        req.reference_decode_persistent_state = None
+        req.reference_decode_baseline_runtime_state = None
+        # SessionSlot is now the sole owner while the request node remains
+        # available for streaming-session protocol bookkeeping.
+
+    def _adopt_legacy_persistent_prefix(
+        self, slot: SessionSlot, logical_prefix: int
+    ) -> None:
+        """Trim a pre-marker streaming slot before persistent continuation.
+
+        Older callers omitted ``persistent_history_session`` on the first
+        turn. The slot then contains the canonical prompt plus raw decode KV,
+        but has no resident-position ledger. The continuation request carries
+        the canonical prefix length, so reclaim the suffix by physical page
+        ownership before the slot is reused.
+        """
+
+        old_len = int(slot.kv_allocated_len)
+        keep_len = max(int(logical_prefix), int(slot.cache_protected_len))
+        if keep_len > old_len:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_LEGACY_PREFIX_EXCEEDS_SESSION: "
+                f"{keep_len=}, {old_len=}"
+            )
+        row = self.req_to_token_pool.req_to_token[slot.req_pool_idx]
+        keep_slots = row[:keep_len].long()
+        keep_pages = torch.unique(keep_slots[keep_slots > 0] // self.page_size)
+        tail_slots = row[keep_len:old_len].long()
+        tail_pages = torch.unique(tail_slots[tail_slots > 0] // self.page_size)
+        free_pages = tail_pages[~torch.isin(tail_pages, keep_pages)]
+        if free_pages.numel():
+            self.token_to_kv_pool_allocator.free(free_pages * self.page_size)
+        row[keep_len:old_len] = 0
+
+        slot.kv_committed_len = keep_len
+        slot.kv_allocated_len = keep_len
+        slot.history_kv_resident_positions = list(range(keep_len))
+        slot.history_kv_score_state = {}
+        logging.getLogger(__name__).info(
+            "PERSISTENT_HISTORY_LEGACY_SLOT_ADOPTED %s",
+            json.dumps(
+                {
+                    "kept_prompt_tokens": keep_len,
+                    "discarded_decode_tokens": old_len - keep_len,
+                    "freed_pages": int(free_pages.numel()),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def cache_unfinished_req(self, req: Req, **kwargs):
+        if getattr(req, "session_cache_closed_during_request", False):
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return
         if _is_streaming(req):
             if self._is_persistent_history_req(req):
-                # Physical eviction can rewrite/free these pages. Keep them
-                # request/session-owned instead of inserting them into radix.
+                # Physical history eviction rewrites and frees request-owned
+                # KV pages.  Those pages must never also be inserted into the
+                # radix tree: after compaction its cached prefix length can be
+                # larger than the entire resident session (for example a
+                # 256-token cached chunk compacted to 134 tokens), producing
+                # negative session-held accounting and stale tree references.
+                # Keep the already computed prefix directly on the request;
+                # SessionSlot takes sole ownership when the request finishes.
                 kv_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : len(req.fill_ids)
                 ]
@@ -569,13 +1040,30 @@ class SessionAwareCache(BasePrefixCache):
 
     # -- Session lifecycle --
 
-    def release_session(self, session_id: str):
+    def release_session(self, session_id: str, active_req: Optional[Req] = None):
         """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
 
-        if slot.last_node is not None:
+        # restore_to_req leaves the slot's pool index intact for retry. While
+        # that request is running, however, the slot and request point to the
+        # same KV. An explicit close transfers ownership to the request, whose
+        # normal completion path releases it after req.session is cleared.
+        borrowed_by_active_req = (
+            active_req is not None
+            and active_req.req_pool_idx is not None
+            and active_req.req_pool_idx == slot.req_pool_idx
+        )
+
+        if borrowed_by_active_req:
+            # The running request now owns both its KV row and the slot's
+            # radix lock. Its regular completion path releases the lock once.
+            active_req.session_cache_closed_during_request = True
+            active_req.last_node = slot.last_node
+            active_req.swa_uuid_for_lock = slot.swa_uuid_for_lock
+            active_req.cache_protected_len = slot.cache_protected_len
+        elif slot.last_node is not None:
             if slot.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
                     slot.last_node,
@@ -584,7 +1072,7 @@ class SessionAwareCache(BasePrefixCache):
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
-        if slot.is_holding_kv:
+        if slot.is_holding_kv and not borrowed_by_active_req:
             start = slot.cache_protected_len
             end = slot.kv_allocated_len
             if start < end:
@@ -594,7 +1082,13 @@ class SessionAwareCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
         logging.getLogger(__name__).info("HISTORY_KV_SESSION_CLOSED %s", json.dumps({
-            "session_id": session_id, "resident_tokens_released": slot.kv_allocated_len,
+            "session_id": session_id,
+            "resident_tokens_released": (
+                0 if borrowed_by_active_req else slot.kv_allocated_len
+            ),
+            "resident_tokens_transferred_to_active_req": (
+                slot.kv_allocated_len if borrowed_by_active_req else 0
+            ),
             "remaining_session_slots": len(self.slots)}))
 
     def session_held_tokens(self) -> int:
@@ -612,6 +1106,8 @@ class SessionAwareCache(BasePrefixCache):
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 allocated_total += allocated
                 claimed_tree_prefix += min(slot.cache_protected_len, allocated)
+        if not claimed_tree_prefix:
+            return allocated_total
         tree_protected = int(self.inner.protected_size())
         tree_accounted_session_prefix = min(claimed_tree_prefix, tree_protected)
         return allocated_total - tree_accounted_session_prefix

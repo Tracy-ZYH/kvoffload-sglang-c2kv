@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.observability import paper_telemetry
+
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
@@ -136,6 +138,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        paper_telemetry.sample("main_kv_allocator_clear")
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -150,6 +153,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        paper_telemetry.sample("main_kv_allocator_alloc")
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -163,6 +167,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
+        if self.is_not_in_free_group:
+            paper_telemetry.sample("main_kv_allocator_free")
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)
@@ -392,6 +398,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        paper_telemetry.sample("main_kv_allocator_alloc")
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -446,6 +453,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        paper_telemetry.sample("main_kv_allocator_alloc_extend")
         return out_indices
 
     def alloc_decode(
@@ -485,6 +493,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        paper_telemetry.sample("main_kv_allocator_alloc_decode")
         return out_indices
 
     def free(self, free_index: torch.Tensor):
@@ -500,6 +509,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
 
+        if self.is_not_in_free_group:
+            paper_telemetry.sample("main_kv_allocator_free")
+
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
@@ -511,6 +523,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        paper_telemetry.sample("main_kv_allocator_clear")
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

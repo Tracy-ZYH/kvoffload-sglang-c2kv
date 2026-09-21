@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -58,6 +59,8 @@ class SchedulerOutputProcessorMixin:
             req.history_kv_selection_scores = {
                 **incoming,
                 "layers": list(incoming_layers),
+                "headwise_layers": list(incoming.get("headwise_layers") or []),
+                "layer_ids": list(incoming.get("layer_ids") or []),
                 "query_tokens": int(incoming.get("query_tokens") or 0),
             }
             return
@@ -75,20 +78,8 @@ class SchedulerOutputProcessorMixin:
         )
         if not compatible:
             logger.error(
-                "HISTORY_KV_SELECTION_CHUNK_MISMATCH rid=%s current=%s incoming=%s",
+                "HISTORY_KV_SELECTION_CHUNK_MISMATCH rid=%s",
                 req.rid,
-                {
-                    "method": current.get("method"),
-                    "history_start": current.get("history_start"),
-                    "history_end": current.get("history_end"),
-                    "layers": len(current_layers),
-                },
-                {
-                    "method": incoming.get("method"),
-                    "history_start": incoming.get("history_start"),
-                    "history_end": incoming.get("history_end"),
-                    "layers": len(incoming_layers),
-                },
             )
             req.history_kv_selection_scores = {
                 "error": "HISTORY_KV_SELECTION_CHUNK_MISMATCH",
@@ -100,6 +91,29 @@ class SchedulerOutputProcessorMixin:
         current["layers"] = [
             left + right for left, right in zip(current_layers, incoming_layers)
         ]
+        current_headwise = current.get("headwise_layers") or []
+        incoming_headwise = incoming.get("headwise_layers") or []
+        if current_headwise or incoming_headwise:
+            if (
+                len(current_headwise) != len(incoming_headwise)
+                or list(current.get("layer_ids") or [])
+                != list(incoming.get("layer_ids") or [])
+                or any(
+                    tuple(left.shape) != tuple(right.shape)
+                    for left, right in zip(current_headwise, incoming_headwise)
+                )
+            ):
+                req.history_kv_selection_scores = {
+                    "error": "HISTORY_KV_HEADWISE_SELECTION_CHUNK_MISMATCH",
+                    "layers": [],
+                    "headwise_layers": [],
+                    "query_tokens": 0,
+                }
+                return
+            current["headwise_layers"] = [
+                left + right
+                for left, right in zip(current_headwise, incoming_headwise)
+            ]
         current["query_tokens"] = int(current.get("query_tokens") or 0) + int(
             incoming.get("query_tokens") or 0
         )
@@ -265,6 +279,11 @@ class SchedulerOutputProcessorMixin:
             injection_error = getattr(req, "c2kv_injection_error", None)
             if injection_error:
                 stats["c2kv_injection_error"] = str(injection_error)
+            paper_measurement = paper_telemetry.request_report(
+                req, finalize=req.finished()
+            )
+            if paper_measurement is not None:
+                stats["paper_measurement"] = paper_measurement
         return stats
 
     def _bytes_per_kv_token(self: Scheduler) -> Optional[int]:
@@ -471,14 +490,12 @@ class SchedulerOutputProcessorMixin:
                 if (
                     req.c2kv_rounds is not None
                     and req.c2kv_round_idx < len(req.c2kv_rounds)
-                    and getattr(
+                    and (getattr(
                         req.c2kv_rounds[req.c2kv_round_idx],
                         "post_history_kv_eviction",
                         False,
-                    )
+                    ) or getattr(req.c2kv_rounds[req.c2kv_round_idx], "collect_history_kv_scores", False))
                 ):
-                    # Chunked prefill returns one score sum per chunk. Merge
-                    # each chunk before the final chunk applies eviction.
                     self._accumulate_history_kv_selection_scores(req, result)
 
                 if req.is_chunked <= 0:
@@ -498,9 +515,12 @@ class SchedulerOutputProcessorMixin:
                         abort = False
                         logical_kv_start = int(batch.seq_lens_cpu[i].item())
                         for seg_idx in cur_round.post_inject_seg_indices:
+                            paper_telemetry.set_phase("injection")
                             if not self._inject_c2kv_gist_segment(
                                 req, seg_idx, logical_kv_start
                             ):
+                                paper_telemetry.sample("c2kv_injection_failed")
+                                paper_telemetry.set_phase("prefill")
                                 logger.warning(
                                     f"C2KV injection failed for {req.rid}; aborting"
                                 )
@@ -547,6 +567,8 @@ class SchedulerOutputProcessorMixin:
                                 self.stream_output([req], req.return_logprob)
                                 abort = True
                                 break
+                            paper_telemetry.sample("c2kv_injection_applied")
+                            paper_telemetry.set_phase("prefill")
                             logical_kv_start = req.kv_committed_len
                         if abort:
                             continue
@@ -636,6 +658,61 @@ class SchedulerOutputProcessorMixin:
                             req.origin_input_ids_unpadded = list(persistent_active_ids)
                             req.c2kv_virtual_input_ids = list(persistent_active_ids)
                         self._release_c2kv_pins(req)
+
+                    # All ordinary KV remaining after turn-prefill eviction is
+                    # protected system/tool/current-input context. Periodic
+                    # reference checkpoints may compress only the subsequently
+                    # decoded suffix.
+                    # In overlap mode the next decode batch can reserve its KV
+                    # slot before this prefill result is processed. The prompt
+                    # IDs already reflect any physical history compaction, while
+                    # kv_committed_len may include that speculative decode slot.
+                    req.reference_decode_protected_len = len(req.origin_input_ids)
+                    reference_config = getattr(
+                        req, "history_kv_reference_config", None
+                    )
+                    reference_method = (
+                        str(reference_config.get("method") or "").lower()
+                        if isinstance(reference_config, dict)
+                        else ""
+                    )
+                    req.reference_decode_persistent_state = (
+                        None
+                        if reference_method in {"agentkv", "commitkv"}
+                        else getattr(req, "history_kv_reference_state", None)
+                    )
+                    req.reference_decode_logical_start = int(
+                        req.reference_decode_protected_len
+                    ) + int(getattr(req, "c2kv_position_correction", 0) or 0)
+                    if isinstance(reference_config, dict) and str(
+                        reference_config.get("method") or ""
+                    ).lower() in {"agentkv", "commitkv"}:
+                        req.reference_decode_baseline_runtime_state = None
+                    report = getattr(req, "kv_memory_report", None)
+                    tool_receipt = (
+                        report.get("tool_kv_eviction")
+                        if isinstance(report, dict) else None
+                    )
+                    if isinstance(tool_receipt, dict) and not tool_receipt.get("no_op"):
+                        state = getattr(req, "history_kv_reference_state", None)
+                        layers = list(state.layers.values()) if state is not None else []
+                        # Overlap may already reserve the next decode slot on
+                        # req. This completed batch still holds the exact
+                        # post-replay prompt length used by the receipt.
+                        normal = int(batch.seq_lens_cpu[i].item())
+                        actual_by_layer = (
+                            [normal + int(layer.key.shape[1]) for layer in layers]
+                            if layers else [normal] * int(self.token_to_kv_pool_allocator.get_kvcache().layer_num)
+                        )
+                        if actual_by_layer != tool_receipt["resident_tokens_by_layer"]:
+                            raise RuntimeError("TOOL_KV_POST_REPLAY_RESIDENT_MISMATCH")
+                        tool_receipt["first_token_after_selection"] = True
+                        snapshot = getattr(req, "history_kv_eviction_report_snapshot", None)
+                        if isinstance(snapshot, dict):
+                            snapshot["tool_kv_eviction"] = dict(tool_receipt)
+                    paper_telemetry.mark_generation_start(
+                        req, normal_kv_tokens=int(batch.seq_lens_cpu[i].item())
+                    )
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -849,6 +926,8 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        paper_telemetry.set_phase("decode")
+        paper_telemetry.sample("decode_step")
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -998,8 +1077,17 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+        for batch_idx, req in enumerate(batch.reqs):
+            if req.finished() or req.is_retracted:
+                continue
+            seq_delta = self._apply_reference_decode_checkpoint(req)
+            if seq_delta:
+                batch.seq_lens_cpu[batch_idx] += seq_delta
+                batch.seq_lens[batch_idx] += seq_delta
+                batch.seq_lens_sum += seq_delta
+        paper_telemetry.sample("decode_release_complete")
+        self.stream_output(batch.reqs, batch.return_logprob)
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(

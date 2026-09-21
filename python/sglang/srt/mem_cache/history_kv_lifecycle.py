@@ -44,12 +44,7 @@ def physical_history_range(positions, history_start, history_end):
 def selection_query_window(
     method, prefix_len, history_end, prompt_len, recent_window
 ):
-    """Return the physical prompt window used to score resident history.
-
-    Attention-based selectors observe only newly-prefilled tail queries.  The
-    window starts after both the resident session prefix and the history
-    candidate span, so every chunk scores the same complete candidate set.
-    """
+    """Return newly-prefilled tail queries used to score resident history."""
     method = str(method or "").strip().lower()
     if method not in ATTENTION_SELECTION_METHODS:
         return None
@@ -67,8 +62,6 @@ def selection_query_window(
     query_end = prompt_len
     query_start = max(prefix_len, history_end, query_end - recent_window)
     if query_start >= query_end:
-        # A prompt can end exactly at the completed-history boundary.  The
-        # final newly-prefilled history token is then the only valid query.
         query_start = query_end - 1
     return query_start, query_end
 

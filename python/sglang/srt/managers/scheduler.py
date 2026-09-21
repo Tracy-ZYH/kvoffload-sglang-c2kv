@@ -69,6 +69,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.observability import paper_telemetry
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
@@ -278,6 +279,39 @@ def _c2kv_pending_result_requires_early_process(req) -> bool:
     return round_idx < len(rounds) - 1 or bool(
         getattr(rounds[round_idx], "post_history_kv_eviction", False)
     )
+
+
+def _persistent_history_session_error(req, config=None) -> Optional[str]:
+    """Validate the live streaming-session binding required by persistence."""
+    hint = getattr(req, "c2kv_kv_memory_hint", None)
+    hint = hint if isinstance(hint, dict) else {}
+    marker = hint.get("persistent_history_session")
+    marker = marker if isinstance(marker, dict) else {}
+    config = config if isinstance(config, dict) else getattr(
+        req, "history_kv_eviction", None
+    )
+    config = config if isinstance(config, dict) else {}
+    persistent = bool(
+        marker.get("enabled")
+        or config.get("persistent_session")
+        or config.get("persistent_continuation")
+    )
+    if not persistent:
+        return None
+
+    session = getattr(req, "session", None)
+    if session is None:
+        return "PERSISTENT_HISTORY_SESSION_UNAVAILABLE"
+    if not bool(getattr(session, "streaming", False)):
+        return "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION"
+
+    expected_session_id = marker.get("session_id")
+    if (
+        expected_session_id is not None
+        and expected_session_id != getattr(session, "session_id", None)
+    ):
+        return "PERSISTENT_HISTORY_SESSION_ID_MISMATCH"
+    return None
 
 
 @dataclass
@@ -922,6 +956,13 @@ class Scheduler(
                     "projection mask. Base-projection batches remain graph eligible."
                 )
 
+        paper_telemetry.configure(
+            self.token_to_kv_pool_allocator,
+            self.c2kv_pool,
+            self._bytes_per_kv_token() or 0,
+            tree_cache=self.tree_cache,
+        )
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -1487,11 +1528,6 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             if sync_c2kv_early_batch and self.last_batch is not None:
-                # result_queue owns a lightweight ScheduleBatch.copy(). A
-                # final-round physical eviction mutates its sequence lengths
-                # before get_next_batch_to_run merges the real last_batch.
-                # Synchronize only on this early path; later processing may
-                # run after last_batch has already been filtered.
                 self.last_batch.seq_lens = tmp_batch.seq_lens
                 self.last_batch.seq_lens_cpu = tmp_batch.seq_lens_cpu
                 self.last_batch.seq_lens_sum = tmp_batch.seq_lens_sum
@@ -1513,6 +1549,7 @@ class Scheduler(
                     _c2kv_pending_result_requires_early_process(r)
                     for r in self.last_batch.reqs
                 )
+
             )
             if c2kv_early_process:
                 pop_and_process(sync_c2kv_early_batch=True)
@@ -1896,6 +1933,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        paper_telemetry.start_request(
+            server_request_id=recv_req.rid,
+            outer_request_id=recv_req.c2kv_outer_request_id,
+            phase=recv_req.c2kv_measurement_phase or "prefill",
+            kind="generation",
+            whole_full_kv_tokens=recv_req.c2kv_paper_whole_full_kv_tokens,
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -1970,12 +2014,31 @@ class Scheduler(
         elif session_id in self.session_controller:
             # Session exists: create request from session
             session = self.session_controller.get(session_id)
-            req = session.create_req(
-                recv_req,
-                self.tokenizer,
-                self.model_config.vocab_size,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-            )
+            try:
+                req = session.create_req(
+                    recv_req,
+                    self.tokenizer,
+                    self.model_config.vocab_size,
+                    eos_token_ids=self.model_config.hf_eos_token_id,
+                )
+            except ValueError as exc:
+                # A persistent-history session left in an unusable state by an
+                # earlier aborted turn (e.g. no active output after a finish_abort)
+                # must fail this request, not the scheduler process.
+                error_msg = f"Invalid request: session {session_id}: {exc}"
+                logger.error(error_msg)
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
             # TODO: set trace context
             if self.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
@@ -2000,6 +2063,25 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        req.c2kv_outer_request_id = recv_req.c2kv_outer_request_id
+        req.c2kv_measurement_phase = recv_req.c2kv_measurement_phase
+        req.c2kv_paper_whole_full_kv_tokens = (
+            recv_req.c2kv_paper_whole_full_kv_tokens
+        )
+        req.c2kv_paper_whole_full_source = recv_req.c2kv_paper_whole_full_source
+        req.c2kv_paper_history_full_kv_tokens = (
+            recv_req.c2kv_paper_history_full_kv_tokens
+        )
+        req.c2kv_paper_history_active_kv_tokens = (
+            recv_req.c2kv_paper_history_active_kv_tokens
+        )
+        req.c2kv_paper_canonical_full_source = (
+            recv_req.c2kv_paper_canonical_full_source
+        )
+        req.c2kv_paper_denominator_tokenization_duration_ns = (
+            recv_req.c2kv_paper_denominator_tokenization_duration_ns
+        )
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2092,6 +2174,12 @@ class Scheduler(
 
         if getattr(recv_req, "c2kv_segments", None):
             req.c2kv_segments = recv_req.c2kv_segments
+            history_hint = (getattr(recv_req, "c2kv_kv_memory_hint", None) or {}).get("history_kv_eviction") or {}
+            if history_hint.get("persistent_continuation"):
+                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+                for segment in req.c2kv_segments:
+                    segment.token_start += prefix_len
+                    segment.token_end += prefix_len
             # One mode applies to the whole request. A request-level value wins;
             # otherwise explicit message values must agree. Unset messages do
             # not override an explicit message value with the server default.
@@ -2216,6 +2304,7 @@ class Scheduler(
         ):
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
+    @paper_telemetry.measure_synchronous_request("c2kv_extract", "extraction")
     def handle_extract_request(self, recv_req: "TokenizedExtractReqInput"):
         from sglang.srt.managers.io_struct import C2KVExtractReqOutput
 
@@ -2237,24 +2326,44 @@ class Scheduler(
             return C2KVExtractReqOutput(error=str(e), success=False)
 
         hf_config = getattr(self.model_config, "hf_config", None)
+        extractor_config = {
+            "gist_type": getattr(
+                self.server_args, "c2kv_gist_type", "dynamic-interleave"
+            ),
+            "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
+            "gist_extra_embed_num": getattr(
+                hf_config, "gist_extra_embed_num", 1
+            ),
+            "gist_residual_type": getattr(
+                hf_config, "gist_residual_type", "none"
+            ),
+            "gist_overlap": getattr(hf_config, "gist_overlap", 0),
+            "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
+            "pic_param": getattr(hf_config, "pic_param", "qkv"),
+        }
+        projection_set = getattr(recv_req, "projection_set", "history") or "history"
+        if projection_set != "history":
+            # A second encoder's entries must never alias the history set's:
+            # the set name and the tool checkpoint identity join the key.  The
+            # "history" key is byte-identical to the pre-tool-set schema.
+            tool_identity = getattr(
+                model_runner.model, "c2kv_tool_gist_identity", None
+            )
+            if projection_set != "tool" or not tool_identity:
+                return C2KVExtractReqOutput(
+                    error=(
+                        "C2KV_TOOL_GIST_UNAVAILABLE: projection_set "
+                        f"{projection_set!r} is not loaded on this server "
+                        "(start it with --c2kv-tool-gist-weights)"
+                    ),
+                    success=False,
+                )
+            extractor_config["projection_set"] = "tool"
+            extractor_config["projection_identity"] = tool_identity
         key_hash = self.c2kv_pool.compute_hash(
             recv_req.input_ids,
             compression_ratio=compression_ratio,
-            extractor_config={
-                "gist_type": getattr(
-                    self.server_args, "c2kv_gist_type", "dynamic-interleave"
-                ),
-                "gist_param": getattr(self.server_args, "c2kv_gist_param", "qkv"),
-                "gist_extra_embed_num": getattr(
-                    hf_config, "gist_extra_embed_num", 1
-                ),
-                "gist_residual_type": getattr(
-                    hf_config, "gist_residual_type", "none"
-                ),
-                "gist_overlap": getattr(hf_config, "gist_overlap", 0),
-                "pic_enabled": bool(getattr(hf_config, "pic_enabled", False)),
-                "pic_param": getattr(hf_config, "pic_param", "qkv"),
-            },
+            extractor_config=extractor_config,
         )
         self._log_c2kv_token_usage(
             "extract_request",
@@ -2277,6 +2386,7 @@ class Scheduler(
                 gist_len=existing.gist_len,
                 original_seq_len=existing.original_seq_len,
                 cache_hit=True,
+                gist_generation_duration_ns=0,
             )
 
         if not recv_req.allow_cache_miss:
@@ -2342,6 +2452,7 @@ class Scheduler(
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         error_msg = None
         gist_key_values = gist_mask = gist_position_ids = None
+        gist_generation_duration_ns = None
 
         def _release_npu_extract_temps():
             if not _is_npu:
@@ -2352,15 +2463,43 @@ class Scheduler(
             except Exception:
                 logger.warning("C2KV NPU extract cleanup failed", exc_info=True)
 
+        measure_gist_generation = paper_telemetry.enabled()
+        if measure_gist_generation:
+            try:
+                self.schedule_stream.synchronize()
+            except Exception:
+                logger.warning(
+                    "C2KV gist timing start synchronization failed",
+                    exc_info=True,
+                )
+                measure_gist_generation = False
+        gist_generation_started_ns = (
+            time.perf_counter_ns() if measure_gist_generation else None
+        )
         try:
             gist_key_values, gist_mask, gist_position_ids = (
                 self.tp_worker.model_runner.forward_c2kv_extract(
-                    input_ids, attention_mask, compression_ratio
+                    input_ids,
+                    attention_mask,
+                    compression_ratio,
+                    projection_set=projection_set,
                 )
             )
         except Exception as e:
             logger.error(f"C2KV extract failed: {e}", exc_info=True)
             error_msg = str(e)
+        finally:
+            if gist_generation_started_ns is not None:
+                try:
+                    self.schedule_stream.synchronize()
+                    gist_generation_duration_ns = max(
+                        0, time.perf_counter_ns() - gist_generation_started_ns
+                    )
+                except Exception:
+                    logger.warning(
+                        "C2KV gist timing end synchronization failed",
+                        exc_info=True,
+                    )
 
         # TP pool-state guard: if forward_c2kv_extract raises on one rank but
         # not another, that rank skips c2kv_pool.store().  On the next extract
@@ -2383,7 +2522,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
 
         original_seq_len = len(recv_req.input_ids)
         gist_len = gist_mask.shape[1]
@@ -2410,7 +2553,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
         has_space = self.c2kv_pool.can_allocate(gist_len, existing_key=key_hash)
         if self.tp_size > 1 and torch.distributed.is_initialized():
             all_ranks_have_space = torch.tensor([int(has_space)], dtype=torch.long)
@@ -2429,7 +2576,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=error_msg, success=False)
+            return C2KVExtractReqOutput(
+                error=error_msg,
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
 
         try:
             entry = self.c2kv_pool.store(
@@ -2444,7 +2595,11 @@ class Scheduler(
             input_ids = attention_mask = None
             gist_key_values = gist_mask = gist_position_ids = None
             _release_npu_extract_temps()
-            return C2KVExtractReqOutput(error=str(e), success=False)
+            return C2KVExtractReqOutput(
+                error=str(e),
+                success=False,
+                gist_generation_duration_ns=gist_generation_duration_ns,
+            )
         self._log_c2kv_token_usage(
             "extract_store",
             key_hash=key_hash[:16],
@@ -2458,8 +2613,10 @@ class Scheduler(
             key_hash=key_hash,
             gist_len=entry.gist_len,
             original_seq_len=original_seq_len,
+            gist_generation_duration_ns=gist_generation_duration_ns,
         )
 
+    @paper_telemetry.measure_synchronous_request("c2kv_repair_extract", "recovery")
     def handle_repair_extract_request(
         self, recv_req: "TokenizedRepairExtractReqInput"
     ):
@@ -2984,11 +3141,108 @@ class Scheduler(
         history_eviction = hint.get("history_kv_eviction")
         if isinstance(history_eviction, dict):
             req.history_kv_eviction = dict(history_eviction)
+        tool_eviction = hint.get("tool_kv_eviction")
+        if isinstance(tool_eviction, dict):
+            if isinstance(history_eviction, dict):
+                raise ValueError("TOOL_KV_WITH_RAW_HISTORY_EVICTION_UNSUPPORTED")
+            from sglang.srt.mem_cache.tool_kv_eviction import plan_tool_kv_eviction
+
+            req.history_kv_eviction = plan_tool_kv_eviction(
+                tool_eviction, len(req.origin_input_ids)
+            )
+            req.tool_kv_eviction = dict(tool_eviction)
+        reference_config = hint.get("history_kv_reference_config")
+        if isinstance(reference_config, dict):
+            req.history_kv_reference_config = dict(reference_config)
+            event_spans = hint.get("history_kv_event_token_spans")
+            if isinstance(event_spans, list):
+                req.history_kv_reference_config["event_token_spans"] = [
+                    dict(item) for item in event_spans if isinstance(item, dict)
+                ]
+            method = str(reference_config.get("method") or "").lower()
+            if method == "agentkv" and req.history_kv_runtime_state is None:
+                from sglang.srt.mem_cache.agentkv import AgentKVQueryRing
+
+                req.history_kv_runtime_state = AgentKVQueryRing()
+            elif method == "commitkv" and req.history_kv_runtime_state is None:
+                from sglang.srt.mem_cache.commitkv import (
+                    CommitKVConfig,
+                    CommitKVRuntimeState,
+                )
+                from sglang.srt.mem_cache.history_kv_reference import (
+                    CommitKVServingState,
+                )
+
+                raw = reference_config.get("commitkv")
+                raw = raw if isinstance(raw, dict) else reference_config
+                config_keys = {
+                    key: raw[key]
+                    for key in (
+                        "window_size",
+                        "page_size",
+                        "pending_fraction",
+                        "use_threshold",
+                        "dead_threshold",
+                        "joint_threshold",
+                        "use_percentile",
+                        "dead_percentile",
+                        "max_scanned_pages",
+                        "max_pending_pages",
+                        "checkpoint_interval",
+                        "measurement_layer_id",
+                    )
+                    if key in raw
+                }
+                if config_keys.get("measurement_layer_id") is None:
+                    config_keys["measurement_layer_id"] = int(
+                        self.model_config.num_hidden_layers - 1
+                    )
+                    req.history_kv_reference_config[
+                        "measurement_layer_id"
+                    ] = config_keys["measurement_layer_id"]
+                    req.history_kv_reference_config[
+                        "measurement_layer_id_source"
+                    ] = "final_layer_project_convention"
+                req.history_kv_runtime_state = CommitKVServingState(
+                    policy=CommitKVRuntimeState(CommitKVConfig(**config_keys)),
+                    target_tokens=int(
+                        reference_config.get("target_tokens") or 2048
+                    ),
+                )
         req.c2kv_kv_memory_hint = dict(hint)
         req.kv_memory_report = report
+        if isinstance(tool_eviction, dict) and req.history_kv_eviction.get("tool_no_op"):
+            config = req.history_kv_eviction
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            layers = int(kv_cache.layer_num)
+            prompt_tokens = len(req.origin_input_ids)
+            report["tool_kv_eviction"] = {
+                "success": True,
+                "method": str(tool_eviction.get("method") or config["method"]),
+                "internal_method": config["method"],
+                "full_prompt_tokens": prompt_tokens,
+                "resident_tokens_by_layer": [prompt_tokens] * layers,
+                "logical_kv_bytes": prompt_tokens * self._bytes_per_kv_token(),
+                "evictable_tokens": len(config["tool_evictable_indices"]),
+                "protected_tokens": prompt_tokens - len(config["tool_evictable_indices"]),
+                "target_resident_tokens_per_layer": tool_eviction.get("target_resident_tokens_per_layer"),
+                "tool_resident_tokens_by_layer": (
+                    [config["tool_protocol_resident_tokens"]] * layers
+                    if config["tool_protocol_resident_tokens"] is not None else None
+                ),
+                "first_token_after_selection": False,
+                "history_untouched": True,
+                "no_op": True,
+                "budget_status": config["tool_budget_status"],
+            }
+            req.history_kv_eviction = None
+        paper_telemetry.bind_request(req)
 
     def _build_history_kv_eviction_rounds(self, req: "Req") -> Optional[str]:
         config = getattr(req, "history_kv_eviction", None)
+        session_error = _persistent_history_session_error(req, config)
+        if session_error is not None:
+            return session_error
         if not isinstance(config, dict):
             return None
 
@@ -2999,7 +3253,14 @@ class Scheduler(
             method = "snapkv_persistent"
         if method == "pyramid":
             method = "pyramidkv"
-        supported = {"streamingllm", "h2o", "snapkv_persistent", "pyramidkv"}
+        supported = {
+            "streamingllm",
+            "h2o",
+            "snapkv_persistent",
+            "pyramidkv",
+            "agentkv",
+            "commitkv",
+        }
         if method not in supported:
             return f"Unsupported physical history KV eviction method: {method!r}"
 
@@ -3011,6 +3272,22 @@ class Scheduler(
 
         original_input_ids = list(req.origin_input_ids)
         original_len = len(original_input_ids)
+        if config.get("tool_kv_eviction"):
+            # The final prompt token is computed only after selection.  The
+            # first action token therefore comes from the pruned KV state.
+            if original_len < 2:
+                return "TOOL_KV_PROMPT_TOO_SHORT"
+            req.c2kv_rounds = [
+                C2KVPrefillRound(
+                    original_input_ids[:-1], [], post_history_kv_eviction=True
+                ),
+                C2KVPrefillRound(original_input_ids[-1:], []),
+            ]
+            req.c2kv_round_idx = 0
+            req.c2kv_round_start_len = 0
+            req.c2kv_virtual_input_ids = original_input_ids
+            req.c2kv_pinned_keys = []
+            return None
         history_start = int(config.get("history_start") or 0)
         history_end = int(config.get("history_end") or 0)
         persistent_continuation = bool(config.get("persistent_continuation"))
@@ -3023,13 +3300,7 @@ class Scheduler(
             return None
 
         persistent_session = bool(config.get("persistent_session"))
-        persistent_continuation = bool(config.get("persistent_continuation"))
         if persistent_continuation:
-            if not (
-                getattr(req, "session", None) is not None
-                and bool(getattr(req.session, "streaming", False))
-            ):
-                return "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION"
             # SessionAwareCache restores the physical prefix inside
             # match_prefix(). Defer exact round construction until then.
             req.c2kv_rounds = [
@@ -3074,9 +3345,7 @@ class Scheduler(
                 )
             ]
             if history_end < original_len:
-                rounds.append(
-                    C2KVPrefillRound(original_input_ids[history_end:], [])
-                )
+                rounds.append(C2KVPrefillRound(original_input_ids[history_end:], []))
         else:
             query_start, query_end = query_window
             rounds = []
@@ -3104,9 +3373,7 @@ class Scheduler(
                         "selection_query_start": query_start,
                         "selection_query_end": query_end,
                         "selection_query_tokens": query_end - query_start,
-                        "selection_query_phase": (
-                            "new_tail_prefill_before_eviction"
-                        ),
+                        "selection_query_phase": "new_tail_prefill_before_eviction",
                     }
                 )
 
@@ -3132,12 +3399,541 @@ class Scheduler(
         )
         return None
 
+    def _build_tool_kv_reference_state(self, req: "Req", config: dict, score_info):
+        """Move only selected schema KV into per-layer/head reference tensors."""
+        from sglang.srt.mem_cache.history_kv_reference import (
+            ReferenceHistoryKVState,
+            gather_reference_layer,
+            select_pyramidkv_headwise,
+        )
+        from sglang.srt.mem_cache.history_kv_selection import select_streamingllm_indices
+        from sglang.srt.mem_cache.tool_kv_eviction import (
+            select_tool_h2o,
+            select_tool_snapkv,
+        )
+
+        evictable = [int(index) for index in config["tool_evictable_indices"]]
+        keep = int(config["tool_keep_tokens"])
+        method = str(config["method"])
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        layer_ids = list(range(kv_cache.start_layer, kv_cache.start_layer + kv_cache.layer_num))
+        if method != "streamingllm":
+            if not isinstance(score_info, dict) or list(score_info.get("layer_ids") or []) != layer_ids:
+                raise RuntimeError("TOOL_KV_HEADWISE_SCORES_UNAVAILABLE")
+            full_scores = list(score_info.get("headwise_layers") or [])
+            if len(full_scores) != len(layer_ids):
+                raise RuntimeError("TOOL_KV_HEADWISE_LAYER_COUNT_MISMATCH")
+            scores = []
+            for score in full_scores:
+                if score.ndim != 2 or score.shape[1] != int(config["history_end"]):
+                    raise RuntimeError("TOOL_KV_HEADWISE_SCORE_SHAPE_MISMATCH")
+                scores.append(score[:, evictable].to(torch.float32))
+        else:
+            scores = []
+
+        if method == "pyramidkv":
+            selected_by_layer, metadata = select_pyramidkv_headwise(
+                scores,
+                target_tokens=keep,
+                capacity_history_tokens=len(evictable),
+                recent_window=int(config["history_kv_recent_window"]),
+                kernel_size=int(config["history_kv_kernel_size"]),
+                pooling=str(config["history_kv_pooling"]),
+            )
+        else:
+            selected_by_layer = []
+            for score in (scores if scores else [None] * len(layer_ids)):
+                if method == "h2o":
+                    selected = select_tool_h2o(
+                        full_scores[len(selected_by_layer)], evictable, keep,
+                        float(config["h2o_recent_fraction"]),
+                    )
+                elif method == "snapkv_persistent":
+                    selected = select_tool_snapkv(
+                        full_scores[len(selected_by_layer)], evictable, keep,
+                        int(config["history_kv_kernel_size"]),
+                    )
+                else:
+                    selected = select_streamingllm_indices(
+                        len(evictable),
+                        target_tokens=keep,
+                        sink_tokens=int(config["streamingllm_sink_tokens"]),
+                    ).unsqueeze(0)
+                selected_by_layer.append(selected)
+            metadata = {
+                "algorithm_version": "tool_schema_reference_headwise_v1",
+                "per_layer_budget_tokens": [keep] * len(layer_ids),
+                "per_head_selection": method != "streamingllm",
+            }
+
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        slots = row[evictable].long()
+        layers = {}
+        for layer_id, selected in zip(layer_ids, selected_by_layer):
+            key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+            if key_buffer.ndim not in (3, 4) or value_buffer.ndim != key_buffer.ndim:
+                raise RuntimeError("TOOL_KV_UNSUPPORTED_BUFFER_LAYOUT")
+            normal_key = key_buffer.reshape(-1, *key_buffer.shape[-2:])[slots]
+            normal_value = value_buffer.reshape(-1, *value_buffer.shape[-2:])[slots]
+            if method == "streamingllm":
+                selected = selected.expand(normal_key.shape[1], -1)
+            layers[layer_id] = gather_reference_layer(
+                normal_key,
+                normal_value,
+                evictable,
+                selected.to(normal_key.device),
+            )
+        state = ReferenceHistoryKVState(
+            method=method,
+            layers=layers,
+            selection_metadata={
+                **metadata,
+                "memory_region": "tool_schema_only",
+                "evictable_schema_tokens": len(evictable),
+            },
+            expected_layer_ids=tuple(layer_ids),
+        )
+        state.validate()
+        cap = config.get("tool_max_resident_tokens")
+        protocol_resident = config.get("tool_protocol_resident_tokens")
+        if cap is not None and protocol_resident is not None:
+            baseline = int(protocol_resident) - keep
+            actual_mean = baseline + sum(
+                int(layer.key.shape[1]) for layer in state.layers.values()
+            ) / len(state.layers)
+            if actual_mean > int(cap):
+                raise RuntimeError("TOOL_KV_ACTUAL_TOOL_BUDGET_EXCEEDED")
+        config.update(
+            history_kv_backend="reference_attention",
+            reference_attention_backend="torch_sdpa",
+            runtime_status_override="reference_attention_ok",
+            per_layer_budget_tokens=metadata["per_layer_budget_tokens"],
+            selection_reason="tool_schema_headwise_reference",
+        )
+        return state
+
+    def _build_pyramidkv_reference_state(
+        self, req: "Req", config: dict, score_info: dict
+    ):
+        """Materialize PyramidKV's per-layer/per-head resident tensors."""
+
+        from sglang.srt.mem_cache.history_kv_reference import (
+            ReferenceHistoryKVState,
+            gather_reference_candidates,
+            select_pyramidkv_headwise,
+        )
+
+        headwise_scores = list(score_info.get("headwise_layers") or [])
+        layer_ids = [int(item) for item in score_info.get("layer_ids") or []]
+        if not headwise_scores or len(headwise_scores) != len(layer_ids):
+            raise RuntimeError("PYRAMIDKV_HEADWISE_SCORES_UNAVAILABLE")
+        history_start = int(config.get("history_start") or 0)
+        history_end = int(config.get("history_end") or 0)
+        history_len = history_end - history_start
+        if history_len <= 0:
+            raise RuntimeError("PYRAMIDKV_REFERENCE_HISTORY_EMPTY")
+        existing_state = getattr(req, "history_kv_reference_state", None)
+        ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+        if len(ledger) < history_end:
+            raise RuntimeError("PYRAMIDKV_RESIDENT_POSITION_LEDGER_INCOMPLETE")
+        normal_positions = ledger[history_start:history_end]
+        protected_indices = set(config.get("protected_history_indices") or [])
+        normal_indices = [index for index in range(history_len) if index not in protected_indices]
+        if protected_indices:
+            normal_positions = [normal_positions[index] for index in normal_indices]
+        expected_scores = []
+        for layer_id, score in zip(layer_ids, headwise_scores):
+            score = score.detach().float().cpu()
+            existing_layer = (
+                existing_state.layer(layer_id)
+                if existing_state is not None
+                else None
+            )
+            expected = history_len + (
+                int(existing_layer.key.shape[1]) if existing_layer is not None else 0
+            )
+            if score.ndim != 2 or int(score.shape[1]) != expected:
+                raise RuntimeError(
+                    "PYRAMIDKV_CANDIDATE_SCORE_LENGTH_MISMATCH: "
+                    f"layer={layer_id}, observed={tuple(score.shape)}, expected={expected}"
+                )
+            if protected_indices:
+                reference_len = expected - history_len
+                score = score[:, list(range(reference_len)) + [reference_len + index for index in normal_indices]]
+            normal_position_tensor = torch.as_tensor(
+                normal_positions,
+                dtype=torch.long,
+            ).expand(score.shape[0], -1)
+            candidate_positions = normal_position_tensor
+            if existing_layer is not None:
+                candidate_positions = torch.cat(
+                    [existing_layer.positions.detach().cpu(), normal_position_tensor],
+                    dim=1,
+                )
+            order = torch.argsort(candidate_positions, dim=1)
+            expected_scores.append(torch.gather(score, 1, order))
+        selected, metadata = select_pyramidkv_headwise(
+            expected_scores,
+            target_tokens=int(config.get("target_tokens") or history_len),
+            capacity_history_tokens=max(int(item.shape[1]) for item in expected_scores),
+            recent_window=max(
+                1, int(config.get("history_kv_recent_window") or 64)
+            ),
+            kernel_size=max(
+                1, int(config.get("history_kv_kernel_size") or 5)
+            ),
+            pooling=str(config.get("history_kv_pooling") or "avgpool").lower(),
+        )
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        slots = req_row[history_start:history_end].long()
+        if protected_indices:
+            slots = slots[normal_indices]
+        layers = {}
+        for layer_id, indices in zip(layer_ids, selected):
+            key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+            if key_buffer.ndim not in (3, 4) or value_buffer.ndim != key_buffer.ndim:
+                raise RuntimeError("PYRAMIDKV_UNSUPPORTED_KV_BUFFER_LAYOUT")
+            normal_key = key_buffer.reshape(
+                -1, *key_buffer.shape[-2:]
+            )[slots]
+            normal_value = value_buffer.reshape(
+                -1, *value_buffer.shape[-2:]
+            )[slots]
+            existing_layer = (
+                existing_state.layer(layer_id)
+                if existing_state is not None
+                else None
+            )
+            layers[layer_id] = gather_reference_candidates(
+                existing_layer,
+                normal_key,
+                normal_value,
+                normal_positions,
+                indices.to(normal_key.device),
+            )
+        state = ReferenceHistoryKVState(
+            method="pyramidkv",
+            layers=layers,
+            selection_metadata={
+                **metadata,
+                "history_kv_backend": "reference_attention",
+                "source_candidate_tokens_by_layer": [
+                    int(item.shape[1]) for item in expected_scores
+                ],
+            },
+            expected_layer_ids=tuple(layer_ids),
+        )
+        state.validate()
+        from sglang.srt.observability import paper_telemetry
+
+        paper_telemetry.sample(
+            "pyramidkv_reference_state_materialized",
+            tensors=[
+                tensor
+                for layer in state.layers.values()
+                for tensor in (layer.key, layer.value, layer.positions)
+            ],
+            temporary_kv=True,
+        )
+        config.update(
+            selection_reason="pyramidkv_official_headwise",
+            per_layer_budget_tokens=metadata["per_layer_budget_tokens"],
+            runtime_status_override="reference_attention_ok",
+            history_kv_backend="reference_attention",
+            reference_attention_backend="torch_sdpa",
+        )
+        return state
+
+    def _build_agentkv_reference_state(self, req: "Req", config: dict):
+        """Materialize StageQ-SnapKV selections over resident candidates."""
+
+        from sglang.srt.mem_cache.agentkv import (
+            AGENTKV_ALGORITHM_VERSION,
+            AgentKVQueryRing,
+            select_agentkv_layer_indices,
+        )
+        from sglang.srt.mem_cache.history_kv_reference import (
+            ReferenceHistoryKVState,
+            gather_reference_candidates,
+            merge_reference_candidates,
+        )
+
+        ring = getattr(req, "history_kv_runtime_state", None)
+        if not isinstance(ring, AgentKVQueryRing):
+            raise RuntimeError("AGENTKV_QUERY_RING_UNAVAILABLE")
+        history_start = int(config.get("history_start") or 0)
+        history_end = int(config.get("history_end") or 0)
+        history_len = history_end - history_start
+        if history_len <= 0:
+            raise RuntimeError("AGENTKV_REFERENCE_HISTORY_EMPTY")
+        ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+        if len(ledger) < history_end:
+            raise RuntimeError("AGENTKV_RESIDENT_POSITION_LEDGER_INCOMPLETE")
+        positions = ledger[history_start:history_end]
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        slots = req_row[history_start:history_end].long()
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        existing_state = getattr(req, "history_kv_reference_state", None)
+        layers = {}
+        per_layer_rows = []
+        per_layer_rows_by_stage = []
+        per_layer_budgets = []
+        for layer_id in range(
+            kv_cache.start_layer, kv_cache.start_layer + kv_cache.layer_num
+        ):
+            key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+            normal_key = key_buffer.reshape(
+                -1, *key_buffer.shape[-2:]
+            )[slots]
+            normal_value = value_buffer.reshape(
+                -1, *value_buffer.shape[-2:]
+            )[slots]
+            existing_layer = (
+                existing_state.layer(layer_id)
+                if existing_state is not None
+                else None
+            )
+            merged_key, _, _ = merge_reference_candidates(
+                existing_layer,
+                normal_key,
+                normal_value,
+                positions,
+            )
+            candidate_key = merged_key.transpose(0, 1).contiguous()
+            observations, _ = ring.read_layer(layer_id)
+            if observations.numel() == 0:
+                observations = candidate_key.new_empty(
+                    (0, candidate_key.shape[1], candidate_key.shape[2])
+                )
+            indices = select_agentkv_layer_indices(
+                candidate_key,
+                observations,
+                target_tokens=int(config.get("target_tokens") or history_len),
+            )
+            layers[layer_id] = gather_reference_candidates(
+                existing_layer,
+                normal_key,
+                normal_value,
+                positions,
+                indices.to(normal_key.device),
+            )
+            per_layer_rows.append(int(observations.shape[0]))
+            per_layer_rows_by_stage.append(ring.rows_by_stage(layer_id))
+            per_layer_budgets.append(int(indices.shape[1]))
+        metadata = {
+            "method": "agentkv",
+            "algorithm_version": AGENTKV_ALGORITHM_VERSION,
+            "history_kv_backend": "reference_attention",
+            "reference_attention_backend": "torch_sdpa",
+            "per_head_selection": True,
+            "per_layer_budget_tokens": per_layer_budgets,
+            "per_layer_query_rows": per_layer_rows,
+            "per_layer_query_rows_by_stage": per_layer_rows_by_stage,
+        }
+        state = ReferenceHistoryKVState(
+            method="agentkv",
+            layers=layers,
+            selection_metadata=metadata,
+            expected_layer_ids=tuple(
+                range(
+                    kv_cache.start_layer,
+                    kv_cache.start_layer + kv_cache.layer_num,
+                )
+            ),
+        )
+        state.validate()
+        from sglang.srt.observability import paper_telemetry
+
+        paper_telemetry.sample(
+            "agentkv_reference_state_materialized",
+            tensors=[
+                tensor
+                for layer in state.layers.values()
+                for tensor in (layer.key, layer.value, layer.positions)
+            ],
+            temporary_kv=True,
+        )
+        config.update(
+            selection_reason="agentkv_stageq_snapkv",
+            per_layer_budget_tokens=per_layer_budgets,
+            runtime_status_override="reference_attention_ok",
+            history_kv_backend="reference_attention",
+            reference_attention_backend="torch_sdpa",
+        )
+        return state
+
+    def _build_commitkv_reference_state(self, req: "Req", config: dict):
+        """Apply CommitKV lifecycle retirement to a common resident axis."""
+
+        from sglang.srt.mem_cache.history_kv_reference import (
+            CommitKVServingState,
+            ReferenceHistoryKVState,
+            gather_reference_candidates,
+        )
+
+        serving_state = getattr(req, "history_kv_runtime_state", None)
+        if not isinstance(serving_state, CommitKVServingState):
+            raise RuntimeError("COMMITKV_RUNTIME_STATE_UNAVAILABLE")
+        reference_config = getattr(req, "history_kv_reference_config", None)
+        declared_target_tokens = (
+            int(reference_config.get("target_tokens") or 2048)
+            if isinstance(reference_config, dict)
+            else serving_state.target_tokens
+        )
+        if declared_target_tokens != serving_state.target_tokens:
+            raise RuntimeError(
+                "COMMITKV_TOTAL_BUDGET_CHANGED: "
+                f"state={serving_state.target_tokens}, "
+                f"request={declared_target_tokens}"
+            )
+        history_start = int(config.get("history_start") or 0)
+        history_end = int(config.get("history_end") or 0)
+        history_len = history_end - history_start
+        if history_len <= 0:
+            raise RuntimeError("COMMITKV_REFERENCE_HISTORY_EMPTY")
+        ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+        if len(ledger) < history_end:
+            raise RuntimeError("COMMITKV_RESIDENT_POSITION_LEDGER_INCOMPLETE")
+        normal_positions = ledger[history_start:history_end]
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        slots = req_row[history_start:history_end].long()
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        layer_ids = tuple(
+            range(
+                kv_cache.start_layer,
+                kv_cache.start_layer + kv_cache.layer_num,
+            )
+        )
+        existing_state = getattr(req, "history_kv_reference_state", None)
+        first_existing = (
+            existing_state.layer(layer_ids[0])
+            if existing_state is not None
+            else None
+        )
+        if first_existing is not None:
+            if not torch.equal(
+                first_existing.positions,
+                first_existing.positions[:1].expand_as(first_existing.positions),
+            ):
+                raise RuntimeError("COMMITKV_REQUIRES_COMMON_HEADWISE_POSITIONS")
+            resident_positions = sorted(
+                first_existing.positions[0].tolist() + normal_positions
+            )
+        else:
+            resident_positions = normal_positions
+        first_key, _ = kv_cache.get_kv_buffer(layer_ids[0])
+        num_kv_heads = int(first_key.shape[-2])
+        # CommitKV deliberately wraps a caller-selected base policy.  The
+        # engine's documented convention is most-recent-first; lifecycle
+        # retirement/protection then modifies that order exactly.
+        baseline = range(len(resident_positions) - 1, -1, -1)
+        selected, metadata = serving_state.policy.checkpoint(
+            baseline,
+            resident_positions,
+            target_tokens=serving_state.target_tokens,
+            num_layers=len(layer_ids),
+            num_kv_heads=num_kv_heads,
+            device=first_key.device,
+        )
+        metadata.update(
+            method="commitkv",
+            history_kv_backend="reference_attention",
+            baseline_policy="most_recent_first_project_convention",
+            scan_order="latest_fully_resident_pages_project_convention",
+            capture_receipts=list(serving_state.receipts),
+            commitkv_total_budget_tokens=serving_state.target_tokens,
+            commitkv_request_effective_target_tokens=int(
+                config.get("target_tokens") or history_len
+            ),
+        )
+        layers = {}
+        for layer_id, indices in zip(layer_ids, selected):
+            key_buffer, value_buffer = kv_cache.get_kv_buffer(layer_id)
+            normal_key = key_buffer.reshape(
+                -1, *key_buffer.shape[-2:]
+            )[slots]
+            normal_value = value_buffer.reshape(
+                -1, *value_buffer.shape[-2:]
+            )[slots]
+            existing_layer = (
+                existing_state.layer(layer_id)
+                if existing_state is not None
+                else None
+            )
+            layers[layer_id] = gather_reference_candidates(
+                existing_layer,
+                normal_key,
+                normal_value,
+                normal_positions,
+                indices.to(normal_key.device),
+            )
+        state = ReferenceHistoryKVState(
+            method="commitkv",
+            layers=layers,
+            selection_metadata=metadata,
+            expected_layer_ids=layer_ids,
+        )
+        state.validate()
+        from sglang.srt.observability import paper_telemetry
+
+        paper_telemetry.sample(
+            "commitkv_reference_state_materialized",
+            tensors=[
+                tensor
+                for layer in state.layers.values()
+                for tensor in (layer.key, layer.value, layer.positions)
+            ],
+            temporary_kv=True,
+        )
+        config.update(
+            selection_reason="commitkv_lifecycle_retirement",
+            per_layer_budget_tokens=metadata.get("per_layer_budget_tokens")
+            or [int(item.shape[1]) for item in selected],
+            runtime_status_override="reference_attention_ok",
+            history_kv_backend="reference_attention",
+            reference_attention_backend="torch_sdpa",
+            commitkv_measurement_layer_id=(
+                serving_state.policy.config.measurement_layer_id
+            ),
+            commitkv_baseline_policy="most_recent_first_project_convention",
+        )
+        return state
+
     def _apply_history_kv_eviction(self, req: "Req") -> bool:
         from sglang.srt.managers.schedule_batch import FINISH_ABORT as _FA
 
         config = getattr(req, "history_kv_eviction", None)
         if not isinstance(config, dict):
             return True
+        paper_telemetry.set_phase("selection")
+        session_error = _persistent_history_session_error(req, config)
+        if session_error is not None:
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                report["history_kv_runtime_status"] = {
+                    "PERSISTENT_HISTORY_SESSION_UNAVAILABLE": (
+                        "persistent_session_unavailable"
+                    ),
+                    "PERSISTENT_HISTORY_SESSION_REQUIRES_STREAMING_SESSION": (
+                        "persistent_session_not_streaming"
+                    ),
+                    "PERSISTENT_HISTORY_SESSION_ID_MISMATCH": (
+                        "persistent_session_id_mismatch"
+                    ),
+                }.get(session_error, "persistent_session_error")
+                report["persistent_history_session_error"] = session_error
+                report["history_kv_physical_eviction"] = {
+                    "success": False,
+                    "error": session_error,
+                }
+            req.persistent_history_eviction_failed = True
+            req.to_finish = _FA(session_error)
+            req.check_finished()
+            paper_telemetry.sample("history_kv_eviction_failed")
+            paper_telemetry.set_phase("prefill")
+            return False
         score_info = getattr(req, "history_kv_selection_scores", None)
         selection_query_tokens_observed = (
             int(score_info.get("query_tokens") or 0)
@@ -3148,16 +3944,23 @@ class Scheduler(
             from sglang.srt.mem_cache.history_kv_eviction import PhysicalHistoryKVEvictor
 
             method = str(config.get("method") or "").strip().lower()
-            if method in {"snapkv", "snapkv_persistent", "h2o", "pyramid", "pyramidkv"}:
-                selection_query_tokens = config.get("selection_query_tokens")
+            if method in {
+                "snapkv",
+                "snapkv_persistent",
+                "h2o",
+                "pyramid",
+                "pyramidkv",
+            }:
+                expected_query_tokens = config.get("selection_query_tokens")
+                if config.get("tool_kv_eviction") and int(config.get("tool_keep_tokens") or 0) == 0:
+                    expected_query_tokens = None
                 if (
-                    selection_query_tokens is not None
-                    and selection_query_tokens_observed
-                    != int(selection_query_tokens)
+                    expected_query_tokens is not None
+                    and selection_query_tokens_observed != int(expected_query_tokens)
                 ):
                     raise RuntimeError(
                         "HISTORY_KV_SELECTION_QUERY_COVERAGE_MISMATCH: "
-                        f"expected={int(selection_query_tokens)}, "
+                        f"expected={int(expected_query_tokens)}, "
                         f"observed={selection_query_tokens_observed}"
                     )
             evictor = PhysicalHistoryKVEvictor(
@@ -3168,7 +3971,34 @@ class Scheduler(
             selected = config.get("selected_history_indices")
             if config.get("persistent_session") and getattr(req, "history_kv_resident_positions", None) is None:
                 req.history_kv_resident_positions = list(range(len(req.c2kv_virtual_input_ids)))
-            if not isinstance(selected, list):
+            reference_state = None
+            if config.get("tool_kv_eviction"):
+                if int(config["tool_keep_tokens"]) > 0:
+                    reference_state = self._build_tool_kv_reference_state(
+                        req, config, score_info
+                    )
+                selected = list(config["protected_history_indices"])
+            elif method in {"pyramid", "pyramidkv"}:
+                if not isinstance(score_info, dict):
+                    raise RuntimeError("PYRAMIDKV_SELECTION_SCORES_UNAVAILABLE")
+                reference_state = self._build_pyramidkv_reference_state(
+                    req, config, score_info
+                )
+                # The headwise history now lives in method-owned tensors.  No
+                # shared history token may remain in req_to_token, or it would
+                # be counted and attended twice.
+                selected = list(config.get("protected_history_indices") or [])
+            elif method == "agentkv":
+                reference_state = self._build_agentkv_reference_state(
+                    req, config
+                )
+                selected = []
+            elif method == "commitkv":
+                reference_state = self._build_commitkv_reference_state(
+                    req, config
+                )
+                selected = []
+            elif not isinstance(selected, list):
                 selected = self._select_history_kv_eviction_indices(req, config)
             result = evictor.evict(
                 req,
@@ -3190,18 +4020,64 @@ class Scheduler(
             report["selection_query_tokens_observed"] = (
                 selection_query_tokens_observed
             )
-            report["history_kv_physical_eviction"] = (
-                result.as_dict() if result is not None else {"success": False, "error": error}
+            physical_receipt = (
+                result.as_dict()
+                if result is not None
+                else {"success": False, "error": error}
             )
+            if result is not None and result.success and reference_state is not None:
+                storage_runtime_status = physical_receipt.get("runtime_status")
+                physical_receipt["storage_runtime_status"] = storage_runtime_status
+                physical_receipt["runtime_status"] = "reference_attention_ok"
+                report["history_kv_storage_runtime_status"] = storage_runtime_status
+            report["history_kv_physical_eviction"] = physical_receipt
             if result is not None and result.success:
-                runtime_status = str(
-                    config.get("runtime_status_override") or result.runtime_status
+                runtime_status = (
+                    "reference_attention_ok"
+                    if reference_state is not None
+                    else str(
+                        config.get("runtime_status_override")
+                        or result.runtime_status
+                    )
                 )
-                report["active_history_kv_tokens"] = result.kept_history_tokens
-                report["active_full_raw_tokens"] = result.kept_history_tokens
-                report["active_history_kv_tokens_source"] = (
-                    "physical_eviction_measured"
-                )
+                if reference_state is not None:
+                    reference_slots = sum(
+                        int(layer.key.shape[0] * layer.key.shape[1])
+                        for layer in reference_state.layers.values()
+                    )
+                    full_token_slots = sum(
+                        int(layer.key.shape[0])
+                        for layer in reference_state.layers.values()
+                    )
+                    active_tokens = int(
+                        math.ceil(reference_slots / max(1, full_token_slots))
+                    )
+                    report.update(
+                        active_history_kv_tokens=active_tokens,
+                        active_full_raw_tokens=active_tokens,
+                        active_history_kv_tokens_source=(
+                            "reference_history_physical_token_equivalent"
+                        ),
+                        history_kv_backend="reference_attention",
+                        reference_attention_backend="torch_sdpa",
+                        reference_history_token_slots=reference_slots,
+                        reference_history_resident_bytes=int(
+                            reference_state.resident_bytes
+                        ),
+                        reference_history_layer_count=len(
+                            reference_state.layers
+                        ),
+                        reference_history_selection_metadata=dict(
+                            reference_state.selection_metadata
+                        ),
+                    )
+                else:
+                    retained_history = result.kept_history_tokens - len(config.get("protected_history_indices") or [])
+                    report["active_history_kv_tokens"] = retained_history
+                    report["active_full_raw_tokens"] = retained_history
+                    report["active_history_kv_tokens_source"] = (
+                        "physical_eviction_measured"
+                    )
                 report["history_kv_runtime_status"] = runtime_status
                 report["physical_slots_freed"] = result.freed_physical_slots
                 report["logical_total_len"] = result.next_rope_position_after
@@ -3256,17 +4132,81 @@ class Scheduler(
                 )
 
         if result is None or not result.success:
-            # release_kv_cache() still visits SessionAwareCache for a failed
-            # request.  Mark this path so it rolls back to the previously
-            # committed session prefix instead of attempting to save a
-            # partially-prefilled canonical prompt.
             req.persistent_history_eviction_failed = True
             req.to_finish = _FA(error or "Physical history KV eviction failed")
             req.check_finished()
+            paper_telemetry.sample("history_kv_eviction_failed")
+            paper_telemetry.set_phase("prefill")
             return False
 
+        if reference_state is not None:
+            req.history_kv_reference_state = reference_state
         req.history_kv_eviction_result = result.as_dict()
         config = getattr(req, "history_kv_eviction", None)
+        if isinstance(config, dict) and config.get("tool_kv_eviction"):
+            # The request table is physically compacted, but RoPE positions
+            # of every protected history/current token must remain original.
+            req.history_kv_resident_positions = list(result.selected_history_indices or [])
+            report = getattr(req, "kv_memory_report", None)
+            if isinstance(report, dict):
+                normal_tokens_after_replay = int(req.kv_committed_len) + 1
+                kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+                selected_layers = (
+                    list(reference_state.layers.values())
+                    if reference_state is not None else []
+                )
+                by_layer = [
+                    normal_tokens_after_replay + int(layer.key.shape[1])
+                    for layer in selected_layers
+                ] if selected_layers else [normal_tokens_after_replay] * int(kv_cache.layer_num)
+                reference_kv_bytes = sum(
+                    layer.key.numel() * layer.key.element_size()
+                    + layer.value.numel() * layer.value.element_size()
+                    for layer in selected_layers
+                )
+                protocol_resident = config.get("tool_protocol_resident_tokens")
+                tool_by_layer = (
+                    [
+                        int(protocol_resident) - int(config["tool_keep_tokens"])
+                        + int(layer.key.shape[1])
+                        for layer in selected_layers
+                    ]
+                    if selected_layers and protocol_resident is not None
+                    else [int(protocol_resident)] * int(kv_cache.layer_num)
+                    if protocol_resident is not None
+                    else None
+                )
+                report["active_history_kv_tokens"] = 0
+                report["active_tool_kv_tokens"] = int(
+                    math.ceil(
+                        sum(int(layer.key.shape[1]) for layer in selected_layers)
+                        / max(1, len(selected_layers))
+                    )
+                )
+                report["tool_kv_eviction"] = {
+                    "success": True,
+                    "method": str(req.tool_kv_eviction.get("method") or config["method"]),
+                    "internal_method": config["method"],
+                    "full_prompt_tokens": int(config["tool_full_prompt_tokens"]),
+                    "resident_tokens_by_layer": by_layer,
+                    "logical_kv_bytes": (
+                        normal_tokens_after_replay * self._bytes_per_kv_token()
+                        + reference_kv_bytes
+                    ),
+                    "evictable_tokens": len(config["tool_evictable_indices"]),
+                    "protected_tokens": int(config["tool_full_prompt_tokens"])
+                    - len(config["tool_evictable_indices"]),
+                    "target_resident_tokens_per_layer": (
+                        req.tool_kv_eviction.get("target_resident_tokens_per_layer")
+                    ),
+                    "tool_resident_tokens_by_layer": tool_by_layer,
+                    "selection_query_start": int(config["selection_query_start"]),
+                    "selection_query_end": int(config["selection_query_end"]),
+                    "selection_query_tokens_observed": selection_query_tokens_observed,
+                    "first_token_after_selection": False,
+                    "history_untouched": True,
+                    "budget_status": config["tool_budget_status"],
+                }
         if isinstance(config, dict) and config.get("persistent_session"):
             # Keep the session's logical input sequence in the same order as
             # the compacted req_to_token mapping. The correction retained in
@@ -3278,6 +4218,8 @@ class Scheduler(
             if not (0 <= history_start <= history_end <= len(virtual_ids)):
                 req.to_finish = _FA("PERSISTENT_HISTORY_ACTIVE_SEQUENCE_INVALID")
                 req.check_finished()
+                paper_telemetry.sample("history_kv_active_sequence_invalid")
+                paper_telemetry.set_phase("prefill")
                 return False
             active_input_ids = (
                 virtual_ids[:history_start]
@@ -3292,6 +4234,8 @@ class Scheduler(
                     f"committed_len={req.kv_committed_len}"
                 )
                 req.check_finished()
+                paper_telemetry.sample("history_kv_active_sequence_length_mismatch")
+                paper_telemetry.set_phase("prefill")
                 return False
             req.c2kv_persistent_active_input_ids = active_input_ids
             req.c2kv_virtual_input_ids = list(active_input_ids)
@@ -3302,7 +4246,11 @@ class Scheduler(
             req.history_kv_resident_positions = compact_positions(ledger, history_start, history_end, selected)
             lifecycle = {
                 **{k: (req.c2kv_kv_memory_hint or {}).get(k) for k in ("episode_id", "turn_id", "step_id")},
-                "history_kv_backend": "physical_eviction", "persistent_session_enabled": True,
+                "history_kv_backend": (
+                    "reference_attention"
+                    if reference_state is not None
+                    else "physical_eviction"
+                ), "persistent_session_enabled": True,
                 "session_id": req.session.session_id,
                 "full_history_tokens": int(config.get("persistent_canonical_history_end", config.get("canonical_history_end", history_end))) - int(config.get("persistent_protected_prefix_tokens", history_start)),
                 "resident_tokens_before_append": int(config.get("persistent_prior_physical_tokens", 0)),
@@ -3310,15 +4258,42 @@ class Scheduler(
                 "resident_tokens_after_append": len(ledger),
                 "resident_tokens_after_eviction": len(req.history_kv_resident_positions),
                 "evicted_tokens_this_turn": len(ledger) - len(req.history_kv_resident_positions),
-                "retained_tokens_this_turn": len(selected),
+                "retained_tokens_this_turn": int(
+                    req.kv_memory_report.get("active_history_kv_tokens", len(selected))
+                ),
                 "history_prefill_tokens": int(config.get("persistent_delta_history_tokens", history_end)),
                 "full_history_reprefill_performed": False,
                 "previous_resident_position_summary": config.get("previous_resident_position_summary"),
                 "resident_position_summary": position_summary(req.history_kv_resident_positions),
-                "cache_layout": "shared_token_indices_across_layers_heads",
+                "cache_layout": (
+                    "per_layer_headwise_reference_tensors"
+                    if reference_state is not None
+                    else "shared_token_indices_across_layers_heads"
+                ),
             }
+            if reference_state is not None:
+                lifecycle.update(
+                    reference_history_token_slots=int(
+                        req.kv_memory_report["reference_history_token_slots"]
+                    ),
+                    reference_history_resident_bytes=int(
+                        req.kv_memory_report["reference_history_resident_bytes"]
+                    ),
+                    reference_attention_backend="torch_sdpa",
+                )
             req.kv_memory_report["history_kv_lifecycle"] = lifecycle
             logger.info("HISTORY_KV_LIFECYCLE %s", json.dumps(lifecycle, sort_keys=True))
+        # Keep a detached copy: request teardown/requeue paths must not make a
+        if not config.get("persistent_session") and getattr(req, "c2kv_tool_source_spans", None):
+            from sglang.srt.mem_cache.history_kv_lifecycle import compact_positions
+            virtual_ids = list(req.c2kv_virtual_input_ids)
+            start, end = int(config["history_start"]), int(config["history_end"])
+            keep = list(result.selected_history_indices or [])
+            active_ids = virtual_ids[:start] + [virtual_ids[start + index] for index in keep] + virtual_ids[end:]
+            req.c2kv_virtual_input_ids = active_ids
+            req.c2kv_persistent_active_input_ids = list(active_ids)
+            req.history_kv_resident_positions = compact_positions(req.history_kv_resident_positions, start, end, keep)
+
         # Keep a detached copy: request teardown/requeue paths must not make a
         # successfully measured eviction disappear before the final response.
         if isinstance(getattr(req, "kv_memory_report", None), dict):
@@ -3337,9 +4312,183 @@ class Scheduler(
             req=req,
             **result.as_dict(),
         )
+        paper_telemetry.sample("history_kv_eviction_applied")
+        paper_telemetry.set_phase("prefill")
         return True
 
+    def _apply_reference_decode_checkpoint(self, req: "Req") -> int:
+        """Compact newly decoded KV at a method's periodic checkpoint.
+
+        Returns the physical sequence-length delta (new minus old).
+        """
+
+        reference_config = getattr(req, "history_kv_reference_config", None)
+        if not isinstance(reference_config, dict):
+            return 0
+        method = str(reference_config.get("method") or "").lower()
+        if method == "agentkv":
+            interval = int(reference_config.get("checkpoint_interval") or 128)
+        elif method == "commitkv":
+            runtime = getattr(req, "history_kv_runtime_state", None)
+            interval = int(runtime.policy.config.checkpoint_interval)
+        else:
+            return 0
+        old_len = int(req.kv_committed_len)
+        logical_start = getattr(req, "reference_decode_logical_start", None)
+        if logical_start is None:
+            decode_steps = int(getattr(req, "decode_batch_idx", 0) or 0)
+        else:
+            decode_steps = old_len + int(
+                getattr(req, "c2kv_position_correction", 0) or 0
+            ) - int(logical_start)
+        if decode_steps <= 0 or decode_steps % interval:
+            return 0
+
+        base_config = getattr(req, "history_kv_eviction", None) or {}
+        history_start = int(
+            getattr(req, "reference_decode_protected_len", old_len)
+        )
+        if not 0 <= history_start < old_len:
+            return 0
+        ledger = list(getattr(req, "history_kv_resident_positions", None) or [])
+        if len(ledger) > old_len:
+            raise RuntimeError("REFERENCE_DECODE_LEDGER_LONGER_THAN_KV")
+        if len(ledger) < old_len:
+            # Physical index p maps to canonical p + total removed tokens for
+            # the newly appended contiguous decode tail.  Using ledger[-1]
+            # is wrong after a prior checkpoint leaves only a protected prefix.
+            start = len(ledger) + int(
+                getattr(req, "c2kv_position_correction", 0) or 0
+            )
+            ledger.extend(range(start, start + old_len - len(ledger)))
+        req.history_kv_resident_positions = ledger
+        checkpoint_config = {
+            **base_config,
+            **reference_config,
+            "method": method,
+            "history_start": history_start,
+            "history_end": old_len,
+            "target_tokens": int(
+                reference_config.get("target_tokens")
+                or base_config.get("target_tokens")
+                or 2048
+            ),
+        }
+        if method == "agentkv":
+            next_state = self._build_agentkv_reference_state(
+                req, checkpoint_config
+            )
+        else:
+            next_state = self._build_commitkv_reference_state(
+                req, checkpoint_config
+            )
+
+        from sglang.srt.mem_cache.history_kv_eviction import (
+            PhysicalHistoryKVEvictor,
+        )
+
+        result = PhysicalHistoryKVEvictor(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            bytes_per_kv_token=self._bytes_per_kv_token(),
+        ).evict(
+            req,
+            method=method,
+            history_start=history_start,
+            history_end=old_len,
+            target_tokens=checkpoint_config["target_tokens"],
+            selected_history_indices=[],
+        )
+        if not result.success:
+            raise RuntimeError(
+                "REFERENCE_DECODE_CHECKPOINT_EVICTION_FAILED: " + result.error
+            )
+        req.history_kv_reference_state = next_state
+        req.history_kv_resident_positions = ledger[:history_start]
+        # Decode allocation receipts before this checkpoint either moved into
+        # the external reference state or were physically freed. Only slots
+        # allocated after the checkpoint remain candidates for finish cleanup.
+        req.persistent_decode_cache_locs = []
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            reference_slots = sum(
+                int(layer.key.shape[0] * layer.key.shape[1])
+                for layer in next_state.layers.values()
+            )
+            full_token_slots = sum(
+                int(layer.key.shape[0])
+                for layer in next_state.layers.values()
+            )
+            active_tokens = int(
+                math.ceil(reference_slots / max(1, full_token_slots))
+            )
+            report.update(
+                active_history_kv_tokens=active_tokens,
+                active_full_raw_tokens=active_tokens,
+                active_history_kv_tokens_source=(
+                    "reference_history_physical_token_equivalent"
+                ),
+                history_kv_backend="reference_attention",
+                reference_attention_backend="torch_sdpa",
+                reference_history_token_slots=reference_slots,
+                reference_history_resident_bytes=int(next_state.resident_bytes),
+                reference_history_layer_count=len(next_state.layers),
+                reference_history_selection_metadata=dict(
+                    next_state.selection_metadata
+                ),
+                physical_kv_len=int(req.kv_committed_len),
+                physical_slots_freed=(
+                    int(report.get("physical_slots_freed") or 0)
+                    + int(result.freed_physical_slots)
+                ),
+            )
+            checkpoints = report.setdefault("reference_decode_checkpoints", [])
+            checkpoints.append(
+                {
+                    "method": method,
+                    "decode_steps": decode_steps,
+                    "old_physical_tokens": old_len,
+                    "new_physical_tokens": int(req.kv_committed_len),
+                    "freed_physical_slots": result.freed_physical_slots,
+                    "reference_history_resident_bytes": int(
+                        next_state.resident_bytes
+                    ),
+                    "full_history_reprefill_performed": False,
+                }
+            )
+        return int(req.kv_committed_len) - old_len
+
     def _select_history_kv_eviction_indices(self, req: "Req", config: dict) -> Optional[list[int]]:
+        protected = set(config.get("protected_history_indices") or [])
+        if protected:
+            from copy import copy
+            start, end = int(config["history_start"]), int(config["history_end"])
+            candidates = [index for index in range(end - start) if index not in protected]
+            if not candidates:
+                return sorted(protected)
+            if str(config.get("method") or "").lower() == "streamingllm":
+                count = max(0, int(config.get("target_tokens") or 0))
+                return sorted(protected | set(candidates[-count:] if count else []))
+            scores = getattr(req, "history_kv_selection_scores", None)
+            if not isinstance(scores, dict):
+                return None
+            scoped = copy(req)
+            scoped.history_kv_eviction = {**config, "history_start": 0,
+                "history_end": len(candidates), "protected_history_indices": []}
+            scoped.history_kv_selection_scores = {**scores, "layers": [
+                torch.as_tensor(layer)[candidates] for layer in scores.get("layers") or []]}
+            ledger = getattr(req, "history_kv_resident_positions", None)
+            if ledger is not None:
+                scoped.history_kv_resident_positions = [ledger[start + index] for index in candidates]
+            selected = self._select_history_kv_eviction_indices(scoped, scoped.history_kv_eviction)
+            if selected is None:
+                return None
+            if hasattr(scoped, "history_kv_score_state"):
+                req.history_kv_score_state = scoped.history_kv_score_state
+            for key, value in scoped.history_kv_eviction.items():
+                if key not in {"history_start", "history_end", "protected_history_indices"}:
+                    config[key] = value
+            return sorted(protected | {candidates[index] for index in selected})
         method = str(config.get("method") or "").strip().lower()
         if method == "snapkv":
             method = "snapkv_persistent"
@@ -3575,6 +4724,12 @@ class Scheduler(
         report = getattr(req, "kv_memory_report", None)
         if not isinstance(report, dict):
             return
+        if getattr(req, "c2kv_active_region", None) == "tool":
+            report["active_tool_kv_tokens"] = int(report.get("active_tool_kv_tokens") or 0) + int(tokens)
+            key = "active_tool_gist_tokens" if kind == "gist" else "active_tool_repair_tokens"
+            report[key] = int(report.get(key) or 0) + int(tokens)
+            report["tool_encoder_source_tokens"] = int(report.get("tool_encoder_source_tokens") or 0) + int(original_tokens)
+            return
         add_c2kv_kv_memory_tokens(
             report,
             kind=kind,
@@ -3765,6 +4920,13 @@ class Scheduler(
         req.c2kv_virtual_input_ids = virtual_ids
         req.c2kv_pinned_keys = pinned_keys
 
+        if any(getattr(segment, "region", None) == "tool" for segment in segments):
+            try:
+                self._compose_c2kv_history_rounds(req, entries, repair_entries)
+            except (ValueError, RuntimeError) as exc:
+                self._release_c2kv_pins(req)
+                return str(exc)
+
         self._log_c2kv_token_usage(
             "build_rounds",
             req=req,
@@ -3791,11 +4953,128 @@ class Scheduler(
 
         return None
 
+    def _compose_c2kv_history_rounds(self, req, entries, repair_entries):
+        """Attach history selection to the existing tool injection schedule."""
+        from sglang.srt.managers.schedule_batch import C2KVPrefillRound
+        from sglang.srt.mem_cache.c2kv_composition import (
+            physical_boundary, protected_history_indices, resident_positions,
+            source_boundary, split_rounds_at_query, raw_query_window,
+        )
+        from sglang.srt.mem_cache.history_kv_lifecycle import selection_query_window
+
+        descriptors = []
+        canonical_cursor = 0
+        input_cursor = 0
+        tool_spans = []
+        for segment, entry, repairs in zip(req.c2kv_segments, entries, repair_entries):
+            canonical_cursor += segment.token_start - input_cursor
+            source_tokens = getattr(segment, "source_token_count", None)
+            if source_tokens is None:
+                source_tokens = entry.original_seq_len if entry else sum(item.original_seq_len for item in repairs)
+            source_tokens = int(source_tokens)
+            local_positions = []
+            if entry is not None:
+                if source_tokens != entry.original_seq_len:
+                    raise ValueError("C2KV_TOOL_SOURCE_LENGTH_MISMATCH")
+                local_positions.extend(int(item) for item in self.c2kv_pool.get_position_ids(entry).tolist())
+            for repair in repairs:
+                source_end = getattr(segment, "source_token_end", None)
+                source_start = canonical_cursor if source_end is None else int(source_end) - source_tokens
+                local_positions.extend(int(item) - source_start for item in self.c2kv_pool.get_position_ids(repair).tolist())
+            expected_len = getattr(segment, "expected_token_len", None)
+            if expected_len is not None and int(expected_len) != len(local_positions):
+                raise ValueError("C2KV_TOOL_RESIDENT_LENGTH_MISMATCH")
+            descriptor = {"token_start": segment.token_start, "token_end": segment.token_end,
+                          "source_tokens": source_tokens, "positions": local_positions,
+                          "region": getattr(segment, "region", None)}
+            descriptors.append(descriptor)
+            if descriptor["region"] == "tool":
+                tool_spans.append((canonical_cursor, canonical_cursor + source_tokens))
+            canonical_cursor += source_tokens
+            input_cursor = segment.token_end
+
+        config = getattr(req, "history_kv_eviction", None)
+        hint = getattr(req, "c2kv_kv_memory_hint", None) or {}
+        session_error = _persistent_history_session_error(req, config)
+        if session_error is not None:
+            raise ValueError(session_error)
+        if isinstance(config, dict) and config.get("persistent_continuation"):
+            req.c2kv_composition_pending = descriptors
+            config["persistent_continuation_pending"] = True
+            return
+
+        positions = resident_positions(len(req.origin_input_ids), descriptors)
+        req.history_kv_resident_positions = positions
+        req.c2kv_tool_source_spans = tool_spans
+        persistent = bool((hint.get("persistent_history_session") or {}).get("enabled"))
+        if persistent:
+            req.c2kv_persistent_active_input_ids = list(req.c2kv_virtual_input_ids)
+        if not isinstance(config, dict):
+            return
+        if len(getattr(req, "prefix_indices", ())) > 0:
+            raise ValueError("PHYSICAL_HISTORY_KV_EVICTION_SHARED_PREFIX_UNSUPPORTED")
+        method = str(config.get("method") or "").lower()
+        if method == "snapkv":
+            method = "snapkv_persistent"
+        if method == "pyramid":
+            method = "pyramidkv"
+        if method not in {"h2o", "snapkv_persistent", "pyramidkv", "streamingllm"}:
+            raise ValueError("C2KV_TOOL_HISTORY_METHOD_UNSUPPORTED: " + method)
+        start, end = int(config.get("history_start") or 0), int(config.get("history_end") or 0)
+        if not 0 <= start <= end <= len(req.origin_input_ids):
+            raise ValueError("C2KV_COMPOSITION_HISTORY_RANGE_INVALID")
+        config["canonical_history_start"] = source_boundary(start, descriptors)
+        config["canonical_history_end"] = source_boundary(end, descriptors)
+        start, end = physical_boundary(start, descriptors), physical_boundary(end, descriptors)
+        config.update(method=method, history_start=start, history_end=end)
+        config["protected_history_indices"] = protected_history_indices(positions, start, end, tool_spans)
+        if start == end:
+            return
+        query_window = selection_query_window(method, 0, end, len(positions), config.get("history_kv_recent_window"))
+        if query_window is None:
+            query_window = (end - 1, end)
+        query_start, query_end = raw_query_window(req.c2kv_rounds, descriptors, query_window)
+        req.c2kv_rounds = split_rounds_at_query(req.c2kv_rounds, descriptors, query_start, query_end, C2KVPrefillRound)
+        config.update(selection_query_start=query_start, selection_query_end=query_end,
+                      selection_query_tokens=query_end - query_start,
+                      selection_query_phase="new_tail_prefill_before_eviction")
+        if isinstance(getattr(req, "kv_memory_report", None), dict):
+            req.kv_memory_report.update({key: config[key] for key in (
+                "selection_query_start", "selection_query_end", "selection_query_tokens", "selection_query_phase")})
+            req.kv_memory_report["tool_history_composition"] = {"tool_segments": len(tool_spans),
+                "tool_protected_history_tokens": len(config["protected_history_indices"]),
+                "canonical_history_start": config["canonical_history_start"],
+                "canonical_history_end": config["canonical_history_end"],
+                "physical_history_start": start, "physical_history_end": end}
+
+    def _advance_cached_c2kv_tool_rounds(self, req):
+        """Inject appended tool carriers whose preceding round is already resident."""
+        if not getattr(req, "c2kv_tool_source_spans", None):
+            return True
+        while req.c2kv_rounds and req.c2kv_round_idx < len(req.c2kv_rounds) and req.extend_input_len == 0:
+            current = req.c2kv_rounds[req.c2kv_round_idx]
+            if current.post_history_kv_eviction or not current.post_inject_seg_indices:
+                raise RuntimeError("C2KV_COMPOSITION_EMPTY_PREFILL_ROUND")
+            for index in current.post_inject_seg_indices:
+                if not self._inject_c2kv_gist_segment(req, index, req.kv_committed_len):
+                    req.persistent_history_eviction_failed = True
+                    req.set_finish_with_abort(getattr(req, "c2kv_injection_error", None) or "C2KV_COMPOSITION_INITIAL_INJECTION_FAILED")
+                    return False
+            req.c2kv_round_idx += 1
+            if req.c2kv_round_idx >= len(req.c2kv_rounds):
+                raise RuntimeError("C2KV_COMPOSITION_REQUIRES_QUERY_TOKEN")
+            req.c2kv_round_start_len = req.kv_committed_len
+            req.prefix_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :req.kv_committed_len].to(torch.int64)
+            req.already_computed = req.kv_committed_len
+            req.prepare_c2kv_round_input(self.tree_cache)
+        return True
+
     def _inject_c2kv_gist_segment(
         self, req: "Req", seg_idx: int, logical_kv_start: Optional[int] = None
     ) -> bool:
         """Returns True on success, False on any failure (caller should abort req)."""
         seg = req.c2kv_segments[seg_idx]
+        req.c2kv_active_region = getattr(seg, "region", None)
         if self.c2kv_pool is None:
             self._set_c2kv_injection_error(
                 req,
@@ -4854,9 +6133,12 @@ class Scheduler(
                 and isinstance(hint.get("persistent_history_session"), dict)
                 and hint["persistent_history_session"].get("enabled")
             )
-            # Physical history pages belong to the request/session, not radix.
-            # A stale protected prefix can exceed the compacted resident length
-            # and cause negative session accounting or skipped page releases.
+            # Multi-round C2KV stashing bypasses SessionAwareCache.  Physical
+            # history requests keep these pages request/session-owned, so they
+            # must not be counted as a radix-protected prefix.  Otherwise the
+            # first 256-token chunk survives in cache_protected_len after the
+            # request is compacted to (for example) 134 resident tokens, and
+            # idle accounting reports session_held=134-256=-122.
             req.cache_protected_len = (
                 0 if persistent_history else len(req.prefix_indices)
             )
@@ -5049,6 +6331,23 @@ class Scheduler(
 
         return ret
 
+    def _abort_missing_persistent_history_session(self, req: Req) -> None:
+        """Return a missing resident slot as a request error, not an engine crash."""
+        error = "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING"
+        report = getattr(req, "kv_memory_report", None)
+        if isinstance(report, dict):
+            report["history_kv_runtime_status"] = "resident_cache_missing"
+            report["persistent_history_session_error"] = error
+        req.set_finish_with_abort(error)
+        req.check_finished()
+        self._cleanup_aborted_c2kv_waiting_req(req)
+        session = getattr(req, "session", None)
+        if session is not None and session.session_id in self.session_controller:
+            self.session_controller.close(
+                CloseSessionReqInput(session_id=session.session_id)
+            )
+        self.stream_output([req], req.return_logprob)
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -5128,6 +6427,7 @@ class Scheduler(
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
+        failed_session_reqs = []
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
@@ -5171,7 +6471,22 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            try:
+                req.init_next_round_input(self.tree_cache)
+                if not self._advance_cached_c2kv_tool_rounds(req):
+                    self._release_c2kv_pins(req)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    self.stream_output([req], req.return_logprob)
+                    failed_session_reqs.append(req)
+                    continue
+            except RuntimeError as exc:
+                if str(exc) != "PERSISTENT_HISTORY_SESSION_RESIDENT_CACHE_MISSING":
+                    raise
+                # The canonical continuation cannot be reconstructed from the
+                # prompt without reviving evicted KV. Fail only this request.
+                self._abort_missing_persistent_history_session(req)
+                failed_session_reqs.append(req)
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -5200,6 +6515,11 @@ class Scheduler(
                 break
 
         # Update waiting queue
+        if failed_session_reqs:
+            failed_session_set = set(failed_session_reqs)
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in failed_session_set
+            ]
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
@@ -5577,7 +6897,7 @@ class Scheduler(
 
         pending_req, deadline = self._pending_flush
 
-        if self.is_fully_idle():
+        if self.is_fully_idle() and not self.session_controller.sessions:
             success = self.flush_cache()
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
@@ -5900,7 +7220,7 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.is_fully_idle():
+        if self.is_fully_idle() and not self.session_controller.sessions:
             self.cur_batch = None
             self.last_batch = None
             if self.recovery_checkpoint_manager is not None:
@@ -5922,9 +7242,10 @@ class Scheduler(
             success = True
         else:
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
+                f"Cache not flushed because requests or sessions remain. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"#open-session: {len(self.session_controller.sessions)}"
             )
             success = False
         return success
