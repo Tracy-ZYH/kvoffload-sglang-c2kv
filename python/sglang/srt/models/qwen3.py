@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.history_kv_selection import (
     deduplicated_recovery_indices,
     dense_headwise_recovery_indices,
     gather_paired_kv,
+    repair_score_query_start,
     require_rotated_headwise_storage,
     select_h2o_prefill_indices,
     select_snapkv_indices,
@@ -49,6 +50,11 @@ from sglang.srt.mem_cache.history_kv_selection import (
 from sglang.srt.mem_cache.history_kv_reference import (
     ReferenceLayerKV,
     reference_sdpa,
+)
+from sglang.srt.mem_cache.repair_tool_selection import (
+    SPARSE_REPAIR_METHODS,
+    select_sparse_repair_indices,
+    validate_sparse_repair_partition,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.observability import paper_telemetry
@@ -543,62 +549,82 @@ class Qwen3Attention(nn.Module):
             if reference_state is not None:
                 reference_state.validate()
                 reference_len = int(reference_state.key.shape[1])
-            if self.num_heads != self.num_kv_heads:
-                groups = self.num_heads // self.num_kv_heads
-                k_score = k_req.repeat_interleave(groups, dim=0)
-            else:
-                k_score = k_req
+            groups = self.num_heads // self.num_kv_heads
 
             # The query may follow an already-cached history boundary. Include
             # the resident current prefix and query's own key in the softmax;
             # only slice to history candidates after normalization. Otherwise
             # heads attending to current content get overstated history scores.
             key_end = prefix_len + q_end
-            k_all = k_score[:, :key_end, :]
+            total_key_len = reference_len + key_end
+            key_positions = normal_positions[:key_end].to(k_req.device)
             if reference_state is not None:
-                reference_keys = reference_state.key.repeat_interleave(
-                    self.num_heads // self.num_kv_heads, dim=0
-                )
-                k_all = torch.cat(
-                    [reference_keys.to(k_all.dtype), k_all], dim=1
-                )
-            key_positions = normal_positions[:key_end].to(k_all.device)
-            if reference_state is not None:
-                reference_positions = reference_state.positions.repeat_interleave(
-                    self.num_heads // self.num_kv_heads, dim=0
-                )
                 k_pos = torch.cat(
                     [
-                        reference_positions.to(k_all.device),
-                        key_positions.view(1, -1).expand(self.num_heads, -1),
+                        reference_state.positions.to(k_req.device),
+                        key_positions.view(1, -1).expand(self.num_kv_heads, -1),
                     ],
                     dim=1,
-                ).unsqueeze(1)
+                ).view(self.num_kv_heads, 1, 1, -1)
             else:
-                k_pos = key_positions.view(1, 1, -1)
-            groups = self.num_heads // self.num_kv_heads
+                k_pos = key_positions.view(1, 1, 1, -1).expand(
+                    self.num_kv_heads, -1, -1, -1
+                )
             headwise_probs = torch.zeros(
                 self.num_kv_heads,
-                reference_len + key_end,
+                total_key_len,
                 dtype=torch.float32,
-                device=k_all.device,
+                device=k_req.device,
             )
-            # H2O scores every prompt query.  Bound the temporary attention
-            # matrix instead of materializing [heads, prompt, prompt].
-            for query_left in range(q_start, q_end, 64):
-                query_right = min(q_end, query_left + 64)
-                logits = torch.matmul(
-                    q_req[:, query_left:query_right, :].float(),
-                    k_all.transpose(-2, -1).float(),
-                ) * self.scaling
-                q_pos = flat_positions[
-                    token_start + query_left : token_start + query_right
-                ].to(logits.device).view(1, -1, 1)
-                logits = logits.masked_fill(k_pos > q_pos, float("-inf"))
-                probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
-                headwise_probs += probs.view(
-                    self.num_kv_heads, groups, query_right - query_left, -1
-                ).sum(dim=(1, 2))
+            # A fixed query count still allocates hundreds of MiB of logits
+            # once AppWorld's persistent history grows past 100k keys. Bound
+            # float logits by bytes, including grouped query heads, while
+            # preserving the same softmax denominator and score reduction.
+            score_query_chunk = max(
+                1,
+                min(
+                    64,
+                    (16 * 1024 * 1024)
+                    // max(1, self.num_heads * total_key_len * 4),
+                ),
+            )
+            # Score one KV head at a time. Keep reference/current keys separate
+            # until their small logits are joined for the full-key softmax.
+            # This avoids a large grouped key copy and full-history float cast.
+            grouped_query = q_req.reshape(
+                self.num_kv_heads, groups, extend_len, self.head_dim
+            )
+            for kv_head in range(self.num_kv_heads):
+                current_key = k_req[kv_head, :key_end, :].transpose(0, 1).float()
+                reference_key = (
+                    reference_state.key[kv_head]
+                    .to(k_req.dtype)
+                    .transpose(0, 1)
+                    .float()
+                    if reference_state is not None
+                    else None
+                )
+                for query_left in range(q_start, q_end, score_query_chunk):
+                    query_right = min(q_end, query_left + score_query_chunk)
+                    query_count = query_right - query_left
+                    score_query = grouped_query[
+                        kv_head, :, query_left:query_right, :
+                    ].reshape(1, groups * query_count, self.head_dim).float()
+                    logits = torch.bmm(score_query, current_key.unsqueeze(0))
+                    if reference_key is not None:
+                        reference_logits = torch.bmm(
+                            score_query, reference_key.unsqueeze(0)
+                        )
+                        logits = torch.cat([reference_logits, logits], dim=-1)
+                    logits = logits.view(groups, query_count, -1) * self.scaling
+                    q_pos = flat_positions[
+                        token_start + query_left : token_start + query_right
+                    ].to(logits.device).view(1, -1, 1)
+                    logits = logits.masked_fill(
+                        k_pos[kv_head] > q_pos, float("-inf")
+                    )
+                    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                    headwise_probs[kv_head] += probs.sum(dim=(0, 1))
             candidate_end = min(history_end, key_end)
             selected_probs = headwise_probs[
                 :, reference_len + history_start : reference_len + candidate_end
@@ -995,6 +1021,7 @@ class Qwen3Attention(nn.Module):
                     query_pos,
                     scale=self.scaling,
                     validate_history=False,
+                    decode_causal=forward_batch.forward_mode.is_decode(),
                 ).reshape(query_len, -1)
             )
         if offset != q.shape[0]:
@@ -2211,6 +2238,8 @@ class Qwen3ForCausalLM(nn.Module):
         history_kv_kernel_size: int = 5,
         history_kv_pooling: str = "avgpool",
         history_kv_h2o_recent_fraction: float = 0.5,
+        history_kv_selectable_relative_indices: Optional[List[int]] = None,
+        history_kv_mandatory_relative_indices: Optional[List[int]] = None,
         history_kv_recovery_mode: Optional[str] = None,
         history_kv_recovery_relative_indices: Optional[List[int]] = None,
         cacheblend: Optional[Dict[str, Any]] = None,
@@ -2286,12 +2315,23 @@ class Qwen3ForCausalLM(nn.Module):
         raw_key_values = []
         history_scores: List[torch.Tensor] = []
         requested_span_tokens = span_end - span_start
+        sparse_selectable, sparse_mandatory = validate_sparse_repair_partition(
+            requested_span_tokens,
+            history_kv_selectable_relative_indices,
+            history_kv_mandatory_relative_indices,
+            history_kv_target_tokens,
+        )
         history_method = (history_kv_method or "").strip().lower()
         if history_method == "snapkv":
             history_method = "snapkv_persistent"
         if history_method == "pyramid":
             history_method = "pyramidkv"
         require_rotated_headwise_storage(history_method, raw_kv_position_mode)
+        if history_kv_selectable_relative_indices is not None:
+            if history_method not in SPARSE_REPAIR_METHODS:
+                raise ValueError("unsupported sparse repair history method")
+            if history_method != "streamingllm" and raw_kv_position_mode != "rotated":
+                raise ValueError("headwise sparse repair requires rotated raw KV")
         if history_method.startswith("snapkv"):
             snap_recent_window = int(history_kv_recent_window)
             snap_kernel_size = int(history_kv_kernel_size)
@@ -2377,12 +2417,13 @@ class Qwen3ForCausalLM(nn.Module):
             k_attn = k_attn.transpose(1, 2).contiguous()
             v_attn = v_attn.transpose(1, 2).contiguous()
 
-            if history_method in HEADWISE_HISTORY_KV_METHODS:
-                if history_method == "h2o":
-                    score_query_start = 0
-                else:
-                    observation_window = min(snap_recent_window, seq_len)
-                    score_query_start = seq_len - observation_window
+            if history_method in HEADWISE_HISTORY_KV_METHODS or (
+                history_kv_selectable_relative_indices is not None
+                and history_method == "pyramidkv"
+            ):
+                score_query_start = repair_score_query_start(
+                    history_method, seq_len, history_kv_recent_window
+                )
                 layer_score = attention_scores_by_kv_head(
                     q,
                     k_attn,
@@ -2505,6 +2546,10 @@ class Qwen3ForCausalLM(nn.Module):
             else:
                 target_tokens = requested_span_tokens
             target_tokens = max(1, min(requested_span_tokens, target_tokens))
+            if history_kv_selectable_relative_indices is not None and (
+                target_tokens < len(sparse_mandatory)
+            ):
+                raise ValueError("sparse repair target is below mandatory token cost")
 
             def _unique_sorted(indices: Iterable[int]) -> List[int]:
                 return sorted({int(i) for i in indices if 0 <= int(i) < requested_span_tokens})
@@ -2554,7 +2599,54 @@ class Qwen3ForCausalLM(nn.Module):
                     restored = torch.cat([restored, tail.clone()], dim=0)
                 return restored.contiguous()
 
-            if history_method == "kivi":
+            if history_kv_selectable_relative_indices is not None:
+                selected_by_layer, sparse_metadata = select_sparse_repair_indices(
+                    history_method,
+                    history_scores,
+                    sparse_selectable,
+                    sparse_mandatory,
+                    target_tokens,
+                    recent_window=int(history_kv_recent_window),
+                    kernel_size=int(history_kv_kernel_size),
+                    pooling=history_kv_pooling.strip().lower(),
+                    h2o_recent_fraction=float(history_kv_h2o_recent_fraction),
+                    num_layers=len(raw_key_values),
+                    device=device,
+                )
+                if sparse_metadata["per_head_selection"]:
+                    raw_key_values = [
+                        gather_paired_kv(key, value, indices)
+                        for (key, value), indices in zip(
+                            raw_key_values, selected_by_layer
+                        )
+                    ]
+                    length = selected_by_layer[0].shape[1]
+                    repair_positions = full_repair_positions[-length:].contiguous().clone()
+                    repair_positions[-1] = full_repair_positions[-1]
+                    sparse_metadata.update(summarize_headwise_indices(selected_by_layer))
+                    sparse_metadata["repair_positions_semantics"] = "ledger_only_recent_suffix"
+                else:
+                    selected_tensor = selected_by_layer[0][0]
+                    raw_key_values = [
+                        (
+                            key.index_select(0, selected_tensor).contiguous().clone(),
+                            value.index_select(0, selected_tensor).contiguous().clone(),
+                        )
+                        for key, value in raw_key_values
+                    ]
+                    repair_positions = repair_positions.index_select(
+                        0, selected_tensor
+                    ).contiguous()
+                history_meta = {
+                    "history_kv_method": history_method,
+                    "history_boundary_adaptation": True,
+                    "requested_span_tokens": requested_span_tokens,
+                    "selected_token_count": int(repair_positions.numel()),
+                    "selection_reason": "global_schema_candidates_with_mandatory_protocol",
+                    "selection_indices_coordinate_space": "span_relative",
+                    **sparse_metadata,
+                }
+            elif history_method == "kivi":
                 bits = max(1, int(os.environ.get("C2KV_KIVI_BITS", "2")))
                 group_size = max(1, int(os.environ.get("C2KV_KIVI_GROUP_SIZE", "32")))
                 residual_length = max(

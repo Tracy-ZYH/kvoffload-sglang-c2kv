@@ -1718,6 +1718,10 @@ class C2KVRepairExtractRequest(BaseModel):
     history_kv_kernel_size: int = 5
     history_kv_pooling: str = "avgpool"
     history_kv_h2o_recent_fraction: float = 0.5
+    # Relative to [span_start, span_end). The optional mandatory list must be
+    # the exact complement; omitted mandatory positions are derived server-side.
+    history_kv_selectable_relative_indices: Optional[List[int]] = None
+    history_kv_mandatory_relative_indices: Optional[List[int]] = None
     # Compression-agnostic recovery over a common source-token selection.
     # Indices are relative to the extracted history span.
     history_kv_recovery_mode: Optional[str] = None

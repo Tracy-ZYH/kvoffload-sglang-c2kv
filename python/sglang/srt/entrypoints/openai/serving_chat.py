@@ -134,6 +134,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_computed_prefixes: Dict[str, int] = {}
         self._persistent_history_exact_output: Dict[str, bool] = {}
         self._persistent_history_tool_segments: Dict[str, List[Dict[str, Any]]] = {}
+        self._persistent_history_tool_source_digests: Dict[str, str] = {}
 
     def release_persistent_history_session(self, session_id: str) -> None:
         self._persistent_history_sessions.pop(session_id, None)
@@ -142,6 +143,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._persistent_history_computed_prefixes.pop(session_id, None)
         self._persistent_history_exact_output.pop(session_id, None)
         self._persistent_history_tool_segments.pop(session_id, None)
+        self._persistent_history_tool_source_digests.pop(session_id, None)
 
     @staticmethod
     def _is_persistent_history_request(request: ChatCompletionRequest) -> bool:
@@ -425,7 +427,31 @@ class OpenAIServingChat(OpenAIServingBase):
         if not segments and not previous:
             return
         old_prefix = [segment for segment in segments if segment["token_start"] < input_prefix]
-        if previous != old_prefix and input_prefix:
+        source_digest = (hint.get("joint_tool_memory") or {}).get(
+            "source_protocol_token_sha256"
+        )
+        previous_digest = getattr(
+            self, "_persistent_history_tool_source_digests", {}
+        ).get(session_id)
+        if input_prefix and previous:
+            if source_digest and previous_digest and source_digest != previous_digest:
+                raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+            if previous != old_prefix:
+                if not source_digest or source_digest != previous_digest:
+                    raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+                frame_keys = ("token_start", "token_end", "source_tokens")
+                same_frame = len(previous) == len(old_prefix) == 1 and all(
+                    previous[0].get(key) == old_prefix[0].get(key)
+                    for key in frame_keys
+                )
+                if not same_frame:
+                    raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
+                hint["persistent_tool_refresh"] = {
+                    "source_protocol_token_sha256": source_digest,
+                    "previous_segment": dict(previous[0]),
+                    "new_segment": dict(old_prefix[0]),
+                }
+        elif previous != old_prefix and input_prefix:
             raise ValueError("PERSISTENT_HISTORY_TOOL_PREFIX_CHANGED")
         hint["tool_memory_input_prefix_tokens"] = input_prefix
         for key in ("persistent_session_logical_prefix_tokens",
@@ -441,6 +467,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         "persistent_canonical_prompt_tokens"):
                 if key in config:
                     config[key] = source_boundary(config[key], segments)
+        for span in hint.get("history_kv_event_token_spans") or []:
+            for key in ("start", "end"):
+                span[key] = source_boundary(span[key], segments)
+        suffix_key = "history_kv_event_generation_suffix_start"
+        if suffix_key in hint:
+            hint[suffix_key] = source_boundary(hint[suffix_key], segments)
         hint["tool_memory_canonical_prompt_tokens"] = source_boundary(input_len, segments)
 
     def _commit_persistent_history_session(
@@ -462,6 +494,11 @@ class OpenAIServingChat(OpenAIServingBase):
             self._persistent_history_tool_segments[session_id] = [
                 dict(item) for item in hint["tool_memory_segments"]
             ]
+            source_digest = (hint.get("joint_tool_memory") or {}).get(
+                "source_protocol_token_sha256"
+            )
+            if source_digest:
+                self._persistent_history_tool_source_digests[session_id] = source_digest
         reference_config = hint.get("history_kv_reference_config") or {}
         method = str(reference_config.get("method") or "").lower()
         exact_output = method in {"agentkv", "commitkv"}
@@ -471,9 +508,23 @@ class OpenAIServingChat(OpenAIServingBase):
         if exact_output:
             next_prefix = list(canonical_prompt_ids) + list(output_ids)
             report = (ret[0].get("meta_info") or {}).get("kv_memory_report") or {}
-            computed_prefix = int(
-                report.get("persistent_session_computed_logical_horizon")
-                or len(canonical_prompt_ids)
+            from sglang.srt.mem_cache.c2kv_composition import (
+                source_boundary,
+                trailing_source_horizon_to_input,
+            )
+            segments = hint.get("tool_memory_segments") or []
+            source_prompt_len = source_boundary(len(canonical_prompt_ids), segments)
+            if source_prompt_len != int(
+                hint.get("persistent_session_canonical_prompt_tokens", source_prompt_len)
+            ):
+                raise ValueError("PERSISTENT_HISTORY_TOOL_SOURCE_PROMPT_MISMATCH")
+            computed_source_horizon = report.get(
+                "persistent_session_computed_logical_horizon"
+            )
+            if computed_source_horizon is None:
+                computed_source_horizon = source_prompt_len
+            computed_prefix = trailing_source_horizon_to_input(
+                computed_source_horizon, len(canonical_prompt_ids), segments
             )
             if not len(canonical_prompt_ids) <= computed_prefix <= len(next_prefix):
                 raise ValueError(
@@ -481,6 +532,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             self._persistent_history_sessions[session_id] = next_prefix
             self._persistent_history_computed_prefixes[session_id] = computed_prefix
+            report["persistent_session_computed_input_horizon"] = computed_prefix
         else:
             self._persistent_history_sessions[session_id] = list(canonical_prompt_ids)
             self._persistent_history_computed_prefixes[session_id] = len(
@@ -1241,6 +1293,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 boundary_policy="overlap",
             )
             config["resolved_tool_protocol_token_span"] = resolved[0]
+        interface_spans = config.get("protected_interface_spans") or []
+        if interface_spans:
+            resolved_interface = []
+            for index, span in enumerate(interface_spans):
+                # Resolve independently: adjacent interface fields may share a
+                # boundary-crossing BPE token, which is protected by both.
+                resolved_interface.extend(resolve_schema_token_spans(
+                    rendered_prompt=rendered,
+                    prompt_ids=prompt_ids,
+                    message_contents=[item.get("content") for item in messages],
+                    schema_spans=[{"schema_index": -2 - index, **span}],
+                    tokenizer=tokenizer,
+                    boundary_policy="overlap",
+                ))
+            config["resolved_protected_interface_token_spans"] = resolved_interface
         config["server_tokenized"] = True
         config["full_prompt_tokens"] = len(prompt_ids)
 

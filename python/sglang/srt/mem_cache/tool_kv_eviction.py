@@ -18,12 +18,22 @@ def plan_tool_kv_eviction(config: Mapping, prompt_tokens: int) -> dict:
     if prompt_tokens < 2 or int(config.get("full_prompt_tokens") or -1) != prompt_tokens:
         raise ValueError("TOOL_KV_PROMPT_LENGTH_MISMATCH")
     spans = config.get("resolved_schema_token_spans")
-    if not isinstance(spans, list) or not spans:
+    raw_spans = config.get("schema_spans") or []
+    if not isinstance(spans, list) or (not spans and not raw_spans):
         raise ValueError("TOOL_KV_RESOLVED_SCHEMA_SPANS_REQUIRED")
     protected = {int(index) for index in config.get("protected_schema_indices") or []}
-    available = {int(item["schema_index"]) for item in spans}
+    # A short prose value may have no wholly contained token, while its
+    # protected catalog index is still valid in the source annotations.
+    available = ({int(item["schema_index"]) for item in spans}
+                 | {int(item["schema_index"]) for item in raw_spans})
     if protected - available:
         raise ValueError("TOOL_KV_PROTECTED_SCHEMA_UNKNOWN")
+    protected_interface = set()
+    for item in config.get("resolved_protected_interface_token_spans") or []:
+        start, end = int(item["token_start"]), int(item["token_end"])
+        if not 0 <= start < end <= prompt_tokens:
+            raise ValueError("TOOL_KV_INTERFACE_SPAN_INVALID")
+        protected_interface.update(range(start, end))
     evictable = set()
     all_schema = set()
     for item in spans:
@@ -36,6 +46,7 @@ def plan_tool_kv_eviction(config: Mapping, prompt_tokens: int) -> dict:
         all_schema.update(indices)
         if int(item["schema_index"]) not in protected:
             evictable.update(indices)
+    evictable.difference_update(protected_interface)
     evictable = sorted(evictable)
     evictable_count = len(evictable)
     mandatory = prompt_tokens - evictable_count
@@ -48,19 +59,16 @@ def plan_tool_kv_eviction(config: Mapping, prompt_tokens: int) -> dict:
         raise ValueError("TOOL_KV_TARGETS_DISAGREE")
     keep = min(max(0, requested_keep), evictable_count)
     protocol = config.get("resolved_tool_protocol_token_span")
-    tool_resident = None
+    tool_scope = all_schema | protected_interface
     if protocol is not None:
         protocol_start = int(protocol["token_start"])
         protocol_end = int(protocol["token_end"])
         if not 0 <= protocol_start < protocol_end <= prompt_tokens:
             raise ValueError("TOOL_KV_PROTOCOL_SPAN_INVALID")
-        if any(not protocol_start <= index < protocol_end for index in all_schema):
-            raise ValueError("TOOL_KV_SCHEMAS_OUTSIDE_PROTOCOL")
-        tool_resident = protocol_end - protocol_start - evictable_count + keep
+        tool_scope.update(range(protocol_start, protocol_end))
+    tool_resident = len(tool_scope) - evictable_count + keep
     cap = config.get("max_resident_tool_tokens")
     if cap is not None:
-        if tool_resident is None:
-            raise ValueError("TOOL_KV_PROTOCOL_SPAN_REQUIRED_FOR_CAP")
         if tool_resident > int(cap):
             raise ValueError("TOOL_KV_TOOL_BUDGET_EXCEEDED")
     history_end = prompt_tokens - 1
@@ -89,6 +97,8 @@ def plan_tool_kv_eviction(config: Mapping, prompt_tokens: int) -> dict:
         "tool_full_prompt_tokens": prompt_tokens,
         "tool_resident_tokens": mandatory + keep,
         "tool_protocol_resident_tokens": tool_resident,
+        "tool_scope_full_tokens": len(tool_scope),
+        "tool_protected_interface_tokens": len(protected_interface),
         "tool_max_resident_tokens": int(cap) if cap is not None else None,
         "tool_no_op": keep == evictable_count,
         "tool_budget_status": (

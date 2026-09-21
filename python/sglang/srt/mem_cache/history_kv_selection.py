@@ -20,6 +20,20 @@ DEFAULT_SCORE_QUERY_CHUNK_SIZE = 64
 DEFAULT_STREAMINGLLM_SINK_TOKENS = 4
 
 
+def repair_score_query_start(method, seq_len, recent_window):
+    """Choose the repair-prefill query range for headwise history scoring."""
+    if type(seq_len) is not int or seq_len <= 0:
+        raise ValueError("repair scoring requires a positive sequence length")
+    if method == "h2o":
+        return 0
+    if method not in {"snapkv_persistent", "snapkv_refresh", "pyramidkv"}:
+        raise ValueError(f"unsupported repair scoring method: {method}")
+    window = int(recent_window)
+    if window <= 0:
+        raise ValueError("history_kv_recent_window must be positive for repair scoring")
+    return seq_len - min(window, seq_len)
+
+
 def dense_headwise_recovery_indices(layer_indices, recovery_indices, *, seq_len):
     """Restore all target tokens, retaining each head's original selection.
 
