@@ -18,10 +18,14 @@ def plan_tool_kv_eviction(config: Mapping, prompt_tokens: int) -> dict:
     if prompt_tokens < 2 or int(config.get("full_prompt_tokens") or -1) != prompt_tokens:
         raise ValueError("TOOL_KV_PROMPT_LENGTH_MISMATCH")
     spans = config.get("resolved_schema_token_spans")
-    if not isinstance(spans, list) or not spans:
+    raw_spans = config.get("schema_spans") or []
+    if not isinstance(spans, list) or (not spans and not raw_spans):
         raise ValueError("TOOL_KV_RESOLVED_SCHEMA_SPANS_REQUIRED")
     protected = {int(index) for index in config.get("protected_schema_indices") or []}
-    available = {int(item["schema_index"]) for item in spans}
+    # A short prose value may have no wholly contained token, while its
+    # protected catalog index is still valid in the source annotations.
+    available = ({int(item["schema_index"]) for item in spans}
+                 | {int(item["schema_index"]) for item in raw_spans})
     if protected - available:
         raise ValueError("TOOL_KV_PROTECTED_SCHEMA_UNKNOWN")
     protected_interface = set()

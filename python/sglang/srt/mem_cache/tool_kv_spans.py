@@ -45,7 +45,7 @@ def resolve_schema_token_spans(
 
     resolved = []
     occupied = set()
-    schema_ids = set()
+    occupied_text = []
     for raw in schema_spans:
         if not isinstance(raw, Mapping):
             raise ValueError("TOOL_KV_SCHEMA_SPAN_INVALID")
@@ -53,13 +53,17 @@ def resolve_schema_token_spans(
         message_index = int(raw["message_index"])
         start = int(raw["start"])
         end = int(raw["end"])
-        if schema_index in schema_ids or not 0 <= message_index < len(message_contents):
+        if not 0 <= message_index < len(message_contents):
             raise ValueError("TOOL_KV_SCHEMA_INDEX_INVALID")
         content = message_contents[message_index]
         if not isinstance(content, str) or not 0 <= start < end <= len(content) or content[start:end] != raw.get("text"):
             raise ValueError("TOOL_KV_SCHEMA_TEXT_MISMATCH")
         absolute_start = content_starts[message_index] + start
         absolute_end = content_starts[message_index] + end
+        if any(absolute_start < right and left < absolute_end
+               for left, right in occupied_text):
+            raise ValueError("TOOL_KV_SCHEMA_TOKEN_SPANS_OVERLAP")
+        occupied_text.append((absolute_start, absolute_end))
         if boundary_policy == "inside":
             included = [
                 index for index, (left, right) in enumerate(offsets)
@@ -71,13 +75,17 @@ def resolve_schema_token_spans(
                 if left < right and left < absolute_end and right > absolute_start
             ]
         if not included:
+            # A short prose value can share a BPE token with surrounding
+            # executable syntax. It has no evictable token; the crossing
+            # token stays protected because it is absent from this result.
+            if boundary_policy == "inside":
+                continue
             raise ValueError("TOOL_KV_SCHEMA_HAS_NO_WHOLE_TOKENS")
         token_start = included[0]
         token_end = included[-1] + 1
         if included != list(range(token_start, token_end)) or occupied.intersection(included):
             raise ValueError("TOOL_KV_SCHEMA_TOKEN_SPANS_OVERLAP")
         occupied.update(included)
-        schema_ids.add(schema_index)
         resolved.append(
             {
                 "schema_index": schema_index,

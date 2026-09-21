@@ -6460,6 +6460,23 @@ class Scheduler(
                 self._abort_invalid_persistent_history_session(req, str(exc))
                 failed_session_reqs.append(req)
                 continue
+            # Chunked requests and streaming-session continuations reuse their
+            # existing request row. Only newly admitted rows consume free slots.
+            # Count rows already staged in this batch because allocation happens
+            # later, in prepare_for_extend().
+            new_req_slots = sum(
+                staged.req_pool_idx is None for staged in adder.can_run_list
+            )
+            if (
+                req.req_pool_idx is None
+                and new_req_slots >= self.req_to_token_pool.available_size()
+            ):
+                if req.mamba_pool_idx is not None:
+                    self.tree_cache.req_to_token_pool.mamba_pool.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

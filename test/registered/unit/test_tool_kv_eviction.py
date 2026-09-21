@@ -51,6 +51,73 @@ def test_schema_boundaries_keep_crossing_bpe_tokens():
     assert protocol[0]["token_end"] == 5
 
 
+def test_multiple_prose_segments_share_one_schema_index_and_one_global_plan():
+    content = '{"name":"lookup","description":"first","title":"second"}'
+    rendered = "<S>" + content + "</S>"
+    spans = [{"schema_index": 0, "message_index": 0,
+              "start": content.index(value), "end": content.index(value) + len(value),
+              "text": value} for value in ('"first"', '"second"')]
+    resolved = resolve_schema_token_spans(
+        rendered_prompt=rendered, prompt_ids=list(range(len(rendered))),
+        message_contents=[content], schema_spans=spans,
+        tokenizer=_Tokenizer(list(rendered)))
+    assert len(resolved) == 2
+    assert {span["schema_index"] for span in resolved} == {0}
+    config = {"method": "h2o", "full_prompt_tokens": len(rendered),
+              "schema_spans": spans, "resolved_schema_token_spans": resolved,
+              "target_evictable_tokens_per_layer": 1}
+    plan = plan_tool_kv_eviction(config, len(rendered))
+    expected = sorted(index for span in resolved
+                      for index in range(span["token_start"], span["token_end"]))
+    assert plan["tool_evictable_indices"] == expected
+    config["protected_schema_indices"] = [0]
+    assert plan_tool_kv_eviction(config, len(rendered))["tool_no_op"] is True
+
+
+@pytest.mark.parametrize("second_index", [0, 1])
+def test_overlapping_prose_segments_remain_invalid(second_index):
+    content = '"first"'
+    spans = [{"schema_index": 0, "message_index": 0,
+              "start": 0, "end": len(content), "text": content},
+             {"schema_index": second_index, "message_index": 0,
+              "start": 2, "end": 5, "text": "irs"}]
+    rendered = "<S>" + content + "</S>"
+    with pytest.raises(ValueError, match="TOOL_KV_SCHEMA_TOKEN_SPANS_OVERLAP"):
+        resolve_schema_token_spans(
+            rendered_prompt=rendered, prompt_ids=list(range(len(rendered))),
+            message_contents=[content], schema_spans=spans,
+            tokenizer=_Tokenizer(list(rendered)))
+
+
+def test_short_prose_without_whole_token_remains_protected():
+    content = "aXbY"
+    rendered = "<S>" + content + "</S>"
+    tokenizer = _Tokenizer(["<S>", "aXb", "Y", "</S>"])
+    spans = [{"schema_index": 0, "message_index": 0,
+              "start": index, "end": index + 1, "text": value}
+             for index, value in ((1, "X"), (3, "Y"))]
+    resolved = resolve_schema_token_spans(
+        rendered_prompt=rendered, prompt_ids=list(range(4)),
+        message_contents=[content], schema_spans=spans, tokenizer=tokenizer)
+    assert resolved == [{"schema_index": 0, "token_start": 2, "token_end": 3}]
+    config = {"method": "h2o", "full_prompt_tokens": 4,
+              "schema_spans": spans, "resolved_schema_token_spans": resolved,
+              "target_evictable_tokens_per_layer": 0}
+    plan = plan_tool_kv_eviction(config, 4)
+    assert plan["tool_evictable_indices"] == [2]
+    assert 1 in plan["protected_history_indices"]
+
+    tiny_only = resolve_schema_token_spans(
+        rendered_prompt=rendered, prompt_ids=list(range(4)),
+        message_contents=[content], schema_spans=spans[:1], tokenizer=tokenizer)
+    assert tiny_only == []
+    config.update(schema_spans=spans[:1], resolved_schema_token_spans=tiny_only,
+                  protected_schema_indices=[0])
+    no_op = plan_tool_kv_eviction(config, 4)
+    assert no_op["tool_no_op"] is True
+    assert no_op["tool_evictable_indices"] == []
+
+
 def test_tool_plan_preserves_every_non_schema_token_and_all_native_noop():
     config = {
         "method": "h2o", "full_prompt_tokens": 8,
